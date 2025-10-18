@@ -11,6 +11,8 @@ use crate::kernel::{BlockPattern2d, linear_attention};
 pub struct AttentionCache<B: Backend> {
     q_rot: Option<Tensor<B, 4>>,
     value: Option<Tensor<B, 4>>,
+    #[cfg(feature = "viz")]
+    last_attention: Option<Tensor<B, 3>>,
 }
 
 impl<B: Backend> AttentionCache<B> {
@@ -28,6 +30,10 @@ impl<B: Backend> AttentionCache<B> {
     pub fn reset(&mut self) {
         self.q_rot = None;
         self.value = None;
+        #[cfg(feature = "viz")]
+        {
+            self.last_attention = None;
+        }
     }
 
     pub fn append(&mut self, q_rot: Tensor<B, 4>, value: Tensor<B, 4>) {
@@ -39,6 +45,10 @@ impl<B: Backend> AttentionCache<B> {
             Some(prev) => Tensor::cat(vec![prev, value], 2),
             None => value,
         });
+        #[cfg(feature = "viz")]
+        {
+            self.last_attention = None;
+        }
     }
 
     pub fn retain_last(&mut self, max_len: usize) {
@@ -68,6 +78,20 @@ impl<B: Backend> AttentionCache<B> {
             };
             self.value = Some(trimmed);
         }
+        #[cfg(feature = "viz")]
+        {
+            self.last_attention = None;
+        }
+    }
+
+    #[cfg(feature = "viz")]
+    pub fn set_last_attention(&mut self, row: Tensor<B, 3>) {
+        self.last_attention = Some(row);
+    }
+
+    #[cfg(feature = "viz")]
+    pub fn last_attention(&self) -> Option<Tensor<B, 3>> {
+        self.last_attention.clone()
     }
 }
 
@@ -142,6 +166,9 @@ impl<B: Backend> Attention<B> {
         let k_rot = q_rot.clone();
         let value_rep = value.repeat_dim(1, self.n_head);
 
+        #[cfg(feature = "viz")]
+        let mut attn_row: Option<Tensor<B, 3>> = None;
+
         let context = if let (Some(prev_q), Some(prev_v)) = (&cache.q_rot, &cache.value) {
             let scores_prev = q_rot.clone().matmul(prev_q.clone().swap_dims(2, 3));
             let mut scores_self = q_rot.clone().matmul(k_rot.clone().swap_dims(2, 3)).tril(-1);
@@ -178,6 +205,18 @@ impl<B: Backend> Attention<B> {
             };
 
             let scores = Tensor::cat(vec![scores_prev, scores_self], 3);
+
+            #[cfg(feature = "viz")]
+            {
+                let dims = scores.shape().dims::<4>();
+                if dims[2] > 0 {
+                    let row = scores
+                        .clone()
+                        .slice_dim(2, (dims[2] - 1)..dims[2])
+                        .reshape([dims[0], dims[1], dims[3]]);
+                    attn_row = Some(row);
+                }
+            }
             let value_all = Tensor::cat(vec![prev_v.clone(), value_rep.clone()], 2);
             scores.matmul(value_all)
         } else {
@@ -200,10 +239,26 @@ impl<B: Backend> Attention<B> {
                 let alibi = slopes * (pos_new - pos_row).tril(-1);
                 scores = scores + alibi;
             }
+            #[cfg(feature = "viz")]
+            {
+                let dims = scores.shape().dims::<4>();
+                if dims[2] > 0 {
+                    let row = scores
+                        .clone()
+                        .slice_dim(2, (dims[2] - 1)..dims[2])
+                        .reshape([dims[0], dims[1], dims[3]]);
+                    attn_row = Some(row);
+                }
+            }
             scores.matmul(value_rep.clone())
         };
 
         cache.append(k_rot.clone(), value_rep.clone());
+
+        #[cfg(feature = "viz")]
+        if let Some(row) = attn_row {
+            cache.set_last_attention(row);
+        }
 
         context
     }

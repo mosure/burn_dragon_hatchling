@@ -6,6 +6,7 @@ pub mod generation;
 pub mod kernel;
 pub mod model;
 pub mod tokenizer;
+pub mod viz;
 pub mod wgpu;
 
 pub use config::{
