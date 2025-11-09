@@ -1,4 +1,6 @@
 #[cfg(feature = "viz")]
+pub mod activity;
+#[cfg(feature = "viz")]
 pub mod collect;
 #[cfg(feature = "viz")]
 pub mod frame;

@@ -60,6 +60,8 @@ crossbeam-channel = { version = "0.5", optional = true }
 parking_lot = { version = "0.12", optional = true }
 ndarray = { version = "0.16", optional = true }
 tempfile = "3"
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "line_series"] }
+plotters-bitmap = "0.3"
 
 
 [dependencies.burn]

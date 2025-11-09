@@ -27,7 +27,7 @@ use burn_dragon_hatchling::model::LayerVizState;
 #[cfg(feature = "viz")]
 use burn_dragon_hatchling::viz::collect::{CollectKnobs, HeadRow, LayerTap, StepTaps, to_frame};
 #[cfg(feature = "viz")]
-use burn_dragon_hatchling::viz::{VideoConfig, Viz, VizMode};
+use burn_dragon_hatchling::viz::{VideoConfig, VideoLayout, Viz, VizMode, VizTargetConfig};
 #[cfg(feature = "viz")]
 use std::sync::Arc;
 
@@ -144,8 +144,12 @@ where
                 .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
             if args.viz || env_enabled {
-                let config = VideoConfig::new(args.viz_output.clone());
-                Viz::new(VizMode::Video(config))
+                let targets = build_viz_targets(&args);
+                if targets.is_empty() {
+                    Viz::new(VizMode::Off)
+                } else {
+                    Viz::new(VizMode::Targets(targets))
+                }
             } else {
                 Viz::new(VizMode::Off)
             }
@@ -367,6 +371,34 @@ fn build_layer_tap<B: Backend>(layer_index: u8, viz_state: LayerVizState<B>) -> 
     }
 }
 
+#[cfg(feature = "viz")]
+fn build_viz_targets(args: &Args) -> Vec<VizTargetConfig> {
+    use std::collections::HashSet;
+
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    let layouts = if args.viz_layouts.is_empty() {
+        vec![VizLayoutArg::Timeline]
+    } else {
+        args.viz_layouts.clone()
+    };
+
+    for layout in layouts {
+        if !seen.insert(layout) {
+            continue;
+        }
+        let mut config = match layout {
+            VizLayoutArg::Timeline => VideoConfig::new(args.viz_output.clone()),
+            VizLayoutArg::Plasticity => VideoConfig::new(args.viz_plasticity_output.clone()),
+            VizLayoutArg::Scalefree => VideoConfig::new(args.viz_scalefree_output.clone()),
+        };
+        config.layout = layout.into();
+        targets.push(VizTargetConfig::Video(config));
+    }
+
+    targets
+}
+
 fn apply_generation_overrides(generation: &mut GenerationConfig, args: &Args, block_size: usize) {
     if let Some(prompt) = &args.prompt {
         generation.prompt = prompt.clone();
@@ -533,6 +565,31 @@ struct Args {
     /// Output path for the visualization MP4 when `--viz` or `BDH_VIZ=1` is used.
     #[arg(long, value_name = "PATH", default_value_os_t = PathBuf::from("runs/viz/output.mp4"))]
     viz_output: PathBuf,
+    #[cfg(feature = "viz")]
+    /// Output path for the plasticity-focused visualization when enabled via `--viz-layouts`.
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value_os_t = PathBuf::from("runs/viz/plasticity.mp4")
+    )]
+    viz_plasticity_output: PathBuf,
+    #[cfg(feature = "viz")]
+    /// Output path for the scale-free visualization when enabled via `--viz-layouts`.
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value_os_t = PathBuf::from("runs/viz/scale_free.mp4")
+    )]
+    viz_scalefree_output: PathBuf,
+    #[cfg(feature = "viz")]
+    /// Comma-separated visualization layouts (`timeline`, `plasticity`, `scalefree`) to render when `--viz` is set.
+    #[arg(
+        long,
+        value_name = "LAYOUTS",
+        value_delimiter = ',',
+        default_value = "timeline,plasticity,scalefree"
+    )]
+    viz_layouts: Vec<VizLayoutArg>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -545,4 +602,23 @@ enum BackendArg {
 enum ContextModeArg {
     Infinite,
     Sliding,
+}
+
+#[cfg(feature = "viz")]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, ValueEnum)]
+enum VizLayoutArg {
+    Timeline,
+    Plasticity,
+    Scalefree,
+}
+
+#[cfg(feature = "viz")]
+impl From<VizLayoutArg> for VideoLayout {
+    fn from(value: VizLayoutArg) -> Self {
+        match value {
+            VizLayoutArg::Timeline => VideoLayout::Timeline,
+            VizLayoutArg::Plasticity => VideoLayout::Plasticity,
+            VizLayoutArg::Scalefree => VideoLayout::ScaleFree,
+        }
+    }
 }
