@@ -73,18 +73,13 @@ pub struct HuggingFaceDatasetConfig {
     pub max_records: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HuggingFaceRecordFormat {
+    #[default]
     Jsonl,
     Text,
     Parquet,
-}
-
-impl Default for HuggingFaceRecordFormat {
-    fn default() -> Self {
-        Self::Jsonl
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

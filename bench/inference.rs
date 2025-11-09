@@ -44,12 +44,7 @@ const STORAGE_BUFFER_LIMIT_BYTES: u64 = 1 << 30; // ~1 GiB limit on most wgpu dr
 const FLOAT_BYTES: u64 = std::mem::size_of::<f32>() as u64;
 
 fn inference_bench(c: &mut Criterion) {
-    run_inference_backend::<Wgpu<f32>, _, _>(
-        c,
-        "wgpu",
-        |device| init_runtime(device),
-        |config, cfg| skip_reason_wgpu(config, cfg),
-    );
+    run_inference_backend::<Wgpu<f32>, _, _>(c, "wgpu", init_runtime, skip_reason_wgpu);
 
     #[cfg(feature = "cuda")]
     run_inference_backend::<Cuda<f32>, _, _>(c, "cuda", |_| {}, |_, _| None);

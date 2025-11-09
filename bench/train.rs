@@ -45,7 +45,7 @@ const TRAIN_CONFIGS: &[TrainConfig] = &[
 ];
 
 fn training_step_bench(c: &mut Criterion) {
-    run_training_backend::<Autodiff<Wgpu<f32>>, _>(c, "wgpu", |device| init_runtime(device));
+    run_training_backend::<Autodiff<Wgpu<f32>>, _>(c, "wgpu", init_runtime);
 
     #[cfg(feature = "cuda")]
     run_training_backend::<Autodiff<Cuda<f32>>, _>(c, "cuda", |_| {});

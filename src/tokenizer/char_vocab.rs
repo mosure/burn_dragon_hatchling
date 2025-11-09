@@ -221,44 +221,6 @@ struct CharVocabRecord {
     unk: Option<u32>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io;
-    use tempfile::tempdir;
-
-    #[test]
-    fn fit_encode_decode_round_trip() {
-        let vocab = CharVocab::fit(["hello", "world"].into_iter(), true).expect("fit");
-        assert!(vocab.len() >= 4);
-        let encoded = vocab.encode("hello", true, true);
-        assert_eq!(encoded.first().copied(), Some(vocab.bos()));
-        assert_eq!(encoded.last().copied(), Some(vocab.eos()));
-        let decoded = vocab.decode(&encoded);
-        assert_eq!(decoded, "hello");
-    }
-
-    #[test]
-    fn encode_unknown_maps_to_unk() {
-        let vocab = CharVocab::fit(["ab"].into_iter(), true).expect("fit");
-        let tokens = vocab.encode("ac", false, false);
-        assert_eq!(tokens.len(), 2);
-        assert_eq!(tokens[0], vocab.ch2id[&'a']);
-        assert_eq!(tokens[1], vocab.unk().expect("unk token"));
-    }
-
-    #[test]
-    fn save_and_load_preserves_vocab() -> io::Result<()> {
-        let vocab = CharVocab::fit(["abc"].into_iter(), true).expect("fit");
-        let dir = tempdir()?;
-        let path = dir.path().join("vocab.json");
-        vocab.save(&path).expect("save vocab");
-        let loaded = CharVocab::load(&path).expect("load vocab");
-        assert_eq!(vocab, loaded);
-        Ok(())
-    }
-}
-
 impl super::Tokenizer for CharVocab {
     fn encode(&self, s: &str, add_bos: bool, add_eos: bool) -> Vec<u32> {
         Self::encode(self, s, add_bos, add_eos)
@@ -294,5 +256,43 @@ impl super::Tokenizer for CharVocab {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use tempfile::tempdir;
+
+    #[test]
+    fn fit_encode_decode_round_trip() {
+        let vocab = CharVocab::fit(["hello", "world"].into_iter(), true).expect("fit");
+        assert!(vocab.len() >= 4);
+        let encoded = vocab.encode("hello", true, true);
+        assert_eq!(encoded.first().copied(), Some(vocab.bos()));
+        assert_eq!(encoded.last().copied(), Some(vocab.eos()));
+        let decoded = vocab.decode(&encoded);
+        assert_eq!(decoded, "hello");
+    }
+
+    #[test]
+    fn encode_unknown_maps_to_unk() {
+        let vocab = CharVocab::fit(["ab"].into_iter(), true).expect("fit");
+        let tokens = vocab.encode("ac", false, false);
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], vocab.ch2id[&'a']);
+        assert_eq!(tokens[1], vocab.unk().expect("unk token"));
+    }
+
+    #[test]
+    fn save_and_load_preserves_vocab() -> io::Result<()> {
+        let vocab = CharVocab::fit(["abc"].into_iter(), true).expect("fit");
+        let dir = tempdir()?;
+        let path = dir.path().join("vocab.json");
+        vocab.save(&path).expect("save vocab");
+        let loaded = CharVocab::load(&path).expect("load vocab");
+        assert_eq!(vocab, loaded);
+        Ok(())
     }
 }

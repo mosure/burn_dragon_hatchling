@@ -296,12 +296,10 @@ fn sample_gradient(stops: &[ColorStop], value: f32) -> Color {
         return stops[0].color;
     }
     for window in stops.windows(2) {
-        if let [start, end] = window {
-            if clamped <= end.at {
-                let span = (end.at - start.at).max(f32::EPSILON);
-                let t = ((clamped - start.at) / span).clamp(0.0, 1.0);
-                return start.color.lerp(end.color, t);
-            }
+        if let [start, end] = window && clamped <= end.at {
+            let span = (end.at - start.at).max(f32::EPSILON);
+            let t = ((clamped - start.at) / span).clamp(0.0, 1.0);
+            return start.color.lerp(end.color, t);
         }
     }
     stops.last().copied().unwrap().color
@@ -682,20 +680,16 @@ impl VideoHandle {
 impl VizTarget for VideoHandle {
     fn push(&self, snapshot: FrameSnapshot) {
         let mut guard = self.tx.lock();
-        if let Some(sender) = guard.as_ref() {
-            if sender.send(snapshot).is_err() {
-                eprintln!("viz: encoder channel closed; disabling visualization output");
-                *guard = None;
-            }
+        if let Some(sender) = guard.as_ref() && sender.send(snapshot).is_err() {
+            eprintln!("viz: encoder channel closed; disabling visualization output");
+            *guard = None;
         }
     }
 
     fn finalize(&self) {
         self.tx.lock().take();
-        if let Some(join) = self.join.lock().take() {
-            if let Err(err) = join.join() {
-                eprintln!("viz: encoder thread join failed: {err:?}");
-            }
+        if let Some(join) = self.join.lock().take() && let Err(err) = join.join() {
+            eprintln!("viz: encoder thread join failed: {err:?}");
         }
         if let Some(err) = self.errors.lock().take() {
             eprintln!("viz encoder error: {err:#}");
@@ -915,11 +909,9 @@ fn encode_with_ffmpeg(
 }
 
 fn run_encoder(rx: Receiver<FrameSnapshot>, config: VideoConfig) -> Result<()> {
-    if let Some(parent) = config.path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create viz output directory {parent:?}"))?;
-        }
+    if let Some(parent) = config.path.parent() && !parent.as_os_str().is_empty() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create viz output directory {parent:?}"))?;
     }
 
     let requested_width = config.width;
@@ -1262,7 +1254,7 @@ fn render_top_bar(context: &VizRenderContext, rect: Rect, image: &mut Array3<u8>
         let span = spark_rect.width().max(1);
         for (idx, layer) in frame.layers.iter().enumerate() {
             let x = spark_rect.x0 + min(span - 1, idx * span / frame.layers.len().max(1));
-            let norm = (layer.attn_entropy.max(0.0).min(4.0) / 4.0) * spark_rect.height() as f32;
+            let norm = (layer.attn_entropy.clamp(0.0, 4.0) / 4.0) * spark_rect.height() as f32;
             let bar_height = max(1, norm as usize);
             let y_start = spark_rect.y1.saturating_sub(bar_height);
             for y in y_start..spark_rect.y1 {
@@ -1456,8 +1448,8 @@ fn render_scalefree_panel(context: &VizRenderContext, rect: Rect, image: &mut Ar
             .configure_mesh()
             .x_labels(0)
             .y_labels(0)
-            .axis_style(&RGBColor(90, 96, 120))
-            .light_line_style(&RGBColor(40, 44, 60))
+            .axis_style(RGBColor(90, 96, 120))
+            .light_line_style(RGBColor(40, 44, 60))
             .draw()?;
 
         if layer_series.iter().any(|series| !series.points.is_empty()) {
@@ -1615,8 +1607,8 @@ fn render_eeg_panel(context: &VizRenderContext, rect: Rect, mode: EegMode, image
             .disable_mesh()
             .x_labels(0)
             .y_labels(0)
-            .axis_style(&theme.grid.to_rgb())
-            .light_line_style(&theme.grid.to_rgb())
+            .axis_style(theme.grid.to_rgb())
+            .light_line_style(theme.grid.to_rgb())
             .draw()?;
 
         for idx in 1..bands.len() {
@@ -1716,7 +1708,7 @@ fn build_eeg_bands(history: &EegHistory, visible_layers: usize, max_bands: usize
 
     let bounded_layers = visible_layers.max(1).min(history.layers().max(1));
     let target_bands = max_bands.max(1).min(bounded_layers);
-    let chunk = (bounded_layers + target_bands - 1) / target_bands;
+    let chunk = bounded_layers.div_ceil(target_bands);
     let mut bands = Vec::with_capacity(target_bands);
 
     for band_idx in 0..target_bands {
@@ -1823,18 +1815,14 @@ fn compute_panel_heights(modules: &[LayoutModule], total_height: usize) -> Vec<u
             heights[*idx] = portion;
             undistributed = undistributed.saturating_sub(portion);
         }
-        if undistributed > 0 {
-            if let Some((idx, _)) = flex_modules.last() {
-                heights[*idx] += undistributed;
-            }
+        if undistributed > 0 && let Some((idx, _)) = flex_modules.last() {
+            heights[*idx] += undistributed;
         }
     }
 
     let assigned: usize = heights.iter().sum();
-    if assigned < total_height {
-        if let Some(last) = heights.last_mut() {
-            *last += total_height - assigned;
-        }
+    if assigned < total_height && let Some(last) = heights.last_mut() {
+        *last += total_height - assigned;
     }
 
     heights

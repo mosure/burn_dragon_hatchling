@@ -12,7 +12,7 @@ pub struct LayerTap<B: Backend> {
     pub layer: u8,
     pub attn_rows: Vec<HeadRow<B>>,
     pub neurons: Tensor<B, 1>,
-    pub syn_readout: Box<dyn Fn(&[(u32, u32)]) -> Vec<(u32, u32, f32)> + Send + Sync>,
+    pub syn_readout: Box<SynReadout>,
 }
 
 pub struct StepTaps<B: Backend> {
@@ -27,6 +27,8 @@ pub struct CollectKnobs {
     pub k_neuron: usize,
     pub probes: Vec<(u8, Vec<(u32, u32)>)>,
 }
+
+type SynReadout = dyn Fn(&[(u32, u32)]) -> Vec<(u32, u32, f32)> + Send + Sync;
 
 pub fn to_frame<B: Backend>(taps: StepTaps<B>, knobs: &CollectKnobs) -> TokenFrame {
     let mut layers = Vec::with_capacity(taps.layers.len());

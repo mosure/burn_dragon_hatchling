@@ -144,7 +144,7 @@ where
                 .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
             if args.viz || env_enabled {
-                let targets = build_viz_targets(&args);
+                let targets = build_viz_targets(args);
                 if targets.is_empty() {
                     Viz::new(VizMode::Off)
                 } else {
