@@ -60,8 +60,8 @@ fn run_inference_backend<B, Init, Skip>(
     Init: Fn(&<B as BackendTrait>::Device),
     Skip: Fn(&BDHConfig, &InferenceConfig) -> Option<String>,
 {
-    <B as BackendTrait>::seed(42);
     let device = <B as BackendTrait>::Device::default();
+    <B as BackendTrait>::seed(&device, 42);
     init_backend(&device);
 
     let model_config = BDHConfig::default();

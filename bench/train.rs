@@ -2,8 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use burn::LearningRate;
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
+use burn::optim::{AdamWConfig, GradientsParams, LearningRate, Optimizer};
 use burn::tensor::backend::{AutodiffBackend, Backend as BackendTrait};
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_autodiff::Autodiff;
@@ -56,8 +55,8 @@ where
     B: AutodiffBackend + Clone + 'static,
     Init: Fn(&<B as BackendTrait>::Device),
 {
-    <B as BackendTrait>::seed(24);
     let device = <B as BackendTrait>::Device::default();
+    <B as BackendTrait>::seed(&device, 24);
     init_backend(&device);
 
     let model_config = BDHConfig::default();

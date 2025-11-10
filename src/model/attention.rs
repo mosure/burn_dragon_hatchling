@@ -270,8 +270,11 @@ impl<B: Backend> Attention<B> {
         let [b, h, t, n] = values.shape().dims();
         let pairs = values.clone().reshape([b, h, t, n / 2, 2]);
 
-        let even = pairs.clone().slice_dim(4, 0..1).squeeze::<4>(4);
-        let odd = pairs.slice_dim(4, 1..2).squeeze::<4>(4);
+        let even = pairs
+            .clone()
+            .slice_dim(4, 0..1)
+            .squeeze_dim::<4>(4);
+        let odd = pairs.slice_dim(4, 1..2).squeeze_dim::<4>(4);
 
         let rotated = Tensor::stack::<5>(vec![odd.clone().neg(), even], 4).reshape([b, h, t, n]);
 

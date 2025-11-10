@@ -72,8 +72,8 @@ where
     B::Device: Clone,
     Init: Fn(&B::Device),
 {
-    B::seed(1337);
     let device = B::Device::default();
+    B::seed(&device, 1337);
     init_backend(&device);
 
     let tokenizer_path = config

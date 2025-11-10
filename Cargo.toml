@@ -49,8 +49,8 @@ rand = "0.8"
 ureq = { version = "2.9", features = ["tls"] }
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 parquet = "53"
-burn-ndarray = "0.18"
-burn-autodiff = "0.18"
+burn-ndarray = "0.19"
+burn-autodiff = "0.19"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 indexmap = "2.5"
@@ -65,7 +65,7 @@ plotters-bitmap = "0.3"
 
 
 [dependencies.burn]
-version = "0.18"
+version = "0.19"
 default-features = true
 features = [
   # "autotune",
@@ -79,7 +79,7 @@ features = [
 ]
 
 [dependencies.burn-wgpu]
-version = "0.18"
+version = "0.19"
 default-features = true
 features = [
   "fusion",
@@ -88,7 +88,7 @@ features = [
 ]
 
 [dependencies.cubecl]
-version = "0.6"
+version = "0.8"
 default-features = true
 features = [
   # "autotune-checks",
@@ -100,7 +100,7 @@ features = [
 ]
 
 [dependencies.cubecl-runtime]
-version = "0.6"
+version = "0.8"
 default-features = true
 features = [
   # "autotune-checks",
@@ -112,7 +112,7 @@ features = [
 ]
 
 [dependencies.burn-train]
-version = "0.18"
+version = "0.19"
 default-features = false
 features = [
   "tui",
@@ -122,7 +122,7 @@ features = [
 version = "0.1"
 
 [dependencies.burn-cuda]
-version = "0.18"
+version = "0.19"
 optional = true
 default-features = false
 features = [

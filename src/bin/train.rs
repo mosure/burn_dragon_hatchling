@@ -7,7 +7,6 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 
-use burn::LearningRate;
 use burn::data::dataloader::DataLoader;
 use burn::lr_scheduler::{
     LrScheduler,
@@ -18,12 +17,19 @@ use burn::lr_scheduler::{
     step::{StepLrScheduler, StepLrSchedulerConfig},
 };
 use burn::optim::adaptor::OptimizerAdaptor;
-use burn::optim::{AdamW, AdamWConfig};
+use burn::optim::{AdamW, AdamWConfig, LearningRate};
 use burn::tensor::Tensor;
 use burn::tensor::backend::{AutodiffBackend, Backend as BackendTrait};
 use burn_autodiff::Autodiff;
 use burn_train::metric::{Adaptor, ItemLazy, LearningRateMetric, LossInput, LossMetric};
-use burn_train::{LearnerBuilder, TrainOutput, TrainStep, ValidStep};
+use burn_train::{
+    LearnerBuilder,
+    LearningStrategy,
+    TrainingResult,
+    TrainOutput,
+    TrainStep,
+    ValidStep,
+};
 use burn_wgpu::Wgpu;
 use tracing::info;
 
@@ -187,8 +193,8 @@ where
     B::Device: Clone,
     Init: Fn(&B::Device),
 {
-    B::seed(1337);
     let device = B::Device::default();
+    B::seed(&device, 1337);
     init_backend(&device);
 
     let training = &config.training;
@@ -320,7 +326,7 @@ fn train_with_scheduler<B, S>(
     model: BDH<B>,
     optimizer: OptimizerAdaptor<AdamW, BDH<B>, B>,
     scheduler: S,
-) -> Result<BDH<B>>
+) -> Result<BDH<ValidBackend<B>>>
 where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
@@ -330,7 +336,7 @@ where
 
     let builder = LearnerBuilder::new(env.run_dir)
         .num_epochs(env.epochs)
-        .devices(vec![env.device.clone()])
+        .learning_strategy(LearningStrategy::SingleDevice(env.device.clone()))
         .with_file_checkpointer(BinFileRecorder::<FullPrecisionSettings>::new())
         .metric_train_numeric(LossMetric::<ValidBackend<B>>::new())
         .metric_valid_numeric(LossMetric::<ValidBackend<B>>::new())
@@ -339,6 +345,11 @@ where
 
     let learner = builder.build(model, optimizer, scheduler);
 
+    let TrainingResult { model, .. } = learner.fit(
+        Arc::clone(&env.train_loader),
+        Arc::clone(&env.valid_loader),
+    );
+
     log_theoretical_profile(
         env.model_config,
         env.training.batch_size,
@@ -346,7 +357,7 @@ where
         env.backend_name,
     );
 
-    Ok(learner.fit(Arc::clone(&env.train_loader), Arc::clone(&env.valid_loader)))
+    Ok(model)
 }
 
 fn resolve_lr_scheduler(

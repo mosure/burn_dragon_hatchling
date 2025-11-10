@@ -1,7 +1,6 @@
 use std::fs;
 
-use burn::LearningRate;
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
+use burn::optim::{AdamWConfig, GradientsParams, LearningRate, Optimizer};
 use burn::tensor::backend::Backend as BackendTrait;
 use burn_autodiff::Autodiff;
 use burn_dragon_hatchling::dataset::{ShakespeareDataset, ShakespeareSplit};
@@ -26,8 +25,8 @@ fn single_training_step_executes() {
         .expect("dataset");
 
     type Backend = Autodiff<NdArray<f32>>;
-    <Backend as BackendTrait>::seed(123);
     let device = <Backend as BackendTrait>::Device::default();
+    <Backend as BackendTrait>::seed(&device, 123);
 
     let mut model_config = BDHConfig::default();
     let vocab = dataset.tokenizer();

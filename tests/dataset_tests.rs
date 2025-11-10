@@ -21,8 +21,8 @@ fn dataset_batches_match_expected_shape() {
         .expect("create dataset");
 
     type Backend = NdArray<f32>;
-    <Backend as BackendTrait>::seed(0);
     let device = <Backend as BackendTrait>::Device::default();
+    <Backend as BackendTrait>::seed(&device, 0);
 
     let batch = dataset.sample_batch::<Backend>(ShakespeareSplit::Train, &device);
     assert_eq!(batch.inputs.shape().dims(), [batch_size, block_size]);
