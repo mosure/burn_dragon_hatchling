@@ -1,4 +1,4 @@
-#![recursion_limit = "512"]
+#![recursion_limit = "256"]
 
 pub mod config;
 pub mod dataset;
@@ -6,6 +6,7 @@ pub mod generation;
 pub mod kernel;
 pub mod model;
 pub mod tokenizer;
+pub mod viz;
 pub mod wgpu;
 
 pub use config::{

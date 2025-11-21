@@ -1,9 +1,8 @@
-#![recursion_limit = "512"]
+#![recursion_limit = "256"]
 
 use std::time::{Duration, Instant};
 
-use burn::LearningRate;
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
+use burn::optim::{AdamWConfig, GradientsParams, LearningRate, Optimizer};
 use burn::tensor::backend::{AutodiffBackend, Backend as BackendTrait};
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_autodiff::Autodiff;
@@ -45,7 +44,7 @@ const TRAIN_CONFIGS: &[TrainConfig] = &[
 ];
 
 fn training_step_bench(c: &mut Criterion) {
-    run_training_backend::<Autodiff<Wgpu<f32>>, _>(c, "wgpu", |device| init_runtime(device));
+    run_training_backend::<Autodiff<Wgpu<f32>>, _>(c, "wgpu", init_runtime);
 
     #[cfg(feature = "cuda")]
     run_training_backend::<Autodiff<Cuda<f32>>, _>(c, "cuda", |_| {});
@@ -56,8 +55,8 @@ where
     B: AutodiffBackend + Clone + 'static,
     Init: Fn(&<B as BackendTrait>::Device),
 {
-    <B as BackendTrait>::seed(24);
     let device = <B as BackendTrait>::Device::default();
+    <B as BackendTrait>::seed(&device, 24);
     init_backend(&device);
 
     let model_config = BDHConfig::default();

@@ -1,4 +1,4 @@
-#![recursion_limit = "512"]
+#![recursion_limit = "256"]
 
 use std::hint::black_box;
 
@@ -44,12 +44,7 @@ const STORAGE_BUFFER_LIMIT_BYTES: u64 = 1 << 30; // ~1 GiB limit on most wgpu dr
 const FLOAT_BYTES: u64 = std::mem::size_of::<f32>() as u64;
 
 fn inference_bench(c: &mut Criterion) {
-    run_inference_backend::<Wgpu<f32>, _, _>(
-        c,
-        "wgpu",
-        |device| init_runtime(device),
-        |config, cfg| skip_reason_wgpu(config, cfg),
-    );
+    run_inference_backend::<Wgpu<f32>, _, _>(c, "wgpu", init_runtime, skip_reason_wgpu);
 
     #[cfg(feature = "cuda")]
     run_inference_backend::<Cuda<f32>, _, _>(c, "cuda", |_| {}, |_, _| None);
@@ -65,8 +60,8 @@ fn run_inference_backend<B, Init, Skip>(
     Init: Fn(&<B as BackendTrait>::Device),
     Skip: Fn(&BDHConfig, &InferenceConfig) -> Option<String>,
 {
-    <B as BackendTrait>::seed(42);
     let device = <B as BackendTrait>::Device::default();
+    <B as BackendTrait>::seed(&device, 42);
     init_backend(&device);
 
     let model_config = BDHConfig::default();

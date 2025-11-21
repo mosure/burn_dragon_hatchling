@@ -10,6 +10,8 @@ use crate::kernel::{BlockPattern1d, relu_lowrank};
 
 use super::attention::Attention;
 use super::config::{BDHConfig, FusedKernelConfig};
+#[cfg(feature = "viz")]
+use super::state::LayerVizState;
 use super::state::ModelState;
 
 const LAYER_NORM_EPS: f32 = 1e-5;
@@ -134,7 +136,7 @@ impl<B: Backend> BDH<B> {
             let xy_sparse = x_sparse * y_sparse;
             let xy_sparse = self.dropout.forward(xy_sparse);
 
-            let mixed = xy_sparse.swap_dims(1, 2);
+            let mixed = xy_sparse.clone().swap_dims(1, 2);
             let [batch, time, heads, latent] = mixed.shape().dims();
             let mixed_flat = mixed.reshape([batch * time, heads * latent]);
 
@@ -303,8 +305,50 @@ impl<B: Backend> BDH<B> {
             let xy_sparse = x_sparse * y_sparse;
             let xy_sparse = self.dropout.forward(xy_sparse);
 
-            let mixed = xy_sparse.swap_dims(1, 2);
+            let mixed = xy_sparse.clone().swap_dims(1, 2);
             let [batch, time, heads, latent] = mixed.shape().dims();
+
+            #[cfg(feature = "viz")]
+            if time > 0 {
+                let attn_rows = layer_state
+                    .attention
+                    .last_attention()
+                    .map(|tensor| {
+                        let dims = tensor.shape().dims::<3>();
+                        let context = dims[2];
+                        (0..dims[1])
+                            .map(|head_idx| {
+                                tensor
+                                    .clone()
+                                    .slice_dim(0, 0..1)
+                                    .slice_dim(1, head_idx..head_idx + 1)
+                                    .reshape([context])
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                let neurons = mixed
+                    .clone()
+                    .slice_dim(1, (time - 1)..time)
+                    .reshape([batch, heads * latent])
+                    .slice_dim(0, 0..1)
+                    .reshape([heads * latent]);
+
+                let synapses = xy_sparse
+                    .clone()
+                    .slice_dim(2, (time - 1)..time)
+                    .reshape([batch, heads, latent])
+                    .slice_dim(0, 0..1)
+                    .reshape([heads, latent]);
+
+                layer_state.viz = Some(LayerVizState {
+                    attn_rows,
+                    neurons,
+                    synapses,
+                });
+            }
+
             let mixed_flat = mixed.reshape([batch * time, heads * latent]);
 
             let mlp_flat = mixed_flat.matmul(decoder.clone());

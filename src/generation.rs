@@ -49,6 +49,9 @@ pub fn prefill_state<B: Backend>(
 
     let last_logits = logits.slice_dim(1, (time - 1)..time).reshape([vocab]);
 
+    #[cfg(feature = "viz")]
+    state.clear_viz();
+
     Ok((state, last_logits))
 }
 

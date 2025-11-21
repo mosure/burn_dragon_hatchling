@@ -32,8 +32,8 @@ fn assert_close(lhs: Tensor<Backend, 4>, rhs: Tensor<Backend, 4>, atol: f32, rto
 
 #[test]
 fn relu_lowrank_fused_matches_reference() {
-    <Backend as BackendTrait>::seed(42);
     let device = <Backend as BackendTrait>::Device::default();
+    <Backend as BackendTrait>::seed(&device, 42);
 
     let input =
         Tensor::<Backend, 4>::random([2, 1, 5, 6], TensorDistribution::Normal(0.0, 1.0), &device);
@@ -67,8 +67,8 @@ fn relu_lowrank_fused_matches_reference() {
 
 #[test]
 fn fused_attention_matches_reference_when_alibi_disabled() {
-    <Backend as BackendTrait>::seed(1337);
     let device = <Backend as BackendTrait>::Device::default();
+    <Backend as BackendTrait>::seed(&device, 1337);
 
     let batch = 1;
     let heads = 2;
@@ -131,8 +131,11 @@ fn rope(phases: Tensor<Backend, 4>, values: Tensor<Backend, 4>) -> Tensor<Backen
     let [b, h, t, n] = values.shape().dims();
     let pairs = values.clone().reshape([b, h, t, n / 2, 2]);
 
-    let even = pairs.clone().slice_dim(4, 0..1).squeeze::<4>(4);
-    let odd = pairs.slice_dim(4, 1..2).squeeze::<4>(4);
+    let even = pairs
+        .clone()
+        .slice_dim(4, 0..1)
+        .squeeze_dim::<4>(4);
+    let odd = pairs.slice_dim(4, 1..2).squeeze_dim::<4>(4);
 
     let rotated = Tensor::stack::<5>(vec![odd.clone().neg(), even], 4).reshape([b, h, t, n]);
 
