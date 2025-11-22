@@ -155,8 +155,33 @@ impl<B: BackendTrait> Default for LanguageModelEsObjective<B> {
 impl<B: BackendTrait> EggrollObjective<BDH<B>, B> for LanguageModelEsObjective<B> {
     type Batch = SequenceBatch<B>;
 
-    fn evaluate(&mut self, model: &BDH<B>, batch: &Self::Batch) -> f32 {
+    fn evaluate(&self, model: &BDH<B>, batch: &Self::Batch) -> f32 {
         let logits = model.forward(batch.inputs.clone());
+        let loss = language_model_loss::<B>(logits, batch.targets.clone());
+        let data = loss
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .unwrap_or_default();
+        data.first().copied().unwrap_or(0.0)
+    }
+
+    fn evaluate_with_noise(
+        &self,
+        model: &BDH<B>,
+        batch: &Self::Batch,
+        noiser: &burn_dragon_hatchling::eggroll::EggrollNoiser<B>,
+        es_key: &burn_dragon_hatchling::eggroll::EsTreeKey,
+        thread_id: u32,
+        deterministic: bool,
+    ) -> f32 {
+        let logits = model.forward_with_noise_det(
+            batch.inputs.clone(),
+            noiser,
+            es_key,
+            thread_id,
+            deterministic,
+        );
         let loss = language_model_loss::<B>(logits, batch.targets.clone());
         let data = loss
             .to_data()

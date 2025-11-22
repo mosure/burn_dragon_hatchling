@@ -398,6 +398,59 @@ impl<B: Backend> EggrollNoiser<B> {
         let mut mapper = Mapper { noise };
         model.clone().map(&mut mapper)
     }
+
+    /// Apply noise deterministically from the ES tree key without materializing a noise map.
+    pub fn apply_noise_from_key<M>(
+        &self,
+        model: &M,
+        es_tree_key: &EsTreeKey,
+        thread_id: u32,
+    ) -> M
+    where
+        M: Module<B> + Clone,
+    {
+        struct Mapper<'a, B: Backend> {
+            noiser: &'a EggrollNoiser<B>,
+            es_tree_key: &'a EsTreeKey,
+            thread_id: u32,
+        }
+
+        impl<'a, B: Backend> ModuleMapper<B> for Mapper<'a, B> {
+            fn map_float<const D: usize>(
+                &mut self,
+                param: Param<Tensor<B, D>>,
+            ) -> Param<Tensor<B, D>> {
+                let (id, tensor, mapper) = param.consume();
+                let Some(spec) = self.noiser.param_spec(id) else {
+                    return Param::from_mapped_value(id, tensor, mapper);
+                };
+                let delta = self
+                    .noiser
+                    .low_rank_delta(spec, self.es_tree_key, self.thread_id);
+
+                match (D, delta) {
+                    (2, EggrollNoiseTensor::D2(delta)) => {
+                        let delta = Tensor::<B, D>::from_data(delta.to_data(), &tensor.device());
+                        let updated = tensor + delta;
+                        Param::from_mapped_value(id, updated, mapper)
+                    }
+                    (3, EggrollNoiseTensor::D3(delta)) => {
+                        let delta = Tensor::<B, D>::from_data(delta.to_data(), &tensor.device());
+                        let updated = tensor + delta;
+                        Param::from_mapped_value(id, updated, mapper)
+                    }
+                    _ => Param::from_mapped_value(id, tensor, mapper),
+                }
+            }
+        }
+
+        let mut mapper = Mapper {
+            noiser: self,
+            es_tree_key,
+            thread_id,
+        };
+        model.clone().map(&mut mapper)
+    }
 }
 
 pub fn discover_param_specs<M, B>(

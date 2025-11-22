@@ -91,7 +91,7 @@ impl<B: Backend> BDH<B> {
     }
 
     pub fn forward(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        self.forward_inner(tokens, None, None, None)
+        self.forward_inner(tokens, None, None, None, false)
     }
 
     pub fn forward_with_noise(
@@ -101,10 +101,27 @@ impl<B: Backend> BDH<B> {
         es_key: &EsTreeKey,
         thread_id: u32,
     ) -> Tensor<B, 3> {
+        self.forward_with_noise_det(tokens, noiser, es_key, thread_id, true)
+    }
+
+    pub fn forward_with_noise_det(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        noiser: &EggrollNoiser<B>,
+        es_key: &EsTreeKey,
+        thread_id: u32,
+        deterministic: bool,
+    ) -> Tensor<B, 3> {
         if noiser.params.config.sigma == 0.0 {
             return self.forward(tokens);
         }
-        self.forward_inner(tokens, Some(noiser), Some(es_key), Some(thread_id))
+        self.forward_inner(
+            tokens,
+            Some(noiser),
+            Some(es_key),
+            Some(thread_id),
+            deterministic,
+        )
     }
 
     fn forward_inner(
@@ -113,6 +130,7 @@ impl<B: Backend> BDH<B> {
         noiser: Option<&EggrollNoiser<B>>,
         es_key: Option<&EsTreeKey>,
         thread_id: Option<u32>,
+        deterministic: bool,
     ) -> Tensor<B, 3> {
         let embed_out = if let (Some(n), Some(k), Some(tid)) = (noiser, es_key, thread_id) {
             n.do_emb(&self.embed.weight.val(), &tokens, self.embed.weight.id, k, tid)
@@ -174,7 +192,11 @@ impl<B: Backend> BDH<B> {
                 activation::relu(y_latent)
             };
             let xy_sparse = x_sparse * y_sparse;
-            let xy_sparse = self.dropout.forward(xy_sparse);
+            let xy_sparse = if deterministic {
+                xy_sparse
+            } else {
+                self.dropout.forward(xy_sparse)
+            };
 
             let mixed = xy_sparse.clone().swap_dims(1, 2);
             let [batch, time, heads, latent] = mixed.shape().dims();
@@ -295,7 +317,7 @@ impl<B: Backend> BDH<B> {
         tokens: Tensor<B, 2, Int>,
         state: &mut ModelState<B>,
     ) -> Tensor<B, 3> {
-        self.forward_with_state_inner(tokens, state, None, None, None)
+        self.forward_with_state_inner(tokens, state, None, None, None, false)
     }
 
     pub fn forward_with_state_and_noise(
@@ -306,7 +328,33 @@ impl<B: Backend> BDH<B> {
         es_key: &EsTreeKey,
         thread_id: u32,
     ) -> Tensor<B, 3> {
-        self.forward_with_state_inner(tokens, state, Some(noiser), Some(es_key), Some(thread_id))
+        self.forward_with_state_and_noise_det(
+            tokens,
+            state,
+            noiser,
+            es_key,
+            thread_id,
+            true,
+        )
+    }
+
+    pub fn forward_with_state_and_noise_det(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        state: &mut ModelState<B>,
+        noiser: &EggrollNoiser<B>,
+        es_key: &EsTreeKey,
+        thread_id: u32,
+        deterministic: bool,
+    ) -> Tensor<B, 3> {
+        self.forward_with_state_inner(
+            tokens,
+            state,
+            Some(noiser),
+            Some(es_key),
+            Some(thread_id),
+            deterministic,
+        )
     }
 
     fn forward_with_state_inner(
@@ -316,6 +364,7 @@ impl<B: Backend> BDH<B> {
         noiser: Option<&EggrollNoiser<B>>,
         es_key: Option<&EsTreeKey>,
         thread_id: Option<u32>,
+        deterministic: bool,
     ) -> Tensor<B, 3> {
         assert_eq!(
             state.layers.len(),
@@ -387,7 +436,11 @@ impl<B: Backend> BDH<B> {
             };
 
             let xy_sparse = x_sparse * y_sparse;
-            let xy_sparse = self.dropout.forward(xy_sparse);
+            let xy_sparse = if deterministic {
+                xy_sparse
+            } else {
+                self.dropout.forward(xy_sparse)
+            };
 
             let mixed = xy_sparse.clone().swap_dims(1, 2);
             let [batch, time, heads, latent] = mixed.shape().dims();

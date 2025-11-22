@@ -4,8 +4,8 @@ use burn::tensor::Tensor;
 use burn_ndarray::NdArray;
 
 use burn_dragon_hatchling::eggroll::{
-    EggrollConfig, EggrollObjective, EggrollTrainer, EggrollNoiser, EggrollKey, EsTreeKey,
-    EggrollParamSpec, discover_param_specs,
+    EggrollConfig, EggrollNoiseTensor, EggrollObjective, EggrollTrainer, EggrollNoiser,
+    EggrollKey, EsTreeKey, EggrollParamSpec, discover_param_specs,
 };
 use burn_dragon_hatchling::{BDH, BDHConfig, BdhEsConfig};
 use burn::tensor::Int;
@@ -68,8 +68,47 @@ impl<B: Backend> MseObjective<B> {
 impl<B: Backend> EggrollObjective<SimpleLinear<B>, B> for MseObjective<B> {
     type Batch = Tensor<B, 2>;
 
-    fn evaluate(&mut self, model: &SimpleLinear<B>, batch: &Self::Batch) -> f32 {
+    fn evaluate(&self, model: &SimpleLinear<B>, batch: &Self::Batch) -> f32 {
         let pred = model.forward(batch.clone());
+        let diff = pred - self.target.clone();
+        let mse = diff.clone().powf_scalar(2.0).sum().div_scalar(diff.shape().num_elements() as f32);
+        mse.to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .unwrap_or_default()
+            .first()
+            .copied()
+            .unwrap_or(0.0)
+            * -1.0
+    }
+
+    fn evaluate_with_noise(
+        &self,
+        model: &SimpleLinear<B>,
+        batch: &Self::Batch,
+        noiser: &EggrollNoiser<B>,
+        es_key: &EsTreeKey,
+        thread_id: u32,
+        _deterministic: bool,
+    ) -> f32 {
+        // Manually form noisy weight without cloning the whole module.
+        let spec = EggrollParamSpec {
+            id: model.weight.id,
+            path: "weight".into(),
+            shape: {
+                let dims = model.weight.val().shape().dims::<2>();
+                (dims[0], dims[1])
+            },
+            rank: 2,
+            sigma_scale: 1.0,
+            stack: None,
+        };
+        let delta = match noiser.low_rank_delta(&spec, es_key, thread_id) {
+            EggrollNoiseTensor::D2(d) => d,
+            EggrollNoiseTensor::D3(_) => unreachable!(),
+        };
+        let w_noisy = model.weight.val() + delta;
+        let pred = batch.clone().matmul(w_noisy.swap_dims(0, 1));
         let diff = pred - self.target.clone();
         let mse = diff.clone().powf_scalar(2.0).sum().div_scalar(diff.shape().num_elements() as f32);
         mse.to_data()
@@ -156,7 +195,7 @@ fn eggroll_improves_on_linear_mse() {
         MseObjective::new(target.clone()),
     );
 
-    let mut objective = MseObjective::new(target.clone());
+    let objective = MseObjective::new(target.clone());
     let baseline = objective.evaluate(&trainer.model, &batch);
     let baseline_mse = -baseline;
     let w_start = trainer.model.weight.val().clone();

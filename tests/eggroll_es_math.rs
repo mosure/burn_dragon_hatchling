@@ -31,9 +31,34 @@ struct LinearObjective;
 impl<B: Backend> EggrollObjective<ScalarModel<B>, B> for LinearObjective {
     type Batch = ();
 
-    fn evaluate(&mut self, model: &ScalarModel<B>, _batch: &Self::Batch) -> f32 {
+    fn evaluate(&self, model: &ScalarModel<B>, _batch: &Self::Batch) -> f32 {
         let val = model.forward();
         val.to_data().convert::<f32>().into_vec::<f32>().unwrap()[0]
+    }
+
+    fn evaluate_with_noise(
+        &self,
+        model: &ScalarModel<B>,
+        _batch: &Self::Batch,
+        noiser: &EggrollNoiser<B>,
+        es_key: &EsTreeKey,
+        thread_id: u32,
+        _deterministic: bool,
+    ) -> f32 {
+        let spec = EggrollParamSpec {
+            id: model.w.id,
+            path: "w".into(),
+            shape: (1, 1),
+            rank: 1,
+            sigma_scale: 1.0,
+            stack: None,
+        };
+        let delta = match noiser.low_rank_delta(&spec, es_key, thread_id) {
+            EggrollNoiseTensor::D2(d) => d,
+            EggrollNoiseTensor::D3(_) => unreachable!(),
+        };
+        let noisy = model.w.val() + delta;
+        noisy.to_data().convert::<f32>().into_vec::<f32>().unwrap()[0]
     }
 }
 

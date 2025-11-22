@@ -12,7 +12,18 @@ use super::rng::{EggrollKey, EsTreeKey};
 pub trait EggrollObjective<M, B: Backend> {
     type Batch;
 
-    fn evaluate(&mut self, model: &M, batch: &Self::Batch) -> f32;
+    fn evaluate(&self, model: &M, batch: &Self::Batch) -> f32;
+
+    /// Evaluate using a noisy forward path without cloning the base model.
+    fn evaluate_with_noise(
+        &self,
+        model: &M,
+        batch: &Self::Batch,
+        noiser: &EggrollNoiser<B>,
+        es_key: &EsTreeKey,
+        thread_id: u32,
+        deterministic: bool,
+    ) -> f32;
 }
 
 pub struct EggrollTrainer<M, B: Backend, Obj>
@@ -62,7 +73,14 @@ where
             },
         }
     }
+}
 
+impl<M, B, Obj> EggrollTrainer<M, B, Obj>
+where
+    M: Module<B> + Clone,
+    B: Backend,
+    Obj: EggrollObjective<M, B>,
+{
     pub fn step(&mut self, batch: &Obj::Batch) -> &M {
         let pop = self.state.config.pop_size;
         if pop == 0 {
@@ -71,13 +89,17 @@ where
 
         let es_key = self.state.es_key.clone().with_step(self.state.step);
 
-        let mut fitness = Vec::with_capacity(pop);
+        let mut fitness: Vec<f32> = Vec::with_capacity(pop);
         for thread_id in 0..pop {
-            let noise = self
-                .noiser
-                .build_noise_map(&es_key, thread_id as u32);
-            let candidate = self.noiser.apply_noise(&self.model, &noise);
-            let score = self.objective.evaluate(&candidate, batch);
+            let tid = thread_id as u32;
+            let score = self.objective.evaluate_with_noise(
+                &self.model,
+                batch,
+                &self.noiser,
+                &es_key,
+                tid,
+                true,
+            );
             fitness.push(score);
         }
 

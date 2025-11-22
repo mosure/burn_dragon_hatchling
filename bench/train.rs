@@ -6,7 +6,11 @@ use burn::optim::{AdamWConfig, GradientsParams, LearningRate, Optimizer};
 use burn::tensor::backend::{AutodiffBackend, Backend as BackendTrait};
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_autodiff::Autodiff;
-use burn_dragon_hatchling::{BDH, BDHConfig, language_model_loss, wgpu::init_runtime};
+use burn_dragon_hatchling::{
+    eggroll::{EggrollKey, EggrollNoiser, EsTreeKey},
+    bdh_param_specs, language_model_loss,
+    BDH, BDHConfig, BdhEsConfig, wgpu::init_runtime,
+};
 use burn_wgpu::Wgpu;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
@@ -48,6 +52,13 @@ fn training_step_bench(c: &mut Criterion) {
 
     #[cfg(feature = "cuda")]
     run_training_backend::<Autodiff<Cuda<f32>>, _>(c, "cuda", |_| {});
+}
+
+fn eggroll_forward_bench(c: &mut Criterion) {
+    run_eggroll_forward_backend::<Wgpu<f32>, _>(c, "wgpu", init_runtime);
+
+    #[cfg(feature = "cuda")]
+    run_eggroll_forward_backend::<Cuda<f32>, _>(c, "cuda", |_| {});
 }
 
 fn run_training_backend<B, Init>(c: &mut Criterion, backend_name: &'static str, init_backend: Init)
@@ -137,6 +148,100 @@ where
     group.finish();
 }
 
+fn run_eggroll_forward_backend<B, Init>(
+    c: &mut Criterion,
+    backend_name: &'static str,
+    init_backend: Init,
+)
+where
+    B: BackendTrait + Clone + 'static,
+    Init: Fn(&<B as BackendTrait>::Device),
+{
+    let device = <B as BackendTrait>::Device::default();
+    <B as BackendTrait>::seed(&device, 42);
+    init_backend(&device);
+
+    let model_config = BDHConfig::default();
+    let mut es_cfg = BdhEsConfig::default();
+    es_cfg.eggroll.pop_size = 1; // forward_with_noise uses a single noise sample
+    es_cfg.eggroll.sigma = 0.01;
+
+    let max_batch = TRAIN_CONFIGS.iter().map(|cfg| cfg.batch).max().unwrap_or(1);
+    let max_block = TRAIN_CONFIGS.iter().map(|cfg| cfg.block).max().unwrap_or(1);
+    let max_token_count = max_batch * max_block;
+
+    let mut base_input_tokens = Vec::with_capacity(max_token_count);
+    for idx in 0..max_token_count {
+        base_input_tokens.push((idx % 255) as i64);
+    }
+    let base_inputs = Tensor::<B, 2, Int>::from_data(
+        TensorData::new(base_input_tokens, [max_batch, max_block]),
+        &device,
+    );
+
+    let mut group =
+        c.benchmark_group(format!("bdh_forward_vs_eggroll/{backend_name}"));
+
+    for cfg in TRAIN_CONFIGS {
+        let inputs = base_inputs
+            .clone()
+            .slice_dim(0, 0..cfg.batch)
+            .slice_dim(1, 0..cfg.block);
+
+        let model = BDH::<B>::new(model_config.clone(), &device);
+        let param_specs = bdh_param_specs(&model, &es_cfg);
+        let noiser = EggrollNoiser::new(param_specs, es_cfg.eggroll.clone(), &device);
+        let es_key = EsTreeKey::new(EggrollKey::from_seed(es_cfg.eggroll.seed));
+
+        // Warm-up plain and noisy forward
+        let _ = model.forward(inputs.clone());
+        let _ = model.forward_with_noise(inputs.clone(), &noiser, &es_key, 0);
+
+        log_theoretical_profile(&model_config, cfg);
+        group.throughput(Throughput::Elements(cfg.batch as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("plain", cfg.name),
+            cfg,
+            |b, _| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let start = Instant::now();
+                        let _ = model.forward(inputs.clone());
+                        total += start.elapsed();
+                    }
+                    total
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("eggroll", cfg.name),
+            cfg,
+            |b, _| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for step in 0..iters {
+                        let es_step = es_key.clone().with_step(step as u64);
+                        let start = Instant::now();
+                        let _ = model.forward_with_noise(
+                            inputs.clone(),
+                            &noiser,
+                            &es_step,
+                            0,
+                        );
+                        total += start.elapsed();
+                    }
+                    total
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn log_theoretical_profile(config: &BDHConfig, cfg: &TrainConfig) {
     let batch = cfg.batch as u64;
     let time = cfg.block as u64;
@@ -172,5 +277,5 @@ fn compute_latent_total(config: &BDHConfig) -> usize {
     compute_latent_per_head(config) * config.n_head
 }
 
-criterion_group!(benches, training_step_bench);
+criterion_group!(benches, training_step_bench, eggroll_forward_bench);
 criterion_main!(benches);
