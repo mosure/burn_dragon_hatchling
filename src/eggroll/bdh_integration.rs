@@ -36,11 +36,6 @@ impl Default for BdhEsConfig {
             rank,
             sigma_scale: 1.0,
         };
-        let off = |rank| BdhEsTargetConfig {
-            enabled: false,
-            rank,
-            sigma_scale: 0.0,
-        };
         Self {
             eggroll: EggrollConfig::default(),
             embedding: on(default_rank),

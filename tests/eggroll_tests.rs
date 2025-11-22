@@ -30,6 +30,26 @@ impl<B: Backend> SimpleLinear<B> {
     }
 }
 
+#[derive(Module, Debug)]
+struct StackedParams<B: Backend> {
+    weight: Param<Tensor<B, 3>>,
+}
+
+impl<B: Backend> StackedParams<B> {
+    fn new(device: &B::Device) -> Self {
+        let w = Tensor::<B, 3>::from_floats(
+            [
+                [[0.1, -0.2], [0.3, 0.4]],
+                [[-0.1, 0.2], [0.5, -0.6]],
+            ],
+            device,
+        );
+        Self {
+            weight: Param::from_tensor(w),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct MseObjective<B: Backend> {
     target: Tensor<B, 2>,
@@ -179,6 +199,49 @@ fn eggroll_improves_on_linear_mse() {
 }
 
 #[test]
+fn stacked_params_receive_noise() {
+    type B = NdArray<f32>;
+    let device = <B as Backend>::Device::default();
+    let model = StackedParams::<B>::new(&device);
+    let spec = EggrollParamSpec {
+        id: model.weight.id,
+        path: "stacked".into(),
+        shape: (2, 2),
+        rank: 2,
+        sigma_scale: 1.0,
+        stack: Some(2),
+    };
+    let noiser = EggrollNoiser::new(
+        vec![spec.clone()],
+        EggrollConfig {
+            sigma: 0.1,
+            pop_size: 1,
+            lr: 0.0,
+            weight_decay: 0.0,
+            rank: 2,
+            seed: 7,
+            max_param_norm: None,
+        },
+        &device,
+    );
+    let es_key = EsTreeKey::new(EggrollKey::from_seed(7));
+    let noise = noiser.build_noise_map(&es_key, 0);
+    let candidate = noiser.apply_noise(&model, &noise);
+    let diff = (candidate.weight.val() - model.weight.val())
+        .abs()
+        .sum()
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .unwrap();
+    assert!(
+        diff[0] > 0.0,
+        "stacked noise application produced no delta: diff={}",
+        diff[0]
+    );
+}
+
+#[test]
 fn embedding_sigma_zero_matches_plain() {
     type EB = NdArray<f32>;
     let device = <EB as Backend>::Device::default();
@@ -267,6 +330,49 @@ fn bdh_sigma_zero_matches_plain() {
     assert!(
         diff[0] < 1e-5,
         "BDH sigma=0 forward should match plain. diff={}",
+        diff[0]
+    );
+}
+
+#[test]
+fn bdh_encoder_noise_changes_output() {
+    type EB = NdArray<f32>;
+    let device = <EB as Backend>::Device::default();
+    let mut cfg = BDHConfig::default();
+    cfg.dropout = 0.0;
+    let model = BDH::<EB>::new(cfg.clone(), &device);
+    let mut es_cfg = BdhEsConfig::default();
+    es_cfg.embedding.enabled = false;
+    es_cfg.decoder.enabled = false;
+    es_cfg.lm_head.enabled = false;
+    es_cfg.encoder_v.enabled = false;
+    es_cfg.encoder.enabled = true;
+    es_cfg.eggroll.sigma = 0.05;
+    es_cfg.eggroll.pop_size = 1;
+    es_cfg.eggroll.seed = 314159;
+
+    let tokens = Tensor::<EB, 2, Int>::from_data(
+        burn::tensor::TensorData::new(vec![0i64, 2, 4, 6], [1, 4]),
+        &device,
+    );
+
+    let param_specs = model.es_param_specs(&es_cfg);
+    let noiser = EggrollNoiser::new(param_specs, es_cfg.eggroll.clone(), &device);
+    let es_key = EsTreeKey::new(EggrollKey::from_seed(es_cfg.eggroll.seed));
+
+    let plain = model.forward(tokens.clone());
+    let noisy = model.forward_with_noise(tokens.clone(), &noiser, &es_key, 0);
+    let diff = (noisy - plain)
+        .abs()
+        .sum()
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .unwrap();
+
+    assert!(
+        diff[0] > 0.0,
+        "encoder noise failed to change forward output. diff={}",
         diff[0]
     );
 }

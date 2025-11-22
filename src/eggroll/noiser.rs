@@ -285,10 +285,13 @@ impl<B: Backend> EggrollNoiser<B> {
         let a = noise
             .clone()
             .slice_dim(1, 0..rows)
-            .reshape([stack, rows, rank]);
+            .reshape([stack, rows, rank])
+            .unsqueeze_dim::<4>(0);
         let b = noise
             .slice_dim(1, rows..(rows + cols))
-            .reshape([stack, cols, rank]);
+            .reshape([stack, cols, rank])
+            .swap_dims(2, 1)
+            .unsqueeze_dim::<4>(0);
 
         let mut x_expanded = x.clone();
         let dims = x_expanded.shape().dims::<4>();
@@ -297,7 +300,7 @@ impl<B: Backend> EggrollNoiser<B> {
             x_expanded = x_expanded.repeat_dim(1, repeat).slice_dim(1, 0..stack);
         }
 
-        let corr = x_expanded.matmul(a).matmul(b.swap_dims(1, 2));
+        let corr = x_expanded.matmul(a).matmul(b);
         base + corr.mul_scalar(self.scale(spec))
     }
 
