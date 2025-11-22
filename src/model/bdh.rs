@@ -126,24 +126,150 @@ impl<B: Backend> BDH<B> {
 
     pub fn forward_population_with_noise(
         &self,
-        tokens: Tensor<B, 2, Int>,
+        tokens: &Tensor<B, 2, Int>,
         noiser: &EggrollNoiser<B>,
-        es_key: &EsTreeKey,
-        pop: usize,
+        tree_key: &EsTreeKey,
+        step: u64,
+        global_workers: &[u32],
         deterministic: bool,
     ) -> Tensor<B, 4> {
-        let mut outs = Vec::with_capacity(pop);
-        for tid in 0..pop {
-            let out = self.forward_with_noise_det(
+        let pop = global_workers.len();
+        if pop == 0 {
+            return Tensor::<B, 4>::zeros([0, 0, 0, 0], &tokens.device());
+        }
+
+        let es_key = tree_key.clone().with_step(step);
+        if pop == 1 {
+            let tid = *global_workers.first().unwrap_or(&0);
+            let logits = self.forward_with_noise_det(
                 tokens.clone(),
                 noiser,
-                es_key,
-                tid as u32,
+                &es_key,
+                tid,
                 deterministic,
             );
-            outs.push(out.unsqueeze_dim::<4>(0));
+            return logits.unsqueeze_dim::<4>(0);
         }
-        Tensor::cat(outs, 0)
+
+        if noiser.params.config.sigma == 0.0 {
+            let logits = self.forward(tokens.clone());
+            return logits
+                .unsqueeze_dim::<4>(0)
+                .repeat_dim(0, pop);
+        }
+
+        let [batch, time] = tokens.shape().dims();
+        let embed_out = noiser.do_emb_pop(
+            &self.embed.weight.val(),
+            tokens,
+            self.embed.weight.id,
+            &es_key,
+            global_workers,
+        );
+        let mut state = embed_out.unsqueeze_dim::<5>(2);
+        state = self.layer_norm(state);
+
+        let decoder_x = self.decoder_x.val();
+        let decoder_y = self.decoder_y.val();
+        let encoder = self.encoder.val();
+        let latent_per_head = decoder_x.shape().dims::<3>()[2];
+
+        for _ in 0..self.n_layer {
+            let state_flat = state.clone().reshape([pop * batch, 1, time, self.n_embd]);
+            let x_latent_all = noiser.do_stack_tmm_pop(
+                state_flat,
+                &decoder_x,
+                self.decoder_x.id,
+                &es_key,
+                global_workers,
+            );
+            let mut x_latent = Self::slice_pop_blocks(x_latent_all, batch, pop);
+            if self.kernel.relu_threshold != 0.0 {
+                x_latent = x_latent.sub_scalar(self.kernel.relu_threshold);
+            }
+            let x_sparse = activation::relu(x_latent);
+
+            let attn_q = x_sparse.clone().reshape([
+                pop * batch,
+                self.n_head,
+                time,
+                latent_per_head,
+            ]);
+            let attn_v = state.clone().reshape([pop * batch, 1, time, self.n_embd]);
+            let attn = self
+                .attention
+                .forward(attn_q, attn_v)
+                .reshape([pop, batch, self.n_head, time, self.n_embd]);
+            let attn = self.layer_norm(attn);
+
+            let attn_flat =
+                attn.clone().reshape([pop * batch, self.n_head, time, self.n_embd]);
+            let y_latent_all = noiser.do_stack_tmm_pop(
+                attn_flat,
+                &decoder_y,
+                self.decoder_y.id,
+                &es_key,
+                global_workers,
+            );
+            let mut y_latent = Self::slice_pop_blocks(y_latent_all, batch, pop);
+            if self.kernel.relu_threshold != 0.0 {
+                y_latent = y_latent.sub_scalar(self.kernel.relu_threshold);
+            }
+            let y_sparse = activation::relu(y_latent);
+
+            let mut xy_sparse = x_sparse * y_sparse;
+            if !deterministic {
+                xy_sparse = self.dropout.forward(xy_sparse);
+            }
+
+            let mixed = xy_sparse.swap_dims(2, 3);
+            let [_, _, time, heads, latent] = mixed.shape().dims();
+            let mixed_flat = mixed.reshape([pop * batch * time, heads * latent]);
+
+            let mlp_flat_all = noiser.do_tmm_pop(
+                mixed_flat,
+                &encoder,
+                self.encoder.id,
+                &es_key,
+                global_workers,
+            );
+            let mlp_flat =
+                Self::slice_pop_blocks(mlp_flat_all, batch * time, pop);
+            let mlp_out = mlp_flat
+                .reshape([pop, batch, time, self.n_embd])
+                .unsqueeze_dim::<5>(2);
+            let mlp_out = self.layer_norm(mlp_out);
+            state = self.layer_norm(state + mlp_out);
+        }
+
+        let logits_in = state.reshape([pop * batch * time, self.n_embd]);
+        let logits_all = noiser.do_mm_pop(
+            logits_in,
+            &self.lm_head.val(),
+            self.lm_head.id,
+            &es_key,
+            global_workers,
+        );
+        let logits = Self::slice_pop_blocks(logits_all, batch * time, pop);
+        logits.reshape([pop, batch, time, self.vocab_size])
+    }
+
+    fn slice_pop_blocks<const D: usize>(
+        tensor: Tensor<B, D>,
+        block: usize,
+        pop: usize,
+    ) -> Tensor<B, D> {
+        let mut slices = Vec::with_capacity(pop);
+        for idx in 0..pop {
+            let start = idx * block;
+            let end = start + block;
+            let slice = tensor
+                .clone()
+                .slice_dim(0, idx..idx + 1)
+                .slice_dim(1, start..end);
+            slices.push(slice);
+        }
+        Tensor::cat(slices, 0)
     }
 
     fn forward_inner(

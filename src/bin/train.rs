@@ -197,15 +197,17 @@ impl<B: BackendTrait> EggrollObjective<BDH<B>, B> for LanguageModelEsObjective<B
         model: &BDH<B>,
         batch: &Self::Batch,
         noiser: &burn_dragon_hatchling::eggroll::EggrollNoiser<B>,
-        es_key: &burn_dragon_hatchling::eggroll::EsTreeKey,
-        pop: usize,
+        tree_key: &burn_dragon_hatchling::eggroll::EsTreeKey,
+        step: u64,
+        global_workers: &[u32],
         deterministic: bool,
     ) -> Option<Self::PopLogits> {
         Some(model.forward_population_with_noise(
-            batch.inputs.clone(),
+            &batch.inputs,
             noiser,
-            es_key,
-            pop,
+            tree_key,
+            step,
+            global_workers,
             deterministic,
         ))
     }

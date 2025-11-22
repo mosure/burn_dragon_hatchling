@@ -416,3 +416,114 @@ fn bdh_encoder_noise_changes_output() {
         diff[0]
     );
 }
+
+#[test]
+fn bdh_pop_forward_matches_single_worker() {
+    type EB = NdArray<f32>;
+    let device = <EB as Backend>::Device::default();
+    let mut cfg = BDHConfig::default();
+    cfg.dropout = 0.0;
+    let model = BDH::<EB>::new(cfg, &device);
+
+    let mut es_cfg = BdhEsConfig::default();
+    es_cfg.eggroll.sigma = 0.05;
+    es_cfg.eggroll.pop_size = 1;
+
+    let tokens = Tensor::<EB, 2, Int>::from_data(
+        burn::tensor::TensorData::new(vec![0i64, 1, 2, 3], [1, 4]),
+        &device,
+    );
+
+    let param_specs = model.es_param_specs(&es_cfg);
+    let noiser = EggrollNoiser::new(param_specs, es_cfg.eggroll.clone(), &device);
+    let tree_key = EsTreeKey::new(EggrollKey::from_seed(es_cfg.eggroll.seed));
+    let step = 3;
+    let es_key = tree_key.clone().with_step(step);
+
+    let single = model.forward_with_noise_det(
+        tokens.clone(),
+        &noiser,
+        &es_key,
+        0,
+        true,
+    );
+    let pop_logits = model.forward_population_with_noise(
+        &tokens,
+        &noiser,
+        &tree_key,
+        step,
+        &[0],
+        true,
+    );
+
+    let [batch, time, vocab] = single.shape().dims();
+    let pop0 = pop_logits
+        .slice_dim(0, 0..1)
+        .reshape([batch, time, vocab]);
+    let diff = (pop0 - single)
+        .abs()
+        .sum()
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .unwrap();
+    assert!(
+        diff[0] < 1e-5,
+        "population forward (pop=1) should match single-worker noisy forward, diff={}",
+        diff[0]
+    );
+}
+
+#[test]
+fn bdh_pop_sigma_zero_matches_plain_for_all_workers() {
+    type EB = NdArray<f32>;
+    let device = <EB as Backend>::Device::default();
+    let mut cfg = BDHConfig::default();
+    cfg.dropout = 0.0;
+    let model = BDH::<EB>::new(cfg, &device);
+
+    let mut es_cfg = BdhEsConfig::default();
+    es_cfg.eggroll.sigma = 0.0;
+    es_cfg.eggroll.pop_size = 3;
+
+    let tokens = Tensor::<EB, 2, Int>::from_data(
+        burn::tensor::TensorData::new(vec![4i64, 5, 6, 7], [1, 4]),
+        &device,
+    );
+
+    let param_specs = model.es_param_specs(&es_cfg);
+    let noiser = EggrollNoiser::new(param_specs, es_cfg.eggroll.clone(), &device);
+    let tree_key = EsTreeKey::new(EggrollKey::from_seed(es_cfg.eggroll.seed));
+    let global_workers: Vec<u32> = (0..es_cfg.eggroll.pop_size as u32).collect();
+    let step = 1;
+
+    let base = model.forward(tokens.clone());
+    let pop_logits = model.forward_population_with_noise(
+        &tokens,
+        &noiser,
+        &tree_key,
+        step,
+        &global_workers,
+        true,
+    );
+    let [batch, time, vocab] = base.shape().dims();
+
+    for (idx, _) in global_workers.iter().enumerate() {
+        let worker_logits = pop_logits
+            .clone()
+            .slice_dim(0, idx..idx + 1)
+            .reshape([batch, time, vocab]);
+        let diff = (worker_logits - base.clone())
+            .abs()
+            .sum()
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .unwrap();
+        assert!(
+            diff[0] < 1e-6,
+            "sigma=0 population logits should match base forward for worker {idx}, diff={}",
+            diff[0]
+        );
+    }
+}

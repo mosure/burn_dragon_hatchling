@@ -32,8 +32,9 @@ pub trait EggrollObjective<M, B: Backend> {
         _model: &M,
         _batch: &Self::Batch,
         _noiser: &EggrollNoiser<B>,
-        _es_key: &EsTreeKey,
-        _pop: usize,
+        _tree_key: &EsTreeKey,
+        _step: u64,
+        _global_workers: &[u32],
         _deterministic: bool,
     ) -> Option<Self::PopLogits> {
         None
@@ -110,14 +111,17 @@ where
             return &self.model;
         }
 
-        let es_key = self.state.es_key.clone().with_step(self.state.step);
+        let tree_key = self.state.es_key.clone();
+        let es_key = tree_key.clone().with_step(self.state.step);
+        let global_workers: Vec<u32> = (0..pop as u32).collect();
 
         let fitness: Vec<f32> = if let Some(pop_logits) = self.objective.forward_population(
             &self.model,
             batch,
             &self.noiser,
-            &es_key,
-            pop,
+            &tree_key,
+            self.state.step,
+            &global_workers,
             true,
         ) {
             if let Some(scores) = self.objective.evaluate_population(&pop_logits, batch) {
