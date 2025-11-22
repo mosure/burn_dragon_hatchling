@@ -201,6 +201,16 @@ impl<B: Backend> EggrollNoiser<B> {
         }
     }
 
+    pub fn low_rank_delta_batch(
+        &self,
+        spec: &EggrollParamSpec,
+        es_tree_key: &EsTreeKey,
+        worker_ids: &[u32],
+    ) -> EggrollNoiseTensor<B> {
+        let tid = worker_ids.first().copied().unwrap_or(0);
+        self.low_rank_delta(spec, es_tree_key, tid)
+    }
+
     pub fn do_mm(
         &self,
         x: Tensor<B, 2>,
@@ -227,6 +237,22 @@ impl<B: Backend> EggrollNoiser<B> {
         let a = noise.slice_dim(0, n..(spec.shape.0 + n)).reshape([spec.shape.0, rank]);
         let corr = x.matmul(b).matmul(a.swap_dims(0, 1));
         base + corr.mul_scalar(self.scale(spec))
+    }
+
+    pub fn do_mm_pop(
+        &self,
+        x: Tensor<B, 2>,
+        w: &Tensor<B, 2>,
+        param_id: ParamId,
+        es_tree_key: &EsTreeKey,
+        worker_ids: &[u32],
+    ) -> Tensor<B, 3> {
+        let mut outs = Vec::with_capacity(worker_ids.len());
+        for &tid in worker_ids {
+            let out = self.do_mm(x.clone(), w, param_id, es_tree_key, tid);
+            outs.push(out.unsqueeze_dim::<3>(0));
+        }
+        Tensor::cat(outs, 0)
     }
 
     pub fn do_tmm(
@@ -256,6 +282,22 @@ impl<B: Backend> EggrollNoiser<B> {
             .reshape([spec.shape.1, rank]);
         let corr = x.matmul(a).matmul(b.swap_dims(0, 1));
         base + corr.mul_scalar(self.scale(spec))
+    }
+
+    pub fn do_tmm_pop(
+        &self,
+        x: Tensor<B, 2>,
+        w: &Tensor<B, 2>,
+        param_id: ParamId,
+        es_tree_key: &EsTreeKey,
+        worker_ids: &[u32],
+    ) -> Tensor<B, 3> {
+        let mut outs = Vec::with_capacity(worker_ids.len());
+        for &tid in worker_ids {
+            let out = self.do_tmm(x.clone(), w, param_id, es_tree_key, tid);
+            outs.push(out.unsqueeze_dim::<3>(0));
+        }
+        Tensor::cat(outs, 0)
     }
 
     pub fn do_stack_tmm(
@@ -304,6 +346,22 @@ impl<B: Backend> EggrollNoiser<B> {
         base + corr.mul_scalar(self.scale(spec))
     }
 
+    pub fn do_stack_tmm_pop(
+        &self,
+        x: Tensor<B, 4>,
+        w: &Tensor<B, 3>,
+        param_id: ParamId,
+        es_tree_key: &EsTreeKey,
+        worker_ids: &[u32],
+    ) -> Tensor<B, 5> {
+        let mut outs = Vec::with_capacity(worker_ids.len());
+        for &tid in worker_ids {
+            let out = self.do_stack_tmm(x.clone(), w, param_id, es_tree_key, tid);
+            outs.push(out.unsqueeze_dim::<5>(0));
+        }
+        Tensor::cat(outs, 0)
+    }
+
     pub fn do_emb(
         &self,
         w: &Tensor<B, 2>,
@@ -340,6 +398,22 @@ impl<B: Backend> EggrollNoiser<B> {
             .matmul(b.swap_dims(0, 1))
             .reshape([batch, seq, spec.shape.1]);
         base + corr.mul_scalar(self.scale(spec))
+    }
+
+    pub fn do_emb_pop(
+        &self,
+        w: &Tensor<B, 2>,
+        indices: &Tensor<B, 2, Int>,
+        param_id: ParamId,
+        es_tree_key: &EsTreeKey,
+        worker_ids: &[u32],
+    ) -> Tensor<B, 4> {
+        let mut outs = Vec::with_capacity(worker_ids.len());
+        for &tid in worker_ids {
+            let out = self.do_emb(w, indices, param_id, es_tree_key, tid);
+            outs.push(out.unsqueeze_dim::<4>(0));
+        }
+        Tensor::cat(outs, 0)
     }
 
     pub fn build_noise_map(

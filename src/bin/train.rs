@@ -154,6 +154,7 @@ impl<B: BackendTrait> Default for LanguageModelEsObjective<B> {
 
 impl<B: BackendTrait> EggrollObjective<BDH<B>, B> for LanguageModelEsObjective<B> {
     type Batch = SequenceBatch<B>;
+    type PopLogits = Tensor<B, 4>;
 
     fn evaluate(&self, model: &BDH<B>, batch: &Self::Batch) -> f32 {
         let logits = model.forward(batch.inputs.clone());
@@ -189,6 +190,51 @@ impl<B: BackendTrait> EggrollObjective<BDH<B>, B> for LanguageModelEsObjective<B
             .into_vec::<f32>()
             .unwrap_or_default();
         data.first().copied().unwrap_or(0.0)
+    }
+
+    fn forward_population(
+        &self,
+        model: &BDH<B>,
+        batch: &Self::Batch,
+        noiser: &burn_dragon_hatchling::eggroll::EggrollNoiser<B>,
+        es_key: &burn_dragon_hatchling::eggroll::EsTreeKey,
+        pop: usize,
+        deterministic: bool,
+    ) -> Option<Self::PopLogits> {
+        Some(model.forward_population_with_noise(
+            batch.inputs.clone(),
+            noiser,
+            es_key,
+            pop,
+            deterministic,
+        ))
+    }
+
+    fn evaluate_population(
+        &self,
+        logits: &Self::PopLogits,
+        batch: &Self::Batch,
+    ) -> Option<Vec<f32>> {
+        let dims = logits.shape().dims::<4>();
+        let pop = dims[0];
+        let batch_size = dims[1];
+        let time = dims[2];
+        let vocab = dims[3];
+        let mut scores = Vec::with_capacity(pop);
+        for p in 0..pop {
+            let logits_p = logits
+                .clone()
+                .slice_dim(0, p..p + 1)
+                .reshape([batch_size, time, vocab]);
+            let loss = language_model_loss::<B>(logits_p, batch.targets.clone());
+            let data = loss
+                .to_data()
+                .convert::<f32>()
+                .into_vec::<f32>()
+                .unwrap_or_default();
+            scores.push(data.first().copied().unwrap_or(0.0));
+        }
+        Some(scores)
     }
 }
 

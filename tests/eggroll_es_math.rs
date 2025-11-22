@@ -30,6 +30,7 @@ struct LinearObjective;
 
 impl<B: Backend> EggrollObjective<ScalarModel<B>, B> for LinearObjective {
     type Batch = ();
+    type PopLogits = ();
 
     fn evaluate(&self, model: &ScalarModel<B>, _batch: &Self::Batch) -> f32 {
         let val = model.forward();

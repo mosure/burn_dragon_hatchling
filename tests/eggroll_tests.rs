@@ -67,6 +67,7 @@ impl<B: Backend> MseObjective<B> {
 
 impl<B: Backend> EggrollObjective<SimpleLinear<B>, B> for MseObjective<B> {
     type Batch = Tensor<B, 2>;
+    type PopLogits = ();
 
     fn evaluate(&self, model: &SimpleLinear<B>, batch: &Self::Batch) -> f32 {
         let pred = model.forward(batch.clone());

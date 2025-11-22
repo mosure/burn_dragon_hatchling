@@ -124,6 +124,28 @@ impl<B: Backend> BDH<B> {
         )
     }
 
+    pub fn forward_population_with_noise(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        noiser: &EggrollNoiser<B>,
+        es_key: &EsTreeKey,
+        pop: usize,
+        deterministic: bool,
+    ) -> Tensor<B, 4> {
+        let mut outs = Vec::with_capacity(pop);
+        for tid in 0..pop {
+            let out = self.forward_with_noise_det(
+                tokens.clone(),
+                noiser,
+                es_key,
+                tid as u32,
+                deterministic,
+            );
+            outs.push(out.unsqueeze_dim::<4>(0));
+        }
+        Tensor::cat(outs, 0)
+    }
+
     fn forward_inner(
         &self,
         tokens: Tensor<B, 2, Int>,
