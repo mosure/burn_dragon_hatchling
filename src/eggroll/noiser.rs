@@ -73,6 +73,13 @@ pub enum EggrollNoiseTensor<B: Backend> {
     D3(Tensor<B, 3>),
 }
 
+pub enum EggrollFactors<B: Backend> {
+    /// 2D weight: A [pop, rows, rank], B [pop, cols, rank]
+    D2 { a: Tensor<B, 3>, b: Tensor<B, 3> },
+    /// Stacked 3D weight: A [pop, stack, rows, rank], B [pop, stack, cols, rank]
+    D3 { a: Tensor<B, 4>, b: Tensor<B, 4> },
+}
+
 pub struct EggrollNoiser<B: Backend> {
     pub frozen: EggrollNoiserFrozen,
     pub params: EggrollNoiserParams<B>,
@@ -211,6 +218,75 @@ impl<B: Backend> EggrollNoiser<B> {
         self.low_rank_delta(spec, es_tree_key, tid)
     }
 
+    pub fn low_rank_factors_batch(
+        &self,
+        spec: &EggrollParamSpec,
+        es_tree_key: &EsTreeKey,
+        worker_ids: &[u32],
+    ) -> EggrollFactors<B> {
+        if let Some(stack) = spec.stack {
+            let mut a_list = Vec::with_capacity(worker_ids.len());
+            let mut b_list = Vec::with_capacity(worker_ids.len());
+            for &tid in worker_ids {
+                let noise = self.noise_block_3d(spec, es_tree_key, tid);
+                let rows = spec.shape.0;
+                let cols = spec.shape.1;
+                let rank = spec.rank.max(1);
+                let a = noise
+                    .clone()
+                    .slice_dim(1, 0..rows)
+                    .reshape([stack, rows, rank])
+                    .unsqueeze_dim::<4>(0);
+                let b = noise
+                    .slice_dim(1, rows..(rows + cols))
+                    .reshape([stack, cols, rank])
+                    .unsqueeze_dim::<4>(0);
+                a_list.push(a);
+                b_list.push(b);
+            }
+            let a = if a_list.is_empty() {
+                Tensor::<B, 4>::zeros([0, stack, spec.shape.0, spec.rank.max(1)], &self.params.device)
+            } else {
+                Tensor::cat(a_list, 0)
+            };
+            let b = if b_list.is_empty() {
+                Tensor::<B, 4>::zeros([0, stack, spec.shape.1, spec.rank.max(1)], &self.params.device)
+            } else {
+                Tensor::cat(b_list, 0)
+            };
+            EggrollFactors::D3 { a, b }
+        } else {
+            let mut a_list = Vec::with_capacity(worker_ids.len());
+            let mut b_list = Vec::with_capacity(worker_ids.len());
+            for &tid in worker_ids {
+                let noise = self.noise_block_2d(spec, es_tree_key, tid);
+                let rank = spec.rank.max(1);
+                let a = noise
+                    .clone()
+                    .slice_dim(0, 0..spec.shape.0)
+                    .reshape([spec.shape.0, rank])
+                    .unsqueeze_dim::<3>(0);
+                let b = noise
+                    .slice_dim(0, spec.shape.0..(spec.shape.0 + spec.shape.1))
+                    .reshape([spec.shape.1, rank])
+                    .unsqueeze_dim::<3>(0);
+                a_list.push(a);
+                b_list.push(b);
+            }
+            let a = if a_list.is_empty() {
+                Tensor::<B, 3>::zeros([0, spec.shape.0, spec.rank.max(1)], &self.params.device)
+            } else {
+                Tensor::cat(a_list, 0)
+            };
+            let b = if b_list.is_empty() {
+                Tensor::<B, 3>::zeros([0, spec.shape.1, spec.rank.max(1)], &self.params.device)
+            } else {
+                Tensor::cat(b_list, 0)
+            };
+            EggrollFactors::D2 { a, b }
+        }
+    }
+
     pub fn do_mm(
         &self,
         x: Tensor<B, 2>,
@@ -247,10 +323,25 @@ impl<B: Backend> EggrollNoiser<B> {
         es_tree_key: &EsTreeKey,
         worker_ids: &[u32],
     ) -> Tensor<B, 3> {
+        let base = x.clone().matmul(w.clone().swap_dims(0, 1));
+        let Some(spec) = self.param_spec(param_id) else {
+            return base.unsqueeze_dim::<3>(0).repeat_dim(0, worker_ids.len());
+        };
+        if self.params.config.sigma == 0.0 || spec.sigma_scale == 0.0 || spec.stack.is_some() {
+            return base.unsqueeze_dim::<3>(0).repeat_dim(0, worker_ids.len());
+        }
+
+        let factors = self.low_rank_factors_batch(spec, es_tree_key, worker_ids);
+        let EggrollFactors::D2 { a, b } = factors else {
+            unreachable!();
+        };
         let mut outs = Vec::with_capacity(worker_ids.len());
-        for &tid in worker_ids {
-            let out = self.do_mm(x.clone(), w, param_id, es_tree_key, tid);
-            outs.push(out.unsqueeze_dim::<3>(0));
+        for (idx, _) in worker_ids.iter().enumerate() {
+            let a_i = a.clone().slice_dim(0, idx..idx + 1).reshape([spec.shape.0, spec.rank.max(1)]);
+            let b_i = b.clone().slice_dim(0, idx..idx + 1).reshape([spec.shape.1, spec.rank.max(1)]);
+            let corr = x.clone().matmul(b_i.clone()).matmul(a_i.swap_dims(0, 1));
+            let noisy = base.clone() + corr.mul_scalar(self.scale(spec));
+            outs.push(noisy.unsqueeze_dim::<3>(0));
         }
         Tensor::cat(outs, 0)
     }
@@ -292,10 +383,25 @@ impl<B: Backend> EggrollNoiser<B> {
         es_tree_key: &EsTreeKey,
         worker_ids: &[u32],
     ) -> Tensor<B, 3> {
+        let base = x.clone().matmul(w.clone());
+        let Some(spec) = self.param_spec(param_id) else {
+            return base.unsqueeze_dim::<3>(0).repeat_dim(0, worker_ids.len());
+        };
+        if self.params.config.sigma == 0.0 || spec.sigma_scale == 0.0 || spec.stack.is_some() {
+            return base.unsqueeze_dim::<3>(0).repeat_dim(0, worker_ids.len());
+        }
+
+        let factors = self.low_rank_factors_batch(spec, es_tree_key, worker_ids);
+        let EggrollFactors::D2 { a, b } = factors else {
+            unreachable!();
+        };
         let mut outs = Vec::with_capacity(worker_ids.len());
-        for &tid in worker_ids {
-            let out = self.do_tmm(x.clone(), w, param_id, es_tree_key, tid);
-            outs.push(out.unsqueeze_dim::<3>(0));
+        for (idx, _) in worker_ids.iter().enumerate() {
+            let a_i = a.clone().slice_dim(0, idx..idx + 1).reshape([spec.shape.0, spec.rank.max(1)]);
+            let b_i = b.clone().slice_dim(0, idx..idx + 1).reshape([spec.shape.1, spec.rank.max(1)]);
+            let corr = x.clone().matmul(a_i.clone()).matmul(b_i.swap_dims(0, 1));
+            let noisy = base.clone() + corr.mul_scalar(self.scale(spec));
+            outs.push(noisy.unsqueeze_dim::<3>(0));
         }
         Tensor::cat(outs, 0)
     }
@@ -354,10 +460,46 @@ impl<B: Backend> EggrollNoiser<B> {
         es_tree_key: &EsTreeKey,
         worker_ids: &[u32],
     ) -> Tensor<B, 5> {
+        let base = x.clone().matmul(w.clone().unsqueeze_dim::<4>(0));
+        let Some(spec) = self.param_spec(param_id) else {
+            return base.unsqueeze_dim::<5>(0).repeat_dim(0, worker_ids.len());
+        };
+        if self.params.config.sigma == 0.0 || spec.sigma_scale == 0.0 {
+            return base.unsqueeze_dim::<5>(0).repeat_dim(0, worker_ids.len());
+        }
+        let Some(stack) = spec.stack else {
+            return base.unsqueeze_dim::<5>(0).repeat_dim(0, worker_ids.len());
+        };
+
+        let factors = self.low_rank_factors_batch(spec, es_tree_key, worker_ids);
+        let EggrollFactors::D3 { a, b } = factors else {
+            unreachable!();
+        };
+
         let mut outs = Vec::with_capacity(worker_ids.len());
-        for &tid in worker_ids {
-            let out = self.do_stack_tmm(x.clone(), w, param_id, es_tree_key, tid);
-            outs.push(out.unsqueeze_dim::<5>(0));
+        for (idx, _) in worker_ids.iter().enumerate() {
+            let a_i = a
+                .clone()
+                .slice_dim(0, idx..idx + 1)
+                .reshape([stack, spec.shape.0, spec.rank.max(1)])
+                .unsqueeze_dim::<4>(0);
+            let b_i = b
+                .clone()
+                .slice_dim(0, idx..idx + 1)
+                .reshape([stack, spec.shape.1, spec.rank.max(1)])
+                .swap_dims(2, 1)
+                .unsqueeze_dim::<4>(0);
+
+            let mut x_expanded = x.clone();
+            let dims = x_expanded.shape().dims::<4>();
+            if dims[1] != stack {
+                let repeat = ((stack + dims[1] - 1) / dims[1]).max(1);
+                x_expanded =
+                    x_expanded.repeat_dim(1, repeat).slice_dim(1, 0..stack);
+            }
+            let corr = x_expanded.matmul(a_i).matmul(b_i);
+            let noisy = base.clone() + corr.mul_scalar(self.scale(spec));
+            outs.push(noisy.unsqueeze_dim::<5>(0));
         }
         Tensor::cat(outs, 0)
     }
@@ -408,10 +550,37 @@ impl<B: Backend> EggrollNoiser<B> {
         es_tree_key: &EsTreeKey,
         worker_ids: &[u32],
     ) -> Tensor<B, 4> {
+        let base = emb_lookup(w.clone(), indices.clone());
+        let Some(spec) = self.param_spec(param_id) else {
+            return base.unsqueeze_dim::<4>(0).repeat_dim(0, worker_ids.len());
+        };
+        if self.params.config.sigma == 0.0 || spec.sigma_scale == 0.0 || spec.stack.is_some() {
+            return base.unsqueeze_dim::<4>(0).repeat_dim(0, worker_ids.len());
+        }
+
+        let factors = self.low_rank_factors_batch(spec, es_tree_key, worker_ids);
+        let EggrollFactors::D2 { a, b } = factors else {
+            unreachable!();
+        };
+
+        let [batch, seq] = indices.shape().dims();
         let mut outs = Vec::with_capacity(worker_ids.len());
-        for &tid in worker_ids {
-            let out = self.do_emb(w, indices, param_id, es_tree_key, tid);
-            outs.push(out.unsqueeze_dim::<4>(0));
+        for (idx, _) in worker_ids.iter().enumerate() {
+            let a_i = a
+                .clone()
+                .slice_dim(0, idx..idx + 1)
+                .reshape([spec.shape.0, spec.rank.max(1)]);
+            let b_i = b
+                .clone()
+                .slice_dim(0, idx..idx + 1)
+                .reshape([spec.shape.1, spec.rank.max(1)]);
+
+            let gathered_a = emb_lookup(a_i, indices.clone()); // [batch, seq, rank]
+            let gathered_flat = gathered_a.reshape([batch * seq, spec.rank.max(1)]);
+            let corr_flat = gathered_flat.matmul(b_i.swap_dims(0, 1)); // [batch*seq, cols]
+            let corr = corr_flat.reshape([batch, seq, spec.shape.1]);
+            let noisy = base.clone() + corr.mul_scalar(self.scale(spec));
+            outs.push(noisy.unsqueeze_dim::<4>(0));
         }
         Tensor::cat(outs, 0)
     }
