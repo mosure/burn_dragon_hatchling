@@ -5,10 +5,10 @@ use super::noiser::{EggrollConfig, EggrollParamSpec};
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BdhEsTarget {
     Embedding,
-    Decoder,
+    DecoderX,
+    DecoderY,
     LmHead,
     Encoder,
-    EncoderV,
 }
 
 #[derive(Clone, Debug)]
@@ -22,10 +22,10 @@ pub struct BdhEsTargetConfig {
 pub struct BdhEsConfig {
     pub eggroll: EggrollConfig,
     pub embedding: BdhEsTargetConfig,
-    pub decoder: BdhEsTargetConfig,
+    pub decoder_x: BdhEsTargetConfig,
+    pub decoder_y: BdhEsTargetConfig,
     pub lm_head: BdhEsTargetConfig,
     pub encoder: BdhEsTargetConfig,
-    pub encoder_v: BdhEsTargetConfig,
 }
 
 impl Default for BdhEsConfig {
@@ -39,10 +39,10 @@ impl Default for BdhEsConfig {
         Self {
             eggroll: EggrollConfig::default(),
             embedding: on(default_rank),
-            decoder: on(default_rank),
+            decoder_x: on(default_rank),
+            decoder_y: on(default_rank),
             lm_head: on(default_rank),
             encoder: on(default_rank),
-            encoder_v: on(default_rank),
         }
     }
 }

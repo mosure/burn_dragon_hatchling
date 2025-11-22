@@ -16,12 +16,8 @@ fn bdh_es_registry_contains_expected_targets() {
         targets.insert(spec.path.clone(), spec);
     }
 
-    assert_eq!(
-        targets.len(),
-        5,
-        "expected embedding, decoder, lm_head, encoder, encoder_v"
-    );
-    for name in ["embedding", "decoder", "lm_head"] {
+    assert_eq!(targets.len(), 5, "expected embedding, decoder_x, decoder_y, encoder, lm_head");
+    for name in ["embedding", "lm_head"] {
         assert!(
             targets
                 .get(name)
@@ -31,15 +27,15 @@ fn bdh_es_registry_contains_expected_targets() {
         );
     }
     let latent = model_cfg.latent_per_head();
-    let enc = targets
-        .get("encoder")
-        .expect("missing encoder spec");
-    assert_eq!(enc.stack, Some(model_cfg.n_head));
-    assert_eq!(enc.shape, (model_cfg.n_embd, latent));
+    let dec_x = targets.get("decoder_x").expect("missing decoder_x spec");
+    assert_eq!(dec_x.stack, Some(model_cfg.n_head));
+    assert_eq!(dec_x.shape, (model_cfg.n_embd, latent));
 
-    let enc_v = targets
-        .get("encoder_v")
-        .expect("missing encoder_v spec");
-    assert_eq!(enc_v.stack, Some(model_cfg.n_head));
-    assert_eq!(enc_v.shape, (model_cfg.n_embd, latent));
+    let dec_y = targets.get("decoder_y").expect("missing decoder_y spec");
+    assert_eq!(dec_y.stack, Some(model_cfg.n_head));
+    assert_eq!(dec_y.shape, (model_cfg.n_embd, latent));
+
+    let enc = targets.get("encoder").expect("missing encoder spec");
+    assert_eq!(enc.stack, None);
+    assert_eq!(enc.shape, (model_cfg.latent_total(), model_cfg.n_embd));
 }

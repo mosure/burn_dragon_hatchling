@@ -29,9 +29,9 @@ pub struct BDH<B: Backend> {
     embed: Embedding<B>,
     dropout: Dropout,
     attention: Attention<B>,
-    encoder: Param<Tensor<B, 3>>,
-    encoder_v: Param<Tensor<B, 3>>,
-    decoder: Param<Tensor<B, 2>>,
+    decoder_x: Param<Tensor<B, 3>>,
+    decoder_y: Param<Tensor<B, 3>>,
+    encoder: Param<Tensor<B, 2>>,
     lm_head: Param<Tensor<B, 2>>,
 }
 
@@ -53,19 +53,19 @@ impl<B: Backend> BDH<B> {
             Tensor::<B, 2>::random(shape, TensorDistribution::Normal(0.0, 0.02), device)
         };
 
-        let encoder = Param::from_tensor(Tensor::<B, 3>::random(
+        let decoder_x = Param::from_tensor(Tensor::<B, 3>::random(
             [config.n_head, config.n_embd, latent_per_head],
             TensorDistribution::Normal(0.0, 0.02),
             device,
         ));
 
-        let encoder_v = Param::from_tensor(Tensor::<B, 3>::random(
+        let decoder_y = Param::from_tensor(Tensor::<B, 3>::random(
             [config.n_head, config.n_embd, latent_per_head],
             TensorDistribution::Normal(0.0, 0.02),
             device,
         ));
 
-        let decoder = Param::from_tensor(weight_init([latent_total, config.n_embd]));
+        let encoder = Param::from_tensor(weight_init([latent_total, config.n_embd]));
         let lm_head = Param::from_tensor(weight_init([config.n_embd, config.vocab_size]));
 
         Self {
@@ -78,9 +78,9 @@ impl<B: Backend> BDH<B> {
             embed,
             dropout,
             attention,
+            decoder_x,
+            decoder_y,
             encoder,
-            encoder_v,
-            decoder,
             lm_head,
         }
     }
@@ -122,9 +122,9 @@ impl<B: Backend> BDH<B> {
         let mut state = embed_out.unsqueeze_dim::<4>(1);
         state = self.layer_norm(state);
 
+        let decoder_x = self.decoder_x.val();
+        let decoder_y = self.decoder_y.val();
         let encoder = self.encoder.val();
-        let encoder_v = self.encoder_v.val();
-        let decoder = self.decoder.val();
         let fused = self.kernel.enabled && noiser.is_none();
         let latent_pattern: &BlockPattern1d = &self.kernel.block_sparse.latent;
 
@@ -132,7 +132,7 @@ impl<B: Backend> BDH<B> {
             let x_sparse = if fused {
                 relu_lowrank::fused_forward(
                     state.clone(),
-                    encoder.clone().unsqueeze_dim::<4>(0),
+                    decoder_x.clone().unsqueeze_dim::<4>(0),
                     None,
                     self.kernel.relu_threshold,
                     latent_pattern,
@@ -140,9 +140,9 @@ impl<B: Backend> BDH<B> {
             } else {
                 let mut x_latent =
                     if let (Some(n), Some(k), Some(tid)) = (noiser, es_key, thread_id) {
-                        n.do_stack_tmm(state.clone(), &encoder, self.encoder.id, k, tid)
+                        n.do_stack_tmm(state.clone(), &decoder_x, self.decoder_x.id, k, tid)
                     } else {
-                        state.clone().matmul(encoder.clone().unsqueeze_dim::<4>(0))
+                        state.clone().matmul(decoder_x.clone().unsqueeze_dim::<4>(0))
                     };
                 if self.kernel.relu_threshold != 0.0 {
                     x_latent = x_latent.sub_scalar(self.kernel.relu_threshold);
@@ -156,7 +156,7 @@ impl<B: Backend> BDH<B> {
             let y_sparse = if fused {
                 relu_lowrank::fused_forward(
                     attn.clone(),
-                    encoder_v.clone().unsqueeze_dim::<4>(0),
+                    decoder_y.clone().unsqueeze_dim::<4>(0),
                     None,
                     self.kernel.relu_threshold,
                     latent_pattern,
@@ -164,9 +164,9 @@ impl<B: Backend> BDH<B> {
             } else {
                 let mut y_latent =
                     if let (Some(n), Some(k), Some(tid)) = (noiser, es_key, thread_id) {
-                        n.do_stack_tmm(attn.clone(), &encoder_v, self.encoder_v.id, k, tid)
+                        n.do_stack_tmm(attn.clone(), &decoder_y, self.decoder_y.id, k, tid)
                     } else {
-                        attn.matmul(encoder_v.clone().unsqueeze_dim::<4>(0))
+                        attn.matmul(decoder_y.clone().unsqueeze_dim::<4>(0))
                     };
                 if self.kernel.relu_threshold != 0.0 {
                     y_latent = y_latent.sub_scalar(self.kernel.relu_threshold);
@@ -181,9 +181,9 @@ impl<B: Backend> BDH<B> {
             let mixed_flat = mixed.reshape([batch * time, heads * latent]);
 
             let mlp_flat = if let (Some(n), Some(k), Some(tid)) = (noiser, es_key, thread_id) {
-                n.do_tmm(mixed_flat.clone(), &decoder, self.decoder.id, k, tid)
+                n.do_tmm(mixed_flat.clone(), &encoder, self.encoder.id, k, tid)
             } else {
-                mixed_flat.matmul(decoder.clone())
+                mixed_flat.matmul(encoder.clone())
             };
             let mlp_out = mlp_flat
                 .reshape([batch, time, self.n_embd])
@@ -330,9 +330,9 @@ impl<B: Backend> BDH<B> {
         let mut current = embed_out.unsqueeze_dim::<4>(1);
         current = self.layer_norm(current);
 
+        let decoder_x = self.decoder_x.val();
+        let decoder_y = self.decoder_y.val();
         let encoder = self.encoder.val();
-        let encoder_v = self.encoder_v.val();
-        let decoder = self.decoder.val();
         let fused = self.kernel.enabled && noiser.is_none();
         let latent_pattern: &BlockPattern1d = &self.kernel.block_sparse.latent;
 
@@ -340,7 +340,7 @@ impl<B: Backend> BDH<B> {
             let x_sparse = if fused {
                 relu_lowrank::fused_forward(
                     current.clone(),
-                    encoder.clone().unsqueeze_dim::<4>(0),
+                    decoder_x.clone().unsqueeze_dim::<4>(0),
                     None,
                     self.kernel.relu_threshold,
                     latent_pattern,
@@ -348,9 +348,9 @@ impl<B: Backend> BDH<B> {
             } else {
                 let mut x_latent =
                     if let (Some(n), Some(k), Some(tid)) = (noiser, es_key, thread_id) {
-                        n.do_stack_tmm(current.clone(), &encoder, self.encoder.id, k, tid)
+                        n.do_stack_tmm(current.clone(), &decoder_x, self.decoder_x.id, k, tid)
                     } else {
-                        current.clone().matmul(encoder.clone().unsqueeze_dim::<4>(0))
+                        current.clone().matmul(decoder_x.clone().unsqueeze_dim::<4>(0))
                     };
                 if self.kernel.relu_threshold != 0.0 {
                     x_latent = x_latent.sub_scalar(self.kernel.relu_threshold);
@@ -368,7 +368,7 @@ impl<B: Backend> BDH<B> {
             let y_sparse = if fused {
                 relu_lowrank::fused_forward(
                     attn.clone(),
-                    encoder_v.clone().unsqueeze_dim::<4>(0),
+                    decoder_y.clone().unsqueeze_dim::<4>(0),
                     None,
                     self.kernel.relu_threshold,
                     latent_pattern,
@@ -376,9 +376,9 @@ impl<B: Backend> BDH<B> {
             } else {
                 let mut y_latent =
                     if let (Some(n), Some(k), Some(tid)) = (noiser, es_key, thread_id) {
-                        n.do_stack_tmm(attn.clone(), &encoder_v, self.encoder_v.id, k, tid)
+                        n.do_stack_tmm(attn.clone(), &decoder_y, self.decoder_y.id, k, tid)
                     } else {
-                        attn.matmul(encoder_v.clone().unsqueeze_dim::<4>(0))
+                        attn.matmul(decoder_y.clone().unsqueeze_dim::<4>(0))
                     };
                 if self.kernel.relu_threshold != 0.0 {
                     y_latent = y_latent.sub_scalar(self.kernel.relu_threshold);
@@ -436,9 +436,9 @@ impl<B: Backend> BDH<B> {
             let mixed_flat = mixed.reshape([batch * time, heads * latent]);
 
             let mlp_flat = if let (Some(n), Some(k), Some(tid)) = (noiser, es_key, thread_id) {
-                n.do_tmm(mixed_flat.clone(), &decoder, self.decoder.id, k, tid)
+                n.do_tmm(mixed_flat.clone(), &encoder, self.encoder.id, k, tid)
             } else {
-                mixed_flat.matmul(decoder.clone())
+                mixed_flat.matmul(encoder.clone())
             };
             let mlp_out = mlp_flat
                 .reshape([batch, time, self.n_embd])
@@ -472,14 +472,36 @@ impl<B: Backend> BDH<B> {
                 stack: None,
             });
         }
-        if cfg.decoder.enabled {
-            let dims = self.decoder.shape().dims::<2>();
+        if cfg.decoder_x.enabled {
+            let dims = self.decoder_x.shape().dims::<3>();
             specs.push(EggrollParamSpec {
-                id: self.decoder.id,
-                path: "decoder".into(),
+                id: self.decoder_x.id,
+                path: "decoder_x".into(),
+                shape: (dims[1], dims[2]),
+                rank: cfg.decoder_x.rank,
+                sigma_scale: cfg.decoder_x.sigma_scale,
+                stack: Some(dims[0]),
+            });
+        }
+        if cfg.decoder_y.enabled {
+            let dims = self.decoder_y.shape().dims::<3>();
+            specs.push(EggrollParamSpec {
+                id: self.decoder_y.id,
+                path: "decoder_y".into(),
+                shape: (dims[1], dims[2]),
+                rank: cfg.decoder_y.rank,
+                sigma_scale: cfg.decoder_y.sigma_scale,
+                stack: Some(dims[0]),
+            });
+        }
+        if cfg.encoder.enabled {
+            let dims = self.encoder.shape().dims::<2>();
+            specs.push(EggrollParamSpec {
+                id: self.encoder.id,
+                path: "encoder".into(),
                 shape: (dims[0], dims[1]),
-                rank: cfg.decoder.rank,
-                sigma_scale: cfg.decoder.sigma_scale,
+                rank: cfg.encoder.rank,
+                sigma_scale: cfg.encoder.sigma_scale,
                 stack: None,
             });
         }
@@ -492,28 +514,6 @@ impl<B: Backend> BDH<B> {
                 rank: cfg.lm_head.rank,
                 sigma_scale: cfg.lm_head.sigma_scale,
                 stack: None,
-            });
-        }
-        if cfg.encoder.enabled {
-            let dims = self.encoder.shape().dims::<3>();
-            specs.push(EggrollParamSpec {
-                id: self.encoder.id,
-                path: "encoder".into(),
-                shape: (dims[1], dims[2]),
-                rank: cfg.encoder.rank,
-                sigma_scale: cfg.encoder.sigma_scale,
-                stack: Some(dims[0]),
-            });
-        }
-        if cfg.encoder_v.enabled {
-            let dims = self.encoder_v.shape().dims::<3>();
-            specs.push(EggrollParamSpec {
-                id: self.encoder_v.id,
-                path: "encoder_v".into(),
-                shape: (dims[1], dims[2]),
-                rank: cfg.encoder_v.rank,
-                sigma_scale: cfg.encoder_v.sigma_scale,
-                stack: Some(dims[0]),
             });
         }
         specs

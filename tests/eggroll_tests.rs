@@ -343,9 +343,9 @@ fn bdh_encoder_noise_changes_output() {
     let model = BDH::<EB>::new(cfg.clone(), &device);
     let mut es_cfg = BdhEsConfig::default();
     es_cfg.embedding.enabled = false;
-    es_cfg.decoder.enabled = false;
+    es_cfg.decoder_x.enabled = false;
+    es_cfg.decoder_y.enabled = false;
     es_cfg.lm_head.enabled = false;
-    es_cfg.encoder_v.enabled = false;
     es_cfg.encoder.enabled = true;
     es_cfg.eggroll.sigma = 0.05;
     es_cfg.eggroll.pop_size = 1;
