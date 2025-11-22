@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 
-use burn::data::dataloader::DataLoader;
+use burn::data::dataloader::{DataLoader, DataLoaderIterator};
 use burn::lr_scheduler::{
     LrScheduler,
     cosine::{CosineAnnealingLrScheduler, CosineAnnealingLrSchedulerConfig},
@@ -40,9 +40,10 @@ use burn::record::{BinFileRecorder, FullPrecisionSettings};
 
 use burn_dragon_hatchling::wgpu::init_runtime;
 use burn_dragon_hatchling::{
-    BDH, BDHConfig, Dataset, DatasetConfig, DatasetSplit, LearningRateScheduleConfig,
-    ModelOverrides, OptimizerConfig, RandomDataLoader, SequenceBatch, TrainingConfig,
-    TrainingHyperparameters, build_dataset, language_model_loss, load_training_config,
+    BDH, BDHConfig, BdhEsConfig, Dataset, DatasetConfig, DatasetSplit, EggrollObjective,
+    EggrollTrainer, LearningRateScheduleConfig, ModelOverrides, OptimizerConfig,
+    RandomDataLoader, SequenceBatch, TrainingConfig, TrainingHyperparameters, TrainingMode,
+    bdh_param_specs, build_dataset, language_model_loss, load_training_config,
 };
 
 #[derive(Parser, Debug)]
@@ -139,6 +140,33 @@ impl<B: BackendTrait> ValidStep<SequenceBatch<B>, LanguageModelOutput<B>> for BD
     }
 }
 
+struct LanguageModelEsObjective<B: BackendTrait> {
+    backend: core::marker::PhantomData<B>,
+}
+
+impl<B: BackendTrait> Default for LanguageModelEsObjective<B> {
+    fn default() -> Self {
+        Self {
+            backend: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<B: BackendTrait> EggrollObjective<BDH<B>, B> for LanguageModelEsObjective<B> {
+    type Batch = SequenceBatch<B>;
+
+    fn evaluate(&mut self, model: &BDH<B>, batch: &Self::Batch) -> f32 {
+        let logits = model.forward(batch.inputs.clone());
+        let loss = language_model_loss::<B>(logits, batch.targets.clone());
+        let data = loss
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .unwrap_or_default();
+        data.first().copied().unwrap_or(0.0)
+    }
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err:#}");
@@ -159,18 +187,34 @@ fn run() -> Result<()> {
     }
 
     let dataset = prepare_dataset(&config.dataset, &config.training)?;
+    let mode = config.mode.clone();
 
     match args.train.backend {
-        BackendArg::Wgpu => train_backend::<Autodiff<Wgpu<f32>>, _>(
-            &config,
-            Arc::clone(&dataset),
-            "wgpu",
-            init_runtime,
-        ),
+        BackendArg::Wgpu => match mode {
+            TrainingMode::Eggroll => train_backend_eggroll::<Wgpu<f32>, _>(
+                &config,
+                Arc::clone(&dataset),
+                "wgpu",
+                init_runtime,
+            ),
+            TrainingMode::Backprop => train_backend::<Autodiff<Wgpu<f32>>, _>(
+                &config,
+                Arc::clone(&dataset),
+                "wgpu",
+                init_runtime,
+            ),
+        },
         BackendArg::Cuda => {
             #[cfg(feature = "cuda")]
             {
-                train_backend::<Autodiff<Cuda<f32>>, _>(&config, dataset, "cuda", |_| {})
+                match mode {
+                    TrainingMode::Eggroll => {
+                        train_backend_eggroll::<Cuda<f32>, _>(&config, dataset, "cuda", |_| {})
+                    }
+                    TrainingMode::Backprop => {
+                        train_backend::<Autodiff<Cuda<f32>>, _>(&config, dataset, "cuda", |_| {})
+                    }
+                }
             }
             #[cfg(not(feature = "cuda"))]
             {
@@ -194,7 +238,7 @@ where
     Init: Fn(&B::Device),
 {
     let device = B::Device::default();
-    B::seed(&device, 1337);
+    B::seed(&device, 42);
     init_backend(&device);
 
     let training = &config.training;
@@ -294,6 +338,74 @@ where
 
     info!("Training complete on {backend_name}");
 
+    Ok(())
+}
+
+fn train_backend_eggroll<B, Init>(
+    config: &TrainingConfig,
+    dataset: Arc<Dataset>,
+    backend_name: &str,
+    init_backend: Init,
+) -> Result<()>
+where
+    B: BackendTrait + Clone + 'static,
+    B::Device: Clone,
+    Init: Fn(&B::Device),
+{
+    let device = B::Device::default();
+    B::seed(&device, 42);
+    init_backend(&device);
+
+    let training = &config.training;
+    let mut model_config = build_model_config(&config.model);
+    let tokenizer = dataset.tokenizer();
+    model_config.vocab_size = tokenizer.len();
+
+    let total_steps = training.max_iters.max(1);
+    let steps_per_epoch = dataset.steps_per_epoch(DatasetSplit::Train);
+    let train_loader_base = RandomDataLoader::<B>::new(
+        Arc::clone(&dataset),
+        DatasetSplit::Train,
+        &device,
+        steps_per_epoch,
+        Some(total_steps),
+    );
+    let mut train_loader: Box<dyn DataLoaderIterator<SequenceBatch<B>>> =
+        train_loader_base.iter();
+
+    let eggroll_cfg = resolve_bdh_eggroll(config);
+    let model = BDH::<B>::new(model_config.clone(), &device);
+    let param_specs = bdh_param_specs(&model, &eggroll_cfg);
+    let mut trainer = EggrollTrainer::new(
+        model,
+        eggroll_cfg.eggroll.clone(),
+        param_specs,
+        LanguageModelEsObjective::<B>::default(),
+    );
+
+    for step_idx in 0..total_steps {
+        let batch = match train_loader.next() {
+            Some(batch) => batch,
+            None => {
+                train_loader = train_loader_base.iter();
+                train_loader
+                    .next()
+                    .ok_or_else(|| anyhow!("data loader yielded no batches"))?
+            }
+        };
+
+        let _model_ref = trainer.step(&batch);
+        if (step_idx + 1) % training.log_frequency.max(1) == 0 {
+            info!(
+                "[eggroll:{backend}] step={}/{}",
+                step_idx + 1,
+                total_steps,
+                backend = backend_name
+            );
+        }
+    }
+
+    info!("Eggroll training complete on {backend_name}");
     Ok(())
 }
 
@@ -440,6 +552,14 @@ fn resolve_lr_scheduler(
     };
 
     Ok(schedule)
+}
+
+fn resolve_bdh_eggroll(config: &TrainingConfig) -> BdhEsConfig {
+    let mut base = BdhEsConfig::default();
+    if let Some(es) = &config.eggroll {
+        base.eggroll = es.clone().into_runtime();
+    }
+    base
 }
 
 fn build_vocab_only(config: &TrainingConfig) -> Result<()> {

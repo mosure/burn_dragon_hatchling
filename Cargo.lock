@@ -1014,11 +1014,12 @@ dependencies = [
 
 [[package]]
 name = "burn_dragon_hatchling"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "burn",
  "burn-autodiff",
+ "burn-collective",
  "burn-cuda",
  "burn-ndarray",
  "burn-train",

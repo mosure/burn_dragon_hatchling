@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
+use crate::eggroll::EggrollConfig;
 use crate::tokenizer::TokenizerConfig;
 use toml::Value;
 
@@ -191,6 +192,47 @@ pub struct TrainingConfig {
     pub generation: GenerationConfig,
     #[serde(default)]
     pub model: ModelOverrides,
+    #[serde(default)]
+    pub mode: TrainingMode,
+    #[serde(default)]
+    pub eggroll: Option<EggrollConfigSection>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingMode {
+    #[default]
+    Backprop,
+    Eggroll,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct EggrollConfigSection {
+    pub pop_size: usize,
+    pub rank: usize,
+    pub sigma: f32,
+    pub lr: f32,
+    pub weight_decay: f32,
+    #[serde(default)]
+    pub max_param_norm: Option<f32>,
+    #[serde(default = "default_eggroll_seed")]
+    pub seed: u64,
+    #[serde(default)]
+    pub targets: Vec<String>,
+}
+
+impl EggrollConfigSection {
+    pub fn into_runtime(self) -> EggrollConfig {
+        EggrollConfig {
+            pop_size: self.pop_size,
+            rank: self.rank,
+            sigma: self.sigma,
+            lr: self.lr,
+            weight_decay: self.weight_decay,
+            seed: self.seed,
+            max_param_norm: self.max_param_norm,
+        }
+    }
 }
 
 pub fn load_training_config(paths: &[PathBuf]) -> Result<TrainingConfig> {
@@ -272,6 +314,10 @@ fn default_temperature() -> f32 {
 
 fn default_step_gamma() -> f64 {
     0.1
+}
+
+fn default_eggroll_seed() -> u64 {
+    2025
 }
 
 #[cfg(test)]

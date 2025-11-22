@@ -56,7 +56,7 @@ where
     Init: Fn(&<B as BackendTrait>::Device),
 {
     let device = <B as BackendTrait>::Device::default();
-    <B as BackendTrait>::seed(&device, 24);
+    <B as BackendTrait>::seed(&device, 42);
     init_backend(&device);
 
     let model_config = BDHConfig::default();

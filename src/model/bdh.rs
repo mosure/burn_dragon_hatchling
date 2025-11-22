@@ -7,6 +7,8 @@ use rand::prelude::*;
 use std::cmp::Ordering;
 
 use crate::kernel::{BlockPattern1d, relu_lowrank};
+use crate::eggroll::{EggrollNoiser, EsTreeKey, EggrollParamSpec};
+use crate::eggroll::bdh_integration::BdhEsConfig;
 
 use super::attention::Attention;
 use super::config::{BDHConfig, FusedKernelConfig};
@@ -89,7 +91,35 @@ impl<B: Backend> BDH<B> {
     }
 
     pub fn forward(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        let mut state = self.embed.forward(tokens).unsqueeze_dim::<4>(1);
+        self.forward_inner(tokens, None, None, None)
+    }
+
+    pub fn forward_with_noise(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        noiser: &EggrollNoiser<B>,
+        es_key: &EsTreeKey,
+        thread_id: u32,
+    ) -> Tensor<B, 3> {
+        if noiser.params.config.sigma == 0.0 {
+            return self.forward(tokens);
+        }
+        self.forward_inner(tokens, Some(noiser), Some(es_key), Some(thread_id))
+    }
+
+    fn forward_inner(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        noiser: Option<&EggrollNoiser<B>>,
+        es_key: Option<&EsTreeKey>,
+        thread_id: Option<u32>,
+    ) -> Tensor<B, 3> {
+        let embed_out = if let (Some(n), Some(k), Some(tid)) = (noiser, es_key, thread_id) {
+            n.do_emb(&self.embed.weight.val(), &tokens, self.embed.weight.id, k, tid)
+        } else {
+            self.embed.forward(tokens)
+        };
+        let mut state = embed_out.unsqueeze_dim::<4>(1);
         state = self.layer_norm(state);
 
         let encoder = self.encoder.val().unsqueeze_dim::<4>(0);
@@ -140,7 +170,11 @@ impl<B: Backend> BDH<B> {
             let [batch, time, heads, latent] = mixed.shape().dims();
             let mixed_flat = mixed.reshape([batch * time, heads * latent]);
 
-            let mlp_flat = mixed_flat.matmul(decoder.clone());
+            let mlp_flat = if let (Some(n), Some(k), Some(tid)) = (noiser, es_key, thread_id) {
+                n.do_tmm(mixed_flat.clone(), &decoder, self.decoder.id, k, tid)
+            } else {
+                mixed_flat.matmul(decoder.clone())
+            };
             let mlp_out = mlp_flat
                 .reshape([batch, time, self.n_embd])
                 .unsqueeze_dim::<4>(1);
@@ -149,10 +183,13 @@ impl<B: Backend> BDH<B> {
         }
 
         let [batch, _, time, dim] = state.shape().dims();
-        state
-            .reshape([batch * time, dim])
-            .matmul(self.lm_head.val())
-            .reshape([batch, time, self.vocab_size])
+        let logits_in = state.reshape([batch * time, dim]);
+        let logits = if let (Some(n), Some(k), Some(tid)) = (noiser, es_key, thread_id) {
+            n.do_mm(logits_in, &self.lm_head.val(), self.lm_head.id, k, tid)
+        } else {
+            logits_in.matmul(self.lm_head.val())
+        };
+        logits.reshape([batch, time, self.vocab_size])
     }
 
     pub fn generate(
@@ -248,12 +285,39 @@ impl<B: Backend> BDH<B> {
         tokens: Tensor<B, 2, Int>,
         state: &mut ModelState<B>,
     ) -> Tensor<B, 3> {
+        self.forward_with_state_inner(tokens, state, None, None, None)
+    }
+
+    pub fn forward_with_state_and_noise(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        state: &mut ModelState<B>,
+        noiser: &EggrollNoiser<B>,
+        es_key: &EsTreeKey,
+        thread_id: u32,
+    ) -> Tensor<B, 3> {
+        self.forward_with_state_inner(tokens, state, Some(noiser), Some(es_key), Some(thread_id))
+    }
+
+    fn forward_with_state_inner(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        state: &mut ModelState<B>,
+        noiser: Option<&EggrollNoiser<B>>,
+        es_key: Option<&EsTreeKey>,
+        thread_id: Option<u32>,
+    ) -> Tensor<B, 3> {
         assert_eq!(
             state.layers.len(),
             self.n_layer,
             "model state layers mismatch"
         );
-        let mut current = self.embed.forward(tokens).unsqueeze_dim::<4>(1);
+        let embed_out = if let (Some(n), Some(k), Some(tid)) = (noiser, es_key, thread_id) {
+            n.do_emb(&self.embed.weight.val(), &tokens, self.embed.weight.id, k, tid)
+        } else {
+            self.embed.forward(tokens)
+        };
+        let mut current = embed_out.unsqueeze_dim::<4>(1);
         current = self.layer_norm(current);
 
         let encoder = self.encoder.val().unsqueeze_dim::<4>(0);
@@ -351,7 +415,11 @@ impl<B: Backend> BDH<B> {
 
             let mixed_flat = mixed.reshape([batch * time, heads * latent]);
 
-            let mlp_flat = mixed_flat.matmul(decoder.clone());
+            let mlp_flat = if let (Some(n), Some(k), Some(tid)) = (noiser, es_key, thread_id) {
+                n.do_tmm(mixed_flat.clone(), &decoder, self.decoder.id, k, tid)
+            } else {
+                mixed_flat.matmul(decoder.clone())
+            };
             let mlp_out = mlp_flat
                 .reshape([batch, time, self.n_embd])
                 .unsqueeze_dim::<4>(1);
@@ -362,9 +430,53 @@ impl<B: Backend> BDH<B> {
         state.position = state.len();
 
         let [batch, _, time, dim] = current.shape().dims();
-        current
-            .reshape([batch * time, dim])
-            .matmul(self.lm_head.val())
-            .reshape([batch, time, self.vocab_size])
+        let logits_in = current.reshape([batch * time, dim]);
+        let logits = if let (Some(n), Some(k), Some(tid)) = (noiser, es_key, thread_id) {
+            n.do_mm(logits_in, &self.lm_head.val(), self.lm_head.id, k, tid)
+        } else {
+            logits_in.matmul(self.lm_head.val())
+        };
+        logits.reshape([batch, time, self.vocab_size])
+    }
+
+    pub fn es_param_specs(&self, cfg: &BdhEsConfig) -> Vec<EggrollParamSpec> {
+        let mut specs = Vec::new();
+        if cfg.embedding.enabled {
+            let dims = self.embed.weight.shape().dims::<2>();
+            specs.push(EggrollParamSpec {
+                id: self.embed.weight.id,
+                path: "embedding".into(),
+                shape: (dims[0], dims[1]),
+                rank: cfg.embedding.rank,
+                sigma_scale: cfg.embedding.sigma_scale,
+            });
+        }
+        if cfg.decoder.enabled {
+            let dims = self.decoder.shape().dims::<2>();
+            specs.push(EggrollParamSpec {
+                id: self.decoder.id,
+                path: "decoder".into(),
+                shape: (dims[0], dims[1]),
+                rank: cfg.decoder.rank,
+                sigma_scale: cfg.decoder.sigma_scale,
+            });
+        }
+        if cfg.lm_head.enabled {
+            let dims = self.lm_head.shape().dims::<2>();
+            specs.push(EggrollParamSpec {
+                id: self.lm_head.id,
+                path: "lm_head".into(),
+                shape: (dims[0], dims[1]),
+                rank: cfg.lm_head.rank,
+                sigma_scale: cfg.lm_head.sigma_scale,
+            });
+        }
+        if cfg.encoder.enabled {
+            // Encoder is 3D; not yet supported for ES noise. Explicitly skipped.
+        }
+        if cfg.encoder_v.enabled {
+            // Encoder_v is 3D; not yet supported for ES noise. Explicitly skipped.
+        }
+        specs
     }
 }

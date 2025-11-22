@@ -73,7 +73,7 @@ where
     Init: Fn(&B::Device),
 {
     let device = B::Device::default();
-    B::seed(&device, 1337);
+    B::seed(&device, 42);
     init_backend(&device);
 
     let tokenizer_path = config

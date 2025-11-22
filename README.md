@@ -16,6 +16,7 @@ burn inference and training of [dragon hatchling](https://arxiv.org/abs/2509.265
 
 - [x] cached inference
 - [x] training benchmarks and reporting
+- [x] [eggroll training](https://arxiv.org/abs/2509.24372)
 - [ ] adaptive tool discovery
 - [ ] conditional (deep) gating
 - [ ] document-coherent dataloading and scale mixup
@@ -37,6 +38,8 @@ Dataset configuration (built-in presets and Hugging Face examples) is documented
 ## training
 
 - `cargo run --release` (defaults to the cuda backend)
+- For the new EGGROLL ES backend, set `mode = "eggroll"` in your TOML config and add an `[eggroll]`
+  block (e.g. `pop_size = 65536`, `rank = 4`, `sigma = 0.01`, `lr = 1e-3`, `targets = ["encoder"]`).
 
 
 ## inference
@@ -54,6 +57,7 @@ Dataset configuration (built-in presets and Hugging Face examples) is documented
 
 | `burn_dragon_hatchling` | `burn` |
 | :--                     | :--    |
+| `0.2`                   | `0.19` |
 | `0.1`                   | `0.18` |
 
 
