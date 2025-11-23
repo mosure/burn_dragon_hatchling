@@ -136,6 +136,7 @@ fn eggroll_sigma_zero_is_noop() {
         model.clone(),
         EggrollConfig {
             pop_size: 1,
+            pop_chunk_size: 1,
             sigma: 0.0,
             lr: 0.1,
             rank: 2,
@@ -143,6 +144,7 @@ fn eggroll_sigma_zero_is_noop() {
             seed: 123,
             max_param_norm: None,
             pop_vectorized: true,
+            antithetic: false,
         },
         specs,
         MseObjective::new(target.clone()),
@@ -181,6 +183,7 @@ fn eggroll_improves_on_linear_mse() {
         model,
         EggrollConfig {
             pop_size: 64,
+            pop_chunk_size: 16,
             sigma: 0.01,
             lr: 0.01,
             rank: 2,
@@ -188,6 +191,7 @@ fn eggroll_improves_on_linear_mse() {
             seed: 999,
             max_param_norm: None,
             pop_vectorized: true,
+            antithetic: false,
         },
         specs,
         MseObjective::new(target.clone()),
@@ -258,12 +262,14 @@ fn stacked_params_receive_noise() {
         EggrollConfig {
             sigma: 0.1,
             pop_size: 1,
+            pop_chunk_size: 1,
             lr: 0.0,
             weight_decay: 0.0,
             rank: 2,
             seed: 7,
             max_param_norm: None,
             pop_vectorized: true,
+            antithetic: false,
         },
         &device,
     );
@@ -309,12 +315,14 @@ fn embedding_sigma_zero_matches_plain() {
         EggrollConfig {
             sigma: 0.0,
             pop_size: 1,
+            pop_chunk_size: 1,
             lr: 0.0,
             weight_decay: 0.0,
             rank: 2,
             seed: 1,
             max_param_norm: None,
             pop_vectorized: true,
+            antithetic: false,
         },
         &device,
     );
@@ -351,12 +359,14 @@ fn bdh_sigma_zero_matches_plain() {
         EggrollConfig {
             sigma: 0.0,
             pop_size: 1,
+            pop_chunk_size: 1,
             lr: 0.0,
             weight_decay: 0.0,
             rank: 2,
             seed: 42,
             max_param_norm: None,
             pop_vectorized: true,
+            antithetic: false,
         },
         &device,
     );
@@ -436,6 +446,7 @@ fn pop_update_matches_naive_delta() {
     };
     let config = EggrollConfig {
         pop_size: 8,
+        pop_chunk_size: 8,
         rank: 2,
         sigma: 0.05,
         lr: 0.1,
@@ -443,6 +454,7 @@ fn pop_update_matches_naive_delta() {
         seed: 1234,
         max_param_norm: None,
         pop_vectorized: true,
+        antithetic: false,
     };
     let noiser = EggrollNoiser::new(vec![spec.clone()], config.clone(), &device);
     let tree_key = EsTreeKey::new(EggrollKey::from_seed(config.seed));

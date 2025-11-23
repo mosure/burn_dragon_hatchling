@@ -20,9 +20,9 @@ impl<B: Backend> ScalarModel<B> {
         }
     }
 
-    fn forward(&self) -> Tensor<B, 2> {
-        self.w.val()
-    }
+    // fn forward(&self) -> Tensor<B, 2> {
+    //     self.w.val()
+    // }
 }
 
 #[derive(Clone)]
@@ -68,6 +68,129 @@ impl<B: Backend> EggrollObjective<ScalarModel<B>, B> for LinearObjective {
 }
 
 #[test]
+fn pop_update_matches_unbiased_estimator() {
+    type B = NdArray<f32>;
+    let device = <B as Backend>::Device::default();
+    let spec = EggrollParamSpec {
+        id: burn::module::ParamId::new(),
+        path: "w".into(),
+        shape: (4, 4),
+        rank: 1,
+        sigma_scale: 1.0,
+        stack: None,
+    };
+    let config = EggrollConfig {
+        pop_size: 4,
+        pop_chunk_size: 2,
+        rank: 1,
+        sigma: 0.5,
+        lr: 0.1,
+        weight_decay: 0.0,
+        seed: 7,
+        max_param_norm: None,
+        pop_vectorized: false,
+        antithetic: false,
+    };
+    let noiser = EggrollNoiser::new(vec![spec.clone()], config.clone(), &device);
+    let tree_key = EsTreeKey::new(EggrollKey::from_seed(config.seed));
+    let step = 0;
+    let worker_ids: Vec<u32> = (0..config.pop_size as u32).collect();
+    let scores: Vec<f32> = vec![0.4, -0.2, 0.1, -0.1];
+
+    let updates = noiser.compute_updates_from_population(
+        &tree_key,
+        step,
+        &worker_ids,
+        &scores,
+    );
+    let delta_pop = match updates.get(&spec.id) {
+        Some(EggrollNoiseTensor::D2(t)) => t.clone(),
+        _ => panic!("expected 2D update"),
+    };
+
+    let mut delta_ref = Tensor::<B, 2>::zeros([spec.shape.0, spec.shape.1], &device);
+    let es_step = tree_key.clone().with_step(step);
+    for (idx, &score) in scores.iter().enumerate() {
+        let tid = worker_ids[idx];
+        let delta = match noiser.low_rank_delta(&spec, &es_step, tid) {
+            EggrollNoiseTensor::D2(d) => d,
+            EggrollNoiseTensor::D3(_) => panic!("unexpected 3D delta"),
+        };
+        let scale = score / (config.pop_size as f32 * config.sigma);
+        delta_ref = delta_ref + delta.mul_scalar(scale);
+    }
+
+    let diff = (delta_pop - delta_ref)
+        .abs()
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .unwrap();
+    let max_diff = diff.iter().copied().fold(0.0_f32, f32::max);
+    assert!(
+        max_diff < 1e-4,
+        "population update should match unbiased estimator, max_diff={}",
+        max_diff
+    );
+}
+
+#[test]
+fn antithetic_pairs_cancel_when_scores_match() {
+    type B = NdArray<f32>;
+    let device = <B as Backend>::Device::default();
+    let spec = EggrollParamSpec {
+        id: burn::module::ParamId::new(),
+        path: "w".into(),
+        shape: (2, 2),
+        rank: 1,
+        sigma_scale: 1.0,
+        stack: None,
+    };
+    let config = EggrollConfig {
+        pop_size: 4,
+        pop_chunk_size: 2,
+        rank: 1,
+        sigma: 0.2,
+        lr: 0.1,
+        weight_decay: 0.0,
+        seed: 11,
+        max_param_norm: None,
+        pop_vectorized: false,
+        antithetic: true,
+    };
+    let noiser = EggrollNoiser::new(vec![spec.clone()], config.clone(), &device);
+    let tree_key = EsTreeKey::new(EggrollKey::from_seed(config.seed));
+    let worker_ids: Vec<u32> = (0..config.pop_size as u32).collect();
+    // Pair 0/1 share base noise with opposite sign and same score; should cancel.
+    let scores = vec![1.0, 1.0, 0.0, 0.0];
+
+    let updates = noiser.compute_updates_from_population(
+        &tree_key,
+        0,
+        &worker_ids,
+        &scores,
+    );
+    let delta_pop = match updates.get(&spec.id) {
+        Some(EggrollNoiseTensor::D2(t)) => t.clone(),
+        _ => panic!("expected 2D update"),
+    };
+
+    let norm = delta_pop
+        .clone()
+        .abs()
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .unwrap()
+        .into_iter()
+        .fold(0.0_f32, f32::max);
+    assert!(
+        norm < 1e-4,
+        "antithetic pair with equal scores should cancel; norm={norm}"
+    );
+}
+
+#[test]
 fn es_gradient_aligns_with_finite_difference() {
     type B = NdArray<f32>;
     let device = <B as Backend>::Device::default();
@@ -89,6 +212,7 @@ fn es_gradient_aligns_with_finite_difference() {
     for seed in 1..=5 {
         let config = EggrollConfig {
             pop_size: 512,
+            pop_chunk_size: 32,
             rank: 1,
             sigma: 0.5,
             lr: 10.0,
@@ -96,6 +220,7 @@ fn es_gradient_aligns_with_finite_difference() {
             seed,
             max_param_norm: None,
             pop_vectorized: true,
+            antithetic: false,
         };
 
         let base_w = model.w.val();

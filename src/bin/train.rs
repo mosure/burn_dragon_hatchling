@@ -1,8 +1,10 @@
 #![recursion_limit = "256"]
 
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
@@ -21,7 +23,10 @@ use burn::optim::{AdamW, AdamWConfig, LearningRate};
 use burn::tensor::{Tensor, activation};
 use burn::tensor::backend::{AutodiffBackend, Backend as BackendTrait};
 use burn_autodiff::Autodiff;
-use burn_train::metric::{Adaptor, ItemLazy, LearningRateMetric, LossInput, LossMetric};
+use burn_train::metric::{Adaptor, ItemLazy, LearningRateMetric, LossInput, LossMetric, MetricEntry, NumericEntry};
+use burn_train::renderer::{MetricState, MetricsRendererTraining, TrainingProgress};
+use burn_train::renderer::tui::TuiMetricsRenderer;
+use burn_train::Interrupter;
 use burn_train::{
     LearnerBuilder,
     LearningStrategy,
@@ -36,7 +41,8 @@ use tracing::info;
 #[cfg(feature = "cuda")]
 use burn_cuda::Cuda;
 
-use burn::record::{BinFileRecorder, FullPrecisionSettings};
+use burn::prelude::Module;
+use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 
 use burn_dragon_hatchling::wgpu::init_runtime;
 use burn_dragon_hatchling::{
@@ -63,6 +69,9 @@ struct TrainArgs {
     /// Backend to use for training.
     #[arg(long, value_enum, default_value_t = BackendArg::Cuda)]
     backend: BackendArg,
+    /// Optional model checkpoint to initialize training from.
+    #[arg(long, value_name = "PATH")]
+    checkpoint: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -162,7 +171,7 @@ impl<B: BackendTrait> EggrollObjective<BDH<B>, B> for LanguageModelEsObjective<B
             .convert::<f32>()
             .into_vec::<f32>()
             .unwrap_or_default();
-        data.first().copied().unwrap_or(0.0)
+        -data.first().copied().unwrap_or(0.0)
     }
 
     fn evaluate_population(
@@ -189,6 +198,9 @@ impl<B: BackendTrait> EggrollObjective<BDH<B>, B> for LanguageModelEsObjective<B
             .convert::<f32>()
             .into_vec::<f32>()
             .unwrap_or_default()
+            .into_iter()
+            .map(|v| -v)
+            .collect()
     }
 
     fn forward_population(
@@ -260,6 +272,7 @@ fn run() -> Result<()> {
                 Arc::clone(&dataset),
                 "wgpu",
                 init_runtime,
+                args.train.checkpoint.as_ref(),
             ),
             TrainingMode::Backprop => train_backend::<Autodiff<Wgpu<f32>>, _>(
                 &config,
@@ -273,7 +286,13 @@ fn run() -> Result<()> {
             {
                 match mode {
                     TrainingMode::Eggroll => {
-                        train_backend_eggroll::<Cuda<f32>, _>(&config, dataset, "cuda", |_| {})
+                        train_backend_eggroll::<Cuda<f32>, _>(
+                            &config,
+                            dataset,
+                            "cuda",
+                            |_| {},
+                            args.train.checkpoint.as_ref(),
+                        )
                     }
                     TrainingMode::Backprop => {
                         train_backend::<Autodiff<Cuda<f32>>, _>(&config, dataset, "cuda", |_| {})
@@ -410,6 +429,7 @@ fn train_backend_eggroll<B, Init>(
     dataset: Arc<Dataset>,
     backend_name: &str,
     init_backend: Init,
+    checkpoint: Option<&PathBuf>,
 ) -> Result<()>
 where
     B: BackendTrait + Clone + 'static,
@@ -438,7 +458,13 @@ where
         train_loader_base.iter();
 
     let eggroll_cfg = resolve_bdh_eggroll(config);
-    let model = BDH::<B>::new(model_config.clone(), &device);
+    let mut model = BDH::<B>::new(model_config.clone(), &device);
+    if let Some(path) = checkpoint {
+        info!("Loading checkpoint from {}", path.display());
+        let record = BinFileRecorder::<FullPrecisionSettings>::new()
+            .load(path.to_path_buf(), &device)?;
+        model = model.load_record(record);
+    }
     let param_specs = bdh_param_specs(&model, &eggroll_cfg);
     let mut trainer = EggrollTrainer::new(
         model,
@@ -447,7 +473,17 @@ where
         LanguageModelEsObjective::<B>::default(),
     );
 
+    let use_tui = std::io::stdout().is_terminal();
+    let interrupter = Interrupter::new();
+    let mut tui = use_tui.then(|| TuiMetricsRenderer::new(interrupter.clone(), None));
+    let epoch_total = total_steps.div_ceil(steps_per_epoch);
+    let run_dir = PathBuf::from("runs")
+        .join(backend_name)
+        .join("eggroll");
+    fs::create_dir_all(&run_dir)?;
+
     for step_idx in 0..total_steps {
+        let step_start = Instant::now();
         let batch = match train_loader.next() {
             Some(batch) => batch,
             None => {
@@ -459,6 +495,67 @@ where
         };
 
         let _model_ref = trainer.step(&batch);
+
+        if let Some(tui) = tui.as_mut() {
+            let items_processed = step_idx + 1;
+            let mean = trainer.state.last_fitness_mean.unwrap_or(0.0);
+            let std_dev = trainer.state.last_fitness_std.unwrap_or(0.0);
+            let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+            let progress = TrainingProgress {
+                progress: burn::data::dataloader::Progress {
+                    items_processed,
+                    items_total: total_steps,
+                },
+                epoch: step_idx / steps_per_epoch + 1,
+                epoch_total,
+                iteration: items_processed,
+            };
+            let metric = MetricEntry::new(
+                Arc::new("fitness_mean".to_string()),
+                format!("{:.4}", mean),
+                format!("{}", mean),
+            );
+            let metric_std = MetricEntry::new(
+                Arc::new("fitness_std".to_string()),
+                format!("{:.4}", std_dev),
+                format!("{}", std_dev),
+            );
+            let metric_step = MetricEntry::new(
+                Arc::new("step_ms".to_string()),
+                format!("{:.1}", step_ms),
+                format!("{}", step_ms),
+            );
+            let metric_pop = MetricEntry::new(
+                Arc::new("pop_size".to_string()),
+                trainer.state.config.pop_size.to_string(),
+                trainer.state.config.pop_size.to_string(),
+            );
+            let metric_sigma = MetricEntry::new(
+                Arc::new("sigma".to_string()),
+                format!("{:.4}", trainer.state.config.sigma),
+                format!("{}", trainer.state.config.sigma),
+            );
+            let metric_lr = MetricEntry::new(
+                Arc::new("lr".to_string()),
+                format!("{:.5}", trainer.state.config.lr),
+                format!("{}", trainer.state.config.lr),
+            );
+            tui.update_train(MetricState::Numeric(metric, NumericEntry::Value(mean as f64)));
+            tui.update_train(MetricState::Numeric(metric_std, NumericEntry::Value(std_dev as f64)));
+            tui.update_train(MetricState::Numeric(metric_step, NumericEntry::Value(step_ms)));
+            tui.update_train(MetricState::Numeric(metric_pop, NumericEntry::Value(trainer.state.config.pop_size as f64)));
+            tui.update_train(MetricState::Numeric(metric_sigma, NumericEntry::Value(trainer.state.config.sigma as f64)));
+            tui.update_train(MetricState::Numeric(
+                metric_lr,
+                NumericEntry::Value(trainer.state.config.lr as f64),
+            ));
+            tui.render_train(progress);
+            if interrupter.should_stop() {
+                info!("Eggroll training interrupted by user");
+                break;
+            }
+        }
+
         if (step_idx + 1) % training.log_frequency.max(1) == 0 {
             info!(
                 "[eggroll:{backend}] step={}/{}",
@@ -468,6 +565,11 @@ where
             );
         }
     }
+
+    let checkpoint_path = run_dir.join("checkpoint.bin");
+    let record = trainer.model.clone().into_record();
+    BinFileRecorder::<FullPrecisionSettings>::new().record(record, checkpoint_path.clone())?;
+    info!("Saved eggroll checkpoint to {}", checkpoint_path.display());
 
     info!("Eggroll training complete on {backend_name}");
     Ok(())

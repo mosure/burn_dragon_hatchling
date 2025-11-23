@@ -96,14 +96,16 @@ where
             noiser,
             state: EggrollState {
                 mean_record,
-                config,
-                param_specs,
-                step: 0,
-                es_key,
-                base_key,
-            },
-        }
+            config,
+            param_specs,
+            step: 0,
+            es_key,
+            base_key,
+            last_fitness_mean: None,
+            last_fitness_std: None,
+        },
     }
+}
 }
 
 impl<M, B, Obj> EggrollTrainer<M, B, Obj>
@@ -118,24 +120,49 @@ where
             return &self.model;
         }
 
+        let chunk_size = self
+            .state
+            .config
+            .pop_chunk_size
+            .max(1)
+            .min(pop.max(1));
         let tree_key = self.state.es_key.clone();
         let es_key = tree_key.clone().with_step(self.state.step);
         let global_workers: Vec<u32> = (0..pop as u32).collect();
         let deterministic = true;
 
-        let fitness: Vec<f32> = if self.state.config.pop_vectorized {
-            if let Some(pop_logits) = self.objective.forward_population(
-                &self.model,
-                batch,
-                &self.noiser,
-                &tree_key,
-                self.state.step,
-                &global_workers,
-                deterministic,
-            ) {
-                self.objective.evaluate_population(&pop_logits, batch)
+        let mut fitness: Vec<f32> = Vec::with_capacity(pop);
+        for chunk in global_workers.chunks(chunk_size) {
+            let chunk_ids: Vec<u32> = chunk.to_vec();
+            let chunk_scores: Vec<f32> = if self.state.config.pop_vectorized {
+                if let Some(pop_logits) = self.objective.forward_population(
+                    &self.model,
+                    batch,
+                    &self.noiser,
+                    &tree_key,
+                    self.state.step,
+                    &chunk_ids,
+                    deterministic,
+                ) {
+                    self.objective.evaluate_population(&pop_logits, batch)
+                } else {
+                    chunk_ids
+                        .iter()
+                        .copied()
+                        .map(|tid| {
+                            self.objective.evaluate_with_noise(
+                                &self.model,
+                                batch,
+                                &self.noiser,
+                                &es_key,
+                                tid,
+                                deterministic,
+                            )
+                        })
+                        .collect()
+                }
             } else {
-                global_workers
+                chunk_ids
                     .iter()
                     .copied()
                     .map(|tid| {
@@ -149,33 +176,23 @@ where
                         )
                     })
                     .collect()
-            }
-        } else {
-            global_workers
-                .iter()
-                .copied()
-                .map(|tid| {
-                    self.objective.evaluate_with_noise(
-                        &self.model,
-                        batch,
-                        &self.noiser,
-                        &es_key,
-                        tid,
-                        deterministic,
-                    )
-                })
-                .collect()
-        };
+            };
+            fitness.extend(chunk_scores);
+        }
 
-        let mean_f = fitness.iter().copied().sum::<f32>() / pop as f32;
+        let pop_count = fitness.len().max(1);
+        let mean_f = fitness.iter().copied().sum::<f32>() / pop_count as f32;
         let var = fitness
             .iter()
             .copied()
             .map(|f| (f - mean_f) * (f - mean_f))
             .sum::<f32>()
-            / (pop as f32).max(1.0);
+            / (pop_count as f32).max(1.0);
         let std = var.sqrt().max(1e-8);
-        let fitness_norm: Vec<f32> = fitness.iter().map(|&f| (f - mean_f) / std).collect();
+        let fitness_norm: Vec<f32> =
+            fitness.iter().map(|&f| (f - mean_f) / std).collect();
+        self.state.last_fitness_mean = Some(mean_f);
+        self.state.last_fitness_std = Some(std);
 
         let updates = self.noiser.compute_updates_from_population(
             &tree_key,

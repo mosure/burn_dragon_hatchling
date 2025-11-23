@@ -218,15 +218,18 @@ pub struct EggrollConfigSection {
     #[serde(default = "default_eggroll_seed")]
     pub seed: u64,
     #[serde(default)]
-    pub targets: Vec<String>,
+    pub pop_chunk_size: Option<usize>,
     #[serde(default = "default_pop_vectorized")]
     pub pop_vectorized: bool,
+    #[serde(default)]
+    pub antithetic: bool,
 }
 
 impl EggrollConfigSection {
     pub fn into_runtime(self) -> EggrollConfig {
         EggrollConfig {
             pop_size: self.pop_size,
+            pop_chunk_size: self.pop_chunk_size.unwrap_or(default_pop_chunk_size()),
             rank: self.rank,
             sigma: self.sigma,
             lr: self.lr,
@@ -234,6 +237,7 @@ impl EggrollConfigSection {
             seed: self.seed,
             max_param_norm: self.max_param_norm,
             pop_vectorized: self.pop_vectorized,
+            antithetic: self.antithetic,
         }
     }
 }
@@ -325,6 +329,10 @@ fn default_step_gamma() -> f64 {
 
 fn default_eggroll_seed() -> u64 {
     2025
+}
+
+fn default_pop_chunk_size() -> usize {
+    16
 }
 
 #[cfg(test)]

@@ -6,19 +6,19 @@ mode = "eggroll"
 [training]
 max_iters = 5000
 log_frequency = 100
+batch_size = 512
 
 [model]
-# Slightly reduce dropout for ES stability; adjust as needed.
 dropout = 0.05
 
 [eggroll]
-pop_size = 4096        # number of perturbations per step
-rank = 4               # low-rank noise rank
-sigma = 0.01           # exploration stddev
-lr = 0.001             # ES learning rate
+antithetic = true
+pop_size = 64
+pop_chunk_size = 4
+pop_vectorized = false
+rank = 1
+sigma = 0.1
+lr = 0.05
 weight_decay = 0.0
-max_param_norm = 5.0
-seed = 12345
-# All trainable matrices are targeted by default (embedding, decoder_x, decoder_y, encoder, lm_head).
-# To limit to specific targets, list them here (currently informational).
-targets = ["decoder_x", "decoder_y", "encoder"]
+# max_param_norm = 5.0
+seed = 42

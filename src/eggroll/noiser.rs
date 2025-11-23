@@ -10,6 +10,7 @@ use super::rng::{normal_f32_from_offset, EggrollKey, EsTreeKey};
 #[derive(Clone, Debug)]
 pub struct EggrollConfig {
     pub pop_size: usize,
+    pub pop_chunk_size: usize,
     pub rank: usize,
     pub sigma: f32,
     pub lr: f32,
@@ -17,12 +18,14 @@ pub struct EggrollConfig {
     pub seed: u64,
     pub max_param_norm: Option<f32>,
     pub pop_vectorized: bool,
+    pub antithetic: bool,
 }
 
 impl Default for EggrollConfig {
     fn default() -> Self {
         Self {
             pop_size: 1024,
+            pop_chunk_size: 16,
             rank: 4,
             sigma: 0.01,
             lr: 1e-3,
@@ -30,6 +33,7 @@ impl Default for EggrollConfig {
             seed: 42,
             max_param_norm: None,
             pop_vectorized: true,
+            antithetic: false,
         }
     }
 }
@@ -56,6 +60,8 @@ where
     pub step: u64,
     pub es_key: EsTreeKey,
     pub base_key: EggrollKey,
+    pub last_fitness_mean: Option<f32>,
+    pub last_fitness_std: Option<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +86,13 @@ pub enum EggrollFactors<B: Backend> {
     D2 { a: Tensor<B, 3>, b: Tensor<B, 3> },
     /// Stacked 3D weight: A [pop, stack, rows, rank], B [pop, stack, cols, rank]
     D3 { a: Tensor<B, 4>, b: Tensor<B, 4> },
+}
+
+enum WorkerFactors<B: Backend> {
+    /// 2D weight: A [rows, rank], B [cols, rank]
+    D2 { a: Tensor<B, 2>, b: Tensor<B, 2> },
+    /// Stacked 3D weight: A [stack, rows, rank], B [stack, cols, rank]
+    D3 { a: Tensor<B, 3>, b: Tensor<B, 3> },
 }
 
 pub struct EggrollNoiser<B: Backend> {
@@ -289,6 +302,52 @@ impl<B: Backend> EggrollNoiser<B> {
         }
     }
 
+    fn low_rank_factors_worker(
+        &self,
+        spec: &EggrollParamSpec,
+        es_tree_key: &EsTreeKey,
+        worker_id: u32,
+    ) -> WorkerFactors<B> {
+        let (key_worker, sign) = if self.params.config.antithetic {
+            let base = worker_id / 2;
+            let sign = if worker_id.is_multiple_of(2) { 1.0 } else { -1.0 };
+            (base, sign)
+        } else {
+            (worker_id, 1.0)
+        };
+        if let Some(stack) = spec.stack {
+            let noise = self.noise_block_3d(spec, es_tree_key, key_worker);
+            let rows = spec.shape.0;
+            let cols = spec.shape.1;
+            let rank = spec.rank.max(1);
+            let a = noise
+                .clone()
+                .slice_dim(1, 0..rows)
+                .reshape([stack, rows, rank])
+                .mul_scalar(sign);
+            let b = noise
+                .slice_dim(1, rows..(rows + cols))
+                .reshape([stack, cols, rank])
+                .mul_scalar(sign);
+            WorkerFactors::D3 { a, b }
+        } else {
+            let noise = self.noise_block_2d(spec, es_tree_key, key_worker);
+            let rows = spec.shape.0;
+            let cols = spec.shape.1;
+            let rank = spec.rank.max(1);
+            let a = noise
+                .clone()
+                .slice_dim(0, 0..rows)
+                .reshape([rows, rank])
+                .mul_scalar(sign);
+            let b = noise
+                .slice_dim(0, rows..(rows + cols))
+                .reshape([cols, rank])
+                .mul_scalar(sign);
+            WorkerFactors::D2 { a, b }
+        }
+    }
+
     pub fn compute_updates_from_population(
         &self,
         es_tree_key: &EsTreeKey,
@@ -303,62 +362,22 @@ impl<B: Backend> EggrollNoiser<B> {
         let es_step = es_tree_key.clone().with_step(step);
 
         for spec in &self.frozen.param_specs {
-            let rank = spec.rank.max(1);
             let pop = worker_ids.len() as f32;
-            let scale = spec.sigma_scale / (pop * (rank as f32).sqrt());
+            let sigma = self.params.config.sigma.max(1e-8);
+            let scale = 1.0 / (pop * sigma);
 
-            match self.low_rank_factors_batch(spec, &es_step, worker_ids) {
-                EggrollFactors::D2 { a, b } => {
-                    let [pop_dim, rows, _] = a.shape().dims::<3>();
-                    let cols = b.shape().dims::<3>()[1];
-                    let mut acc = Tensor::<B, 2>::zeros([rows, cols], &self.params.device);
-                    for (idx, &score) in scores.iter().enumerate().take(pop_dim) {
-                        let a_i = a
-                            .clone()
-                            .slice_dim(0, idx..idx + 1)
-                            .reshape([rows, rank]);
-                        let b_i = b
-                            .clone()
-                            .slice_dim(0, idx..idx + 1)
-                            .reshape([cols, rank]);
-                        let delta = a_i.matmul(b_i.swap_dims(0, 1));
-                        acc = acc + delta.mul_scalar(score * scale);
-                    }
-                    if let Some(max_norm) = self.params.config.max_param_norm && max_norm > 0.0 {
-                        let norm_val = acc
-                            .clone()
-                            .powf_scalar(2.0)
-                            .sum()
-                            .sqrt()
-                            .to_data()
-                            .convert::<f32>()
-                            .into_vec::<f32>()
-                            .unwrap_or_default()
-                            .first()
-                            .copied()
-                            .unwrap_or(0.0);
-                        if norm_val > max_norm && norm_val > 0.0 {
-                            let factor = max_norm / norm_val;
-                            acc = acc.mul_scalar(factor);
-                        }
-                    }
-                    updates.insert(spec.id, EggrollNoiseTensor::D2(acc));
-                }
-                EggrollFactors::D3 { a, b } => {
-                    let [pop_dim, stack, rows, _] = a.shape().dims::<4>();
-                    let cols = b.shape().dims::<4>()[2];
+            match (spec.stack, spec.shape) {
+                (Some(stack), (rows, cols)) => {
                     let mut acc =
                         Tensor::<B, 3>::zeros([stack, rows, cols], &self.params.device);
-                    for (idx, &score) in scores.iter().enumerate().take(pop_dim) {
-                        let a_i = a
-                            .clone()
-                            .slice_dim(0, idx..idx + 1)
-                            .reshape([stack, rows, rank]);
-                        let b_i = b
-                            .clone()
-                            .slice_dim(0, idx..idx + 1)
-                            .reshape([stack, cols, rank]);
-                        let delta = a_i.matmul(b_i.swap_dims(2, 1));
+                    for (worker_id, score) in worker_ids.iter().copied().zip(scores.iter().copied())
+                    {
+                        let WorkerFactors::D3 { a, b } =
+                            self.low_rank_factors_worker(spec, &es_step, worker_id)
+                        else {
+                            unreachable!();
+                        };
+                        let delta = a.matmul(b.swap_dims(2, 1));
                         acc = acc + delta.mul_scalar(score * scale);
                     }
                     if let Some(max_norm) = self.params.config.max_param_norm && max_norm > 0.0 {
@@ -381,6 +400,38 @@ impl<B: Backend> EggrollNoiser<B> {
                     }
                     updates.insert(spec.id, EggrollNoiseTensor::D3(acc));
                 }
+                (None, (rows, cols)) => {
+                    let mut acc = Tensor::<B, 2>::zeros([rows, cols], &self.params.device);
+                    for (worker_id, score) in worker_ids.iter().copied().zip(scores.iter().copied())
+                    {
+                        let WorkerFactors::D2 { a, b } =
+                            self.low_rank_factors_worker(spec, &es_step, worker_id)
+                        else {
+                            unreachable!();
+                        };
+                        let delta = a.matmul(b.swap_dims(0, 1));
+                        acc = acc + delta.mul_scalar(score * scale);
+                    }
+                    if let Some(max_norm) = self.params.config.max_param_norm && max_norm > 0.0 {
+                        let norm_val = acc
+                            .clone()
+                            .powf_scalar(2.0)
+                            .sum()
+                            .sqrt()
+                            .to_data()
+                            .convert::<f32>()
+                            .into_vec::<f32>()
+                            .unwrap_or_default()
+                            .first()
+                            .copied()
+                            .unwrap_or(0.0);
+                        if norm_val > max_norm && norm_val > 0.0 {
+                            let factor = max_norm / norm_val;
+                            acc = acc.mul_scalar(factor);
+                        }
+                    }
+                    updates.insert(spec.id, EggrollNoiseTensor::D2(acc));
+                }
             }
         }
 
@@ -395,7 +446,7 @@ impl<B: Backend> EggrollNoiser<B> {
         es_tree_key: &EsTreeKey,
         thread_id: u32,
     ) -> Tensor<B, 2> {
-        let base = x.clone().matmul(w.clone().swap_dims(0, 1));
+        let base = x.clone().matmul(w.clone());
         let Some(spec) = self.param_spec(param_id) else {
             return base;
         };
@@ -408,10 +459,13 @@ impl<B: Backend> EggrollNoiser<B> {
 
         let noise = self.noise_block_2d(spec, es_tree_key, thread_id);
         let rank = spec.rank.max(1);
-        let n = spec.shape.1;
-        let b = noise.clone().slice_dim(0, 0..n).reshape([n, rank]);
-        let a = noise.slice_dim(0, n..(spec.shape.0 + n)).reshape([spec.shape.0, rank]);
-        let corr = x.matmul(b).matmul(a.swap_dims(0, 1));
+        let rows = spec.shape.0;
+        let cols = spec.shape.1;
+        let a = noise.clone().slice_dim(0, 0..rows).reshape([rows, rank]);
+        let b = noise
+            .slice_dim(0, rows..(rows + cols))
+            .reshape([cols, rank]);
+        let corr = x.matmul(a).matmul(b.swap_dims(0, 1));
         base + corr.mul_scalar(self.scale(spec))
     }
 
@@ -423,7 +477,7 @@ impl<B: Backend> EggrollNoiser<B> {
         es_tree_key: &EsTreeKey,
         worker_ids: &[u32],
     ) -> Tensor<B, 3> {
-        let base = x.clone().matmul(w.clone().swap_dims(0, 1));
+        let base = x.clone().matmul(w.clone());
         let Some(spec) = self.param_spec(param_id) else {
             return base.unsqueeze_dim::<3>(0).repeat_dim(0, worker_ids.len());
         };
@@ -439,7 +493,7 @@ impl<B: Backend> EggrollNoiser<B> {
         for (idx, _) in worker_ids.iter().enumerate() {
             let a_i = a.clone().slice_dim(0, idx..idx + 1).reshape([spec.shape.0, spec.rank.max(1)]);
             let b_i = b.clone().slice_dim(0, idx..idx + 1).reshape([spec.shape.1, spec.rank.max(1)]);
-            let corr = x.clone().matmul(b_i.clone()).matmul(a_i.swap_dims(0, 1));
+            let corr = x.clone().matmul(a_i.clone()).matmul(b_i.swap_dims(0, 1));
             let noisy = base.clone() + corr.mul_scalar(self.scale(spec));
             outs.push(noisy.unsqueeze_dim::<3>(0));
         }

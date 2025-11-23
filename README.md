@@ -17,6 +17,7 @@ burn inference and training of [dragon hatchling](https://arxiv.org/abs/2509.265
 - [x] cached inference
 - [x] training benchmarks and reporting
 - [x] [eggroll training](https://arxiv.org/abs/2509.24372)
+- [ ] int8 ES training (https://github.com/tracel-ai/burn/issues/464)
 - [ ] adaptive tool discovery
 - [ ] conditional (deep) gating
 - [ ] document-coherent dataloading and scale mixup
