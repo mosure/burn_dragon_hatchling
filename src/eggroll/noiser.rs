@@ -289,6 +289,109 @@ impl<B: Backend> EggrollNoiser<B> {
         }
     }
 
+    pub fn compute_updates_from_population(
+        &self,
+        es_tree_key: &EsTreeKey,
+        step: u64,
+        worker_ids: &[u32],
+        scores: &[f32],
+    ) -> HashMap<ParamId, EggrollNoiseTensor<B>> {
+        let mut updates = HashMap::new();
+        if self.params.config.sigma == 0.0 || worker_ids.is_empty() {
+            return updates;
+        }
+        let sigma = self.params.config.sigma.max(f32::MIN_POSITIVE);
+        let es_step = es_tree_key.clone().with_step(step);
+
+        for spec in &self.frozen.param_specs {
+            let rank = spec.rank.max(1);
+            let pop = worker_ids.len() as f32;
+            let scale = spec.sigma_scale / (pop * (rank as f32).sqrt() * sigma);
+
+            match self.low_rank_factors_batch(spec, &es_step, worker_ids) {
+                EggrollFactors::D2 { a, b } => {
+                    let [pop_dim, rows, _] = a.shape().dims::<3>();
+                    let cols = b.shape().dims::<3>()[1];
+                    let mut acc = Tensor::<B, 2>::zeros([rows, cols], &self.params.device);
+                    for (idx, &score) in scores.iter().enumerate().take(pop_dim) {
+                        let a_i = a
+                            .clone()
+                            .slice_dim(0, idx..idx + 1)
+                            .reshape([rows, rank]);
+                        let b_i = b
+                            .clone()
+                            .slice_dim(0, idx..idx + 1)
+                            .reshape([cols, rank]);
+                        let delta = a_i.matmul(b_i.swap_dims(0, 1));
+                        acc = acc + delta.mul_scalar(score * scale);
+                    }
+                    if let Some(max_norm) = self.params.config.max_param_norm {
+                        if max_norm > 0.0 {
+                            let norm_val = acc
+                                .clone()
+                                .powf_scalar(2.0)
+                                .sum()
+                                .sqrt()
+                                .to_data()
+                                .convert::<f32>()
+                                .into_vec::<f32>()
+                                .unwrap_or_default()
+                                .first()
+                                .copied()
+                                .unwrap_or(0.0);
+                            if norm_val > max_norm && norm_val > 0.0 {
+                                let factor = max_norm / norm_val;
+                                acc = acc.mul_scalar(factor);
+                            }
+                        }
+                    }
+                    updates.insert(spec.id, EggrollNoiseTensor::D2(acc));
+                }
+                EggrollFactors::D3 { a, b } => {
+                    let [pop_dim, stack, rows, _] = a.shape().dims::<4>();
+                    let cols = b.shape().dims::<4>()[2];
+                    let mut acc =
+                        Tensor::<B, 3>::zeros([stack, rows, cols], &self.params.device);
+                    for (idx, &score) in scores.iter().enumerate().take(pop_dim) {
+                        let a_i = a
+                            .clone()
+                            .slice_dim(0, idx..idx + 1)
+                            .reshape([stack, rows, rank]);
+                        let b_i = b
+                            .clone()
+                            .slice_dim(0, idx..idx + 1)
+                            .reshape([stack, cols, rank]);
+                        let delta = a_i.matmul(b_i.swap_dims(2, 1));
+                        acc = acc + delta.mul_scalar(score * scale);
+                    }
+                    if let Some(max_norm) = self.params.config.max_param_norm {
+                        if max_norm > 0.0 {
+                            let norm_val = acc
+                                .clone()
+                                .powf_scalar(2.0)
+                                .sum()
+                                .sqrt()
+                                .to_data()
+                                .convert::<f32>()
+                                .into_vec::<f32>()
+                                .unwrap_or_default()
+                                .first()
+                                .copied()
+                                .unwrap_or(0.0);
+                            if norm_val > max_norm && norm_val > 0.0 {
+                                let factor = max_norm / norm_val;
+                                acc = acc.mul_scalar(factor);
+                            }
+                        }
+                    }
+                    updates.insert(spec.id, EggrollNoiseTensor::D3(acc));
+                }
+            }
+        }
+
+        updates
+    }
+
     pub fn do_mm(
         &self,
         x: Tensor<B, 2>,

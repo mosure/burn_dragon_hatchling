@@ -1,4 +1,4 @@
-use burn::module::{Module, Param};
+use burn::module::{Module, Param, ParamId};
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 use burn_ndarray::NdArray;
@@ -419,6 +419,73 @@ fn bdh_encoder_noise_changes_output() {
         diff[0] > 0.0,
         "encoder noise failed to change forward output. diff={}",
         diff[0]
+    );
+}
+
+#[test]
+fn pop_update_matches_naive_delta() {
+    type B = NdArray<f32>;
+    let device = <B as Backend>::Device::default();
+    let spec = EggrollParamSpec {
+        id: ParamId::new(),
+        path: "w".into(),
+        shape: (8, 8),
+        rank: 2,
+        sigma_scale: 1.0,
+        stack: None,
+    };
+    let config = EggrollConfig {
+        pop_size: 8,
+        rank: 2,
+        sigma: 0.05,
+        lr: 0.1,
+        weight_decay: 0.0,
+        seed: 1234,
+        max_param_norm: None,
+        pop_vectorized: true,
+    };
+    let noiser = EggrollNoiser::new(vec![spec.clone()], config.clone(), &device);
+    let tree_key = EsTreeKey::new(EggrollKey::from_seed(config.seed));
+    let step = 2;
+    let worker_ids: Vec<u32> = (0..config.pop_size as u32).collect();
+    let scores: Vec<f32> = (0..config.pop_size)
+        .map(|i| (i as f32 - 4.0) * 0.1)
+        .collect();
+
+    let updates = noiser.compute_updates_from_population(
+        &tree_key,
+        step,
+        &worker_ids,
+        &scores,
+    );
+    let delta_pop = match updates.get(&spec.id) {
+        Some(EggrollNoiseTensor::D2(t)) => t.clone(),
+        _ => panic!("expected 2D update"),
+    };
+
+    let mut delta_ref = Tensor::<B, 2>::zeros([spec.shape.0, spec.shape.1], &device);
+    let es_step = tree_key.clone().with_step(step);
+    for (idx, &score) in scores.iter().enumerate() {
+        let tid = worker_ids[idx];
+        let delta = match noiser.low_rank_delta(&spec, &es_step, tid) {
+            EggrollNoiseTensor::D2(d) => d,
+            EggrollNoiseTensor::D3(_) => panic!("unexpected 3D delta"),
+        };
+        let scale = score / (config.pop_size as f32 * config.sigma);
+        delta_ref = delta_ref + delta.mul_scalar(scale);
+    }
+
+    let diff = (delta_pop - delta_ref)
+        .abs()
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .unwrap();
+    let max_diff = diff.iter().copied().fold(0.0_f32, f32::max);
+    assert!(
+        max_diff < 1e-4,
+        "population update should match naive accumulation, max_diff={}",
+        max_diff
     );
 }
 

@@ -176,54 +176,12 @@ where
         let std = var.sqrt().max(1e-8);
         let fitness_norm: Vec<f32> = fitness.iter().map(|&f| (f - mean_f) / std).collect();
 
-        let mut updates: HashMap<ParamId, EggrollNoiseTensor<B>> = HashMap::new();
-        let sigma = self
-            .state
-            .config
-            .sigma
-            .max(f32::MIN_POSITIVE);
-        for spec in &self.state.param_specs {
-            if let Some(stack) = spec.stack {
-                let mut acc = Tensor::<B, 3>::zeros(
-                    [stack, spec.shape.0, spec.shape.1],
-                    &self.noiser.params.device,
-                );
-                for (k, score) in fitness_norm.iter().copied().enumerate() {
-                    let delta = match self
-                        .noiser
-                        .low_rank_delta(spec, &es_key, k as u32)
-                    {
-                        EggrollNoiseTensor::D3(delta) => delta,
-                        EggrollNoiseTensor::D2(_) => continue,
-                    };
-                    let scaled = delta.mul_scalar(score / (pop as f32 * sigma));
-                    acc = acc + scaled;
-                }
-                updates.insert(
-                    spec.id,
-                    EggrollNoiseTensor::D3(acc.mul_scalar(self.state.config.lr)),
-                );
-            } else {
-                let mut acc =
-                    Tensor::<B, 2>::zeros([spec.shape.0, spec.shape.1], &self.noiser.params.device);
-                for (k, score) in fitness_norm.iter().copied().enumerate() {
-                    let delta = match self
-                        .noiser
-                        .low_rank_delta(spec, &es_key, k as u32)
-                    {
-                        EggrollNoiseTensor::D2(delta) => delta,
-                        EggrollNoiseTensor::D3(_) => continue,
-                    };
-                    // E_k already scaled by sigma/sqrt(rank)
-                    let scaled = delta.mul_scalar(score / (pop as f32 * sigma));
-                    acc = acc + scaled;
-                }
-                updates.insert(
-                    spec.id,
-                    EggrollNoiseTensor::D2(acc.mul_scalar(self.state.config.lr)),
-                );
-            }
-        }
+        let updates = self.noiser.compute_updates_from_population(
+            &tree_key,
+            self.state.step,
+            &global_workers,
+            &fitness_norm,
+        );
 
         let weight_decay = self.state.config.weight_decay;
         let lr = self.state.config.lr;
@@ -247,14 +205,14 @@ where
                             delta.clone().to_data(),
                             &tensor.device(),
                         );
-                        updated = updated + delta;
+                        updated = updated + delta.mul_scalar(self.lr);
                     }
                     (3, Some(EggrollNoiseTensor::D3(delta))) => {
                         let delta = Tensor::<B, D>::from_data(
                             delta.clone().to_data(),
                             &tensor.device(),
                         );
-                        updated = updated + delta;
+                        updated = updated + delta.mul_scalar(self.lr);
                     }
                     _ => {}
                 };
