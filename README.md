@@ -38,8 +38,6 @@ Dataset configuration (built-in presets and Hugging Face examples) is documented
 ## training
 
 - `cargo run --release` (defaults to the cuda backend)
-- For the new EGGROLL ES backend, set `mode = "eggroll"` in your TOML config and add an `[eggroll]`
-  block (e.g. `pop_size = 65536`, `rank = 4`, `sigma = 0.01`, `lr = 1e-3`, `targets = ["decoder_x","decoder_y","encoder"]`). All trainable matrices (embedding, decoder_x, decoder_y, encoder, lm_head) are valid targets.
 
 
 ## inference

@@ -300,13 +300,12 @@ impl<B: Backend> EggrollNoiser<B> {
         if self.params.config.sigma == 0.0 || worker_ids.is_empty() {
             return updates;
         }
-        let sigma = self.params.config.sigma.max(f32::MIN_POSITIVE);
         let es_step = es_tree_key.clone().with_step(step);
 
         for spec in &self.frozen.param_specs {
             let rank = spec.rank.max(1);
             let pop = worker_ids.len() as f32;
-            let scale = spec.sigma_scale / (pop * (rank as f32).sqrt() * sigma);
+            let scale = spec.sigma_scale / (pop * (rank as f32).sqrt());
 
             match self.low_rank_factors_batch(spec, &es_step, worker_ids) {
                 EggrollFactors::D2 { a, b } => {
