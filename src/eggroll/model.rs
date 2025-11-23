@@ -11,20 +11,24 @@ use super::rng::{EggrollKey, EsTreeKey};
 
 pub trait EggrollObjective<M, B: Backend> {
     type Batch;
-    type PopLogits;
+    fn evaluate(&mut self, logits: &Tensor<B, 3>, batch: &Self::Batch) -> f32;
 
-    fn evaluate(&self, model: &M, batch: &Self::Batch) -> f32;
-
-    /// Evaluate using a noisy forward path without cloning the base model.
-    fn evaluate_with_noise(
-        &self,
-        model: &M,
+    fn evaluate_population(
+        &mut self,
+        logits: &Tensor<B, 4>,
         batch: &Self::Batch,
-        noiser: &EggrollNoiser<B>,
-        es_key: &EsTreeKey,
-        thread_id: u32,
-        deterministic: bool,
-    ) -> f32;
+    ) -> Vec<f32> {
+        let [pop, batch_size, time, vocab] = logits.shape().dims::<4>();
+        let mut scores = Vec::with_capacity(pop);
+        for idx in 0..pop {
+            let logits_single = logits
+                .clone()
+                .slice_dim(0, idx..idx + 1)
+                .reshape([batch_size, time, vocab]);
+            scores.push(self.evaluate(&logits_single, batch));
+        }
+        scores
+    }
 
     /// Optional population path: run a batched noisy forward once and return per-population logits.
     fn forward_population(
@@ -36,18 +40,20 @@ pub trait EggrollObjective<M, B: Backend> {
         _step: u64,
         _global_workers: &[u32],
         _deterministic: bool,
-    ) -> Option<Self::PopLogits> {
+    ) -> Option<Tensor<B, 4>> {
         None
     }
 
-    /// Optional population evaluation: compute fitness per population member from batched logits.
-    fn evaluate_population(
-        &self,
-        _logits: &Self::PopLogits,
-        _batch: &Self::Batch,
-    ) -> Option<Vec<f32>> {
-        None
-    }
+    /// Evaluate using a noisy forward path without cloning the base model.
+    fn evaluate_with_noise(
+        &mut self,
+        model: &M,
+        batch: &Self::Batch,
+        noiser: &EggrollNoiser<B>,
+        es_key: &EsTreeKey,
+        thread_id: u32,
+        deterministic: bool,
+    ) -> f32;
 }
 
 pub struct EggrollTrainer<M, B: Backend, Obj>
@@ -114,47 +120,50 @@ where
         let tree_key = self.state.es_key.clone();
         let es_key = tree_key.clone().with_step(self.state.step);
         let global_workers: Vec<u32> = (0..pop as u32).collect();
+        let deterministic = true;
 
-        let fitness: Vec<f32> = if let Some(pop_logits) = self.objective.forward_population(
-            &self.model,
-            batch,
-            &self.noiser,
-            &tree_key,
-            self.state.step,
-            &global_workers,
-            true,
-        ) {
-            if let Some(scores) = self.objective.evaluate_population(&pop_logits, batch) {
-                scores
+        let fitness: Vec<f32> = if self.state.config.pop_vectorized {
+            if let Some(pop_logits) = self.objective.forward_population(
+                &self.model,
+                batch,
+                &self.noiser,
+                &tree_key,
+                self.state.step,
+                &global_workers,
+                deterministic,
+            ) {
+                self.objective.evaluate_population(&pop_logits, batch)
             } else {
-                (0..pop)
+                global_workers
+                    .iter()
+                    .copied()
                     .map(|tid| {
                         self.objective.evaluate_with_noise(
                             &self.model,
                             batch,
                             &self.noiser,
                             &es_key,
-                            tid as u32,
-                            true,
+                            tid,
+                            deterministic,
                         )
                     })
                     .collect()
             }
         } else {
-            let mut scores = Vec::with_capacity(pop);
-            for thread_id in 0..pop {
-                let tid = thread_id as u32;
-                let score = self.objective.evaluate_with_noise(
-                    &self.model,
-                    batch,
-                    &self.noiser,
-                    &es_key,
-                    tid,
-                    true,
-                );
-                scores.push(score);
-            }
-            scores
+            global_workers
+                .iter()
+                .copied()
+                .map(|tid| {
+                    self.objective.evaluate_with_noise(
+                        &self.model,
+                        batch,
+                        &self.noiser,
+                        &es_key,
+                        tid,
+                        deterministic,
+                    )
+                })
+                .collect()
         };
 
         let mean_f = fitness.iter().copied().sum::<f32>() / pop as f32;

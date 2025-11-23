@@ -16,6 +16,7 @@ pub struct EggrollConfig {
     pub weight_decay: f32,
     pub seed: u64,
     pub max_param_norm: Option<f32>,
+    pub pop_vectorized: bool,
 }
 
 impl Default for EggrollConfig {
@@ -28,6 +29,7 @@ impl Default for EggrollConfig {
             weight_decay: 0.0,
             seed: 42,
             max_param_norm: None,
+            pop_vectorized: true,
         }
     }
 }

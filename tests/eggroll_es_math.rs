@@ -30,15 +30,19 @@ struct LinearObjective;
 
 impl<B: Backend> EggrollObjective<ScalarModel<B>, B> for LinearObjective {
     type Batch = ();
-    type PopLogits = ();
 
-    fn evaluate(&self, model: &ScalarModel<B>, _batch: &Self::Batch) -> f32 {
-        let val = model.forward();
-        val.to_data().convert::<f32>().into_vec::<f32>().unwrap()[0]
+    fn evaluate(&mut self, logits: &Tensor<B, 3>, _batch: &Self::Batch) -> f32 {
+        logits
+            .clone()
+            .reshape([1])
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .unwrap()[0]
     }
 
     fn evaluate_with_noise(
-        &self,
+        &mut self,
         model: &ScalarModel<B>,
         _batch: &Self::Batch,
         noiser: &EggrollNoiser<B>,
@@ -91,6 +95,7 @@ fn es_gradient_aligns_with_finite_difference() {
             weight_decay: 0.0,
             seed,
             max_param_norm: None,
+            pop_vectorized: true,
         };
 
         let base_w = model.w.val();

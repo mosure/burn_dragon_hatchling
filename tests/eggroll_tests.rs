@@ -63,14 +63,8 @@ impl<B: Backend> MseObjective<B> {
             _phantom: core::marker::PhantomData,
         }
     }
-}
 
-impl<B: Backend> EggrollObjective<SimpleLinear<B>, B> for MseObjective<B> {
-    type Batch = Tensor<B, 2>;
-    type PopLogits = ();
-
-    fn evaluate(&self, model: &SimpleLinear<B>, batch: &Self::Batch) -> f32 {
-        let pred = model.forward(batch.clone());
+    fn mse(&self, pred: Tensor<B, 2>) -> f32 {
         let diff = pred - self.target.clone();
         let mse = diff.clone().powf_scalar(2.0).sum().div_scalar(diff.shape().num_elements() as f32);
         mse.to_data()
@@ -82,9 +76,19 @@ impl<B: Backend> EggrollObjective<SimpleLinear<B>, B> for MseObjective<B> {
             .unwrap_or(0.0)
             * -1.0
     }
+}
+
+impl<B: Backend> EggrollObjective<SimpleLinear<B>, B> for MseObjective<B> {
+    type Batch = Tensor<B, 2>;
+
+    fn evaluate(&mut self, logits: &Tensor<B, 3>, _batch: &Self::Batch) -> f32 {
+        let [batch, _, dim] = logits.shape().dims();
+        let preds = logits.clone().reshape([batch, dim]);
+        self.mse(preds)
+    }
 
     fn evaluate_with_noise(
-        &self,
+        &mut self,
         model: &SimpleLinear<B>,
         batch: &Self::Batch,
         noiser: &EggrollNoiser<B>,
@@ -110,16 +114,7 @@ impl<B: Backend> EggrollObjective<SimpleLinear<B>, B> for MseObjective<B> {
         };
         let w_noisy = model.weight.val() + delta;
         let pred = batch.clone().matmul(w_noisy.swap_dims(0, 1));
-        let diff = pred - self.target.clone();
-        let mse = diff.clone().powf_scalar(2.0).sum().div_scalar(diff.shape().num_elements() as f32);
-        mse.to_data()
-            .convert::<f32>()
-            .into_vec::<f32>()
-            .unwrap_or_default()
-            .first()
-            .copied()
-            .unwrap_or(0.0)
-            * -1.0
+        self.mse(pred)
     }
 }
 
@@ -147,6 +142,7 @@ fn eggroll_sigma_zero_is_noop() {
             weight_decay: 0.0,
             seed: 123,
             max_param_norm: None,
+            pop_vectorized: true,
         },
         specs,
         MseObjective::new(target.clone()),
@@ -191,13 +187,17 @@ fn eggroll_improves_on_linear_mse() {
             weight_decay: 0.0,
             seed: 999,
             max_param_norm: None,
+            pop_vectorized: true,
         },
         specs,
         MseObjective::new(target.clone()),
     );
 
-    let objective = MseObjective::new(target.clone());
-    let baseline = objective.evaluate(&trainer.model, &batch);
+    let mut objective = MseObjective::new(target.clone());
+    let baseline_preds = trainer.model.forward(batch.clone());
+    let [batch_size, dim] = baseline_preds.shape().dims();
+    let baseline_logits = baseline_preds.reshape([batch_size, 1, dim]);
+    let baseline = objective.evaluate(&baseline_logits, &batch);
     let baseline_mse = -baseline;
     let w_start = trainer.model.weight.val().clone();
 
@@ -219,7 +219,9 @@ fn eggroll_improves_on_linear_mse() {
         let _ = trainer.step(&batch);
     }
 
-    let improved = objective.evaluate(&trainer.model, &batch);
+    let improved_preds = trainer.model.forward(batch.clone());
+    let improved_logits = improved_preds.reshape([batch_size, 1, dim]);
+    let improved = objective.evaluate(&improved_logits, &batch);
     let improved_mse = -improved;
     let w_after = trainer.model.weight.val().clone();
     let w_diff = (w_after - w_start)
@@ -261,6 +263,7 @@ fn stacked_params_receive_noise() {
             rank: 2,
             seed: 7,
             max_param_norm: None,
+            pop_vectorized: true,
         },
         &device,
     );
@@ -311,6 +314,7 @@ fn embedding_sigma_zero_matches_plain() {
             rank: 2,
             seed: 1,
             max_param_norm: None,
+            pop_vectorized: true,
         },
         &device,
     );
@@ -352,6 +356,7 @@ fn bdh_sigma_zero_matches_plain() {
             rank: 2,
             seed: 42,
             max_param_norm: None,
+            pop_vectorized: true,
         },
         &device,
     );

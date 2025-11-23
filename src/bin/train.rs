@@ -18,7 +18,7 @@ use burn::lr_scheduler::{
 };
 use burn::optim::adaptor::OptimizerAdaptor;
 use burn::optim::{AdamW, AdamWConfig, LearningRate};
-use burn::tensor::Tensor;
+use burn::tensor::{Tensor, activation};
 use burn::tensor::backend::{AutodiffBackend, Backend as BackendTrait};
 use burn_autodiff::Autodiff;
 use burn_train::metric::{Adaptor, ItemLazy, LearningRateMetric, LossInput, LossMetric};
@@ -154,11 +154,9 @@ impl<B: BackendTrait> Default for LanguageModelEsObjective<B> {
 
 impl<B: BackendTrait> EggrollObjective<BDH<B>, B> for LanguageModelEsObjective<B> {
     type Batch = SequenceBatch<B>;
-    type PopLogits = Tensor<B, 4>;
 
-    fn evaluate(&self, model: &BDH<B>, batch: &Self::Batch) -> f32 {
-        let logits = model.forward(batch.inputs.clone());
-        let loss = language_model_loss::<B>(logits, batch.targets.clone());
+    fn evaluate(&mut self, logits: &Tensor<B, 3>, batch: &Self::Batch) -> f32 {
+        let loss = language_model_loss::<B>(logits.clone(), batch.targets.clone());
         let data = loss
             .to_data()
             .convert::<f32>()
@@ -167,8 +165,54 @@ impl<B: BackendTrait> EggrollObjective<BDH<B>, B> for LanguageModelEsObjective<B
         data.first().copied().unwrap_or(0.0)
     }
 
-    fn evaluate_with_noise(
+    fn evaluate_population(
+        &mut self,
+        logits: &Tensor<B, 4>,
+        batch: &Self::Batch,
+    ) -> Vec<f32> {
+        let [pop, batch_size, time, _vocab] = logits.shape().dims::<4>();
+        let targets = batch
+            .targets
+            .clone()
+            .unsqueeze_dim::<3>(0)
+            .repeat_dim(0, pop);
+        let log_probs = activation::log_softmax(logits.clone(), 3);
+        let gathered = log_probs.gather(3, targets.unsqueeze_dim::<4>(3));
+        let token_loss = gathered.neg().reshape([pop, batch_size * time]);
+        let loss_mean = token_loss
+            .sum_dim(1)
+            .div_scalar((batch_size * time) as f32)
+            .reshape([pop]);
+
+        loss_mean
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .unwrap_or_default()
+    }
+
+    fn forward_population(
         &self,
+        model: &BDH<B>,
+        batch: &Self::Batch,
+        noiser: &burn_dragon_hatchling::eggroll::EggrollNoiser<B>,
+        tree_key: &burn_dragon_hatchling::eggroll::EsTreeKey,
+        step: u64,
+        global_workers: &[u32],
+        deterministic: bool,
+    ) -> Option<Tensor<B, 4>> {
+        Some(model.forward_population_with_noise(
+            &batch.inputs,
+            noiser,
+            tree_key,
+            step,
+            global_workers,
+            deterministic,
+        ))
+    }
+
+    fn evaluate_with_noise(
+        &mut self,
         model: &BDH<B>,
         batch: &Self::Batch,
         noiser: &burn_dragon_hatchling::eggroll::EggrollNoiser<B>,
@@ -183,60 +227,7 @@ impl<B: BackendTrait> EggrollObjective<BDH<B>, B> for LanguageModelEsObjective<B
             thread_id,
             deterministic,
         );
-        let loss = language_model_loss::<B>(logits, batch.targets.clone());
-        let data = loss
-            .to_data()
-            .convert::<f32>()
-            .into_vec::<f32>()
-            .unwrap_or_default();
-        data.first().copied().unwrap_or(0.0)
-    }
-
-    fn forward_population(
-        &self,
-        model: &BDH<B>,
-        batch: &Self::Batch,
-        noiser: &burn_dragon_hatchling::eggroll::EggrollNoiser<B>,
-        tree_key: &burn_dragon_hatchling::eggroll::EsTreeKey,
-        step: u64,
-        global_workers: &[u32],
-        deterministic: bool,
-    ) -> Option<Self::PopLogits> {
-        Some(model.forward_population_with_noise(
-            &batch.inputs,
-            noiser,
-            tree_key,
-            step,
-            global_workers,
-            deterministic,
-        ))
-    }
-
-    fn evaluate_population(
-        &self,
-        logits: &Self::PopLogits,
-        batch: &Self::Batch,
-    ) -> Option<Vec<f32>> {
-        let dims = logits.shape().dims::<4>();
-        let pop = dims[0];
-        let batch_size = dims[1];
-        let time = dims[2];
-        let vocab = dims[3];
-        let mut scores = Vec::with_capacity(pop);
-        for p in 0..pop {
-            let logits_p = logits
-                .clone()
-                .slice_dim(0, p..p + 1)
-                .reshape([batch_size, time, vocab]);
-            let loss = language_model_loss::<B>(logits_p, batch.targets.clone());
-            let data = loss
-                .to_data()
-                .convert::<f32>()
-                .into_vec::<f32>()
-                .unwrap_or_default();
-            scores.push(data.first().copied().unwrap_or(0.0));
-        }
-        Some(scores)
+        self.evaluate(&logits, batch)
     }
 }
 

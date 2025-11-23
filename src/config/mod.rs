@@ -219,6 +219,8 @@ pub struct EggrollConfigSection {
     pub seed: u64,
     #[serde(default)]
     pub targets: Vec<String>,
+    #[serde(default = "default_pop_vectorized")]
+    pub pop_vectorized: bool,
 }
 
 impl EggrollConfigSection {
@@ -231,8 +233,13 @@ impl EggrollConfigSection {
             weight_decay: self.weight_decay,
             seed: self.seed,
             max_param_norm: self.max_param_norm,
+            pop_vectorized: self.pop_vectorized,
         }
     }
+}
+
+fn default_pop_vectorized() -> bool {
+    true
 }
 
 pub fn load_training_config(paths: &[PathBuf]) -> Result<TrainingConfig> {
