@@ -125,7 +125,7 @@ fn philox2x32(key: EggrollKey, counter: u64) -> (u32, u32) {
         x1 = x1.rotate_left(rot) ^ x0;
 
         if (r + 1) % 4 == 0 {
-            let k = ((r + 1) / 4) as usize;
+            let k = (r + 1) / 4;
             x0 = x0.wrapping_add(ks[k % 3]);
             x1 = x1.wrapping_add(ks[(k + 1) % 3].wrapping_add(k as u32));
         }

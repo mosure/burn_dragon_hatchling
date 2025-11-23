@@ -31,6 +31,7 @@ pub trait EggrollObjective<M, B: Backend> {
     }
 
     /// Optional population path: run a batched noisy forward once and return per-population logits.
+    #[allow(clippy::too_many_arguments)]
     fn forward_population(
         &self,
         _model: &M,
@@ -81,9 +82,9 @@ where
     ) -> Self {
         let devices = model.devices();
         let device = devices
-            .get(0)
+            .first()
             .cloned()
-            .unwrap_or_else(|| B::Device::default());
+            .unwrap_or_else(B::Device::default);
         let noiser = EggrollNoiser::new(param_specs.clone(), config.clone(), &device);
         let base_key = EggrollKey::from_seed(config.seed);
         let es_key = EsTreeKey::new(base_key);

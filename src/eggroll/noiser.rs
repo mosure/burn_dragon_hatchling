@@ -324,24 +324,22 @@ impl<B: Backend> EggrollNoiser<B> {
                         let delta = a_i.matmul(b_i.swap_dims(0, 1));
                         acc = acc + delta.mul_scalar(score * scale);
                     }
-                    if let Some(max_norm) = self.params.config.max_param_norm {
-                        if max_norm > 0.0 {
-                            let norm_val = acc
-                                .clone()
-                                .powf_scalar(2.0)
-                                .sum()
-                                .sqrt()
-                                .to_data()
-                                .convert::<f32>()
-                                .into_vec::<f32>()
-                                .unwrap_or_default()
-                                .first()
-                                .copied()
-                                .unwrap_or(0.0);
-                            if norm_val > max_norm && norm_val > 0.0 {
-                                let factor = max_norm / norm_val;
-                                acc = acc.mul_scalar(factor);
-                            }
+                    if let Some(max_norm) = self.params.config.max_param_norm && max_norm > 0.0 {
+                        let norm_val = acc
+                            .clone()
+                            .powf_scalar(2.0)
+                            .sum()
+                            .sqrt()
+                            .to_data()
+                            .convert::<f32>()
+                            .into_vec::<f32>()
+                            .unwrap_or_default()
+                            .first()
+                            .copied()
+                            .unwrap_or(0.0);
+                        if norm_val > max_norm && norm_val > 0.0 {
+                            let factor = max_norm / norm_val;
+                            acc = acc.mul_scalar(factor);
                         }
                     }
                     updates.insert(spec.id, EggrollNoiseTensor::D2(acc));
@@ -363,24 +361,22 @@ impl<B: Backend> EggrollNoiser<B> {
                         let delta = a_i.matmul(b_i.swap_dims(2, 1));
                         acc = acc + delta.mul_scalar(score * scale);
                     }
-                    if let Some(max_norm) = self.params.config.max_param_norm {
-                        if max_norm > 0.0 {
-                            let norm_val = acc
-                                .clone()
-                                .powf_scalar(2.0)
-                                .sum()
-                                .sqrt()
-                                .to_data()
-                                .convert::<f32>()
-                                .into_vec::<f32>()
-                                .unwrap_or_default()
-                                .first()
-                                .copied()
-                                .unwrap_or(0.0);
-                            if norm_val > max_norm && norm_val > 0.0 {
-                                let factor = max_norm / norm_val;
-                                acc = acc.mul_scalar(factor);
-                            }
+                    if let Some(max_norm) = self.params.config.max_param_norm && max_norm > 0.0 {
+                        let norm_val = acc
+                            .clone()
+                            .powf_scalar(2.0)
+                            .sum()
+                            .sqrt()
+                            .to_data()
+                            .convert::<f32>()
+                            .into_vec::<f32>()
+                            .unwrap_or_default()
+                            .first()
+                            .copied()
+                            .unwrap_or(0.0);
+                        if norm_val > max_norm && norm_val > 0.0 {
+                            let factor = max_norm / norm_val;
+                            acc = acc.mul_scalar(factor);
                         }
                     }
                     updates.insert(spec.id, EggrollNoiseTensor::D3(acc));
@@ -548,7 +544,7 @@ impl<B: Backend> EggrollNoiser<B> {
         let mut x_expanded = x.clone();
         let dims = x_expanded.shape().dims::<4>();
         if dims[1] != stack {
-            let repeat = ((stack + dims[1] - 1) / dims[1]).max(1);
+            let repeat = stack.div_ceil(dims[1]).max(1);
             x_expanded = x_expanded.repeat_dim(1, repeat).slice_dim(1, 0..stack);
         }
 
@@ -597,7 +593,7 @@ impl<B: Backend> EggrollNoiser<B> {
             let mut x_expanded = x.clone();
             let dims = x_expanded.shape().dims::<4>();
             if dims[1] != stack {
-                let repeat = ((stack + dims[1] - 1) / dims[1]).max(1);
+                let repeat = stack.div_ceil(dims[1]).max(1);
                 x_expanded =
                     x_expanded.repeat_dim(1, repeat).slice_dim(1, 0..stack);
             }
@@ -728,15 +724,10 @@ impl<B: Backend> EggrollNoiser<B> {
                         let updated = tensor + delta;
                         return Param::from_mapped_value(id, updated, mapper);
                     }
-                } else if D == 3 {
-                    if let Some(EggrollNoiseTensor::D3(delta)) = self.noise.get(&id) {
-                        let delta = Tensor::<B, D>::from_data(
-                            delta.clone().to_data(),
-                            &tensor.device(),
-                        );
-                        let updated = tensor + delta;
-                        return Param::from_mapped_value(id, updated, mapper);
-                    }
+                } else if D == 3 && let Some(EggrollNoiseTensor::D3(delta)) = self.noise.get(&id) {
+                    let delta = Tensor::<B, D>::from_data(delta.clone().to_data(), &tensor.device());
+                    let updated = tensor + delta;
+                    return Param::from_mapped_value(id, updated, mapper);
                 }
                 Param::from_mapped_value(id, tensor, mapper)
             }
