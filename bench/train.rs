@@ -374,13 +374,9 @@ fn forward_streaming<B: BackendTrait>(
             stream_inputs.push(input_slice);
 
             let mut guard = handle.state.lock().expect("lock stream state");
-            if guard.is_none() {
-                *guard = Some(model.init_compressed_state());
-            }
             let state = guard
-                .as_ref()
-                .expect("stream state initialized")
-                .clone();
+                .take()
+                .unwrap_or_else(|| model.init_compressed_state());
             stream_states.push(state);
             state_arcs.push((*idx, Arc::clone(&handle.state)));
         }
@@ -394,10 +390,10 @@ fn forward_streaming<B: BackendTrait>(
             Tensor::cat(stream_inputs.clone(), 0)
         };
 
-        if let Some(mut stacked_state) = ModelState::try_stack(&stream_states) {
+        if let Some(mut stacked_state) = ModelState::try_stack(stream_states.clone()) {
             let logits_stream =
                 model.forward_with_state(stream_inputs_batched, &mut stacked_state);
-            let updated_states = stacked_state.split(stream_states.len());
+            let updated_states = stacked_state.split(state_arcs.len());
 
             for (pos, (idx, state_arc)) in state_arcs.into_iter().enumerate() {
                 let slice = logits_stream.clone().slice_dim(0, pos..pos + 1);
@@ -411,12 +407,12 @@ fn forward_streaming<B: BackendTrait>(
         } else {
             for (idx, state_arc) in state_arcs {
                 if let Ok(mut guard) = state_arc.lock() {
-                    if guard.is_none() {
-                        *guard = Some(model.init_compressed_state());
-                    }
-                    let state = guard.as_mut().expect("stream state initialized");
+                    let mut state = guard
+                        .take()
+                        .unwrap_or_else(|| model.init_compressed_state());
                     let input_slice = inputs.clone().slice_dim(0, idx..idx + 1);
-                    let logits = model.forward_with_state(input_slice, state);
+                    let logits = model.forward_with_state(input_slice, &mut state);
+                    *guard = Some(state);
                     logits_by_index.push((idx, logits));
                 }
             }

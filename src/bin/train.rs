@@ -166,10 +166,9 @@ fn forward_with_streaming<B: BackendTrait>(
             stream_inputs.push(input_slice);
 
             let mut guard = handle.state.lock().expect("lock stream state");
-            if guard.is_none() {
-                *guard = Some(model.init_compressed_state());
-            }
-            let state = guard.as_ref().expect("stream state initialized").clone();
+            let state = guard
+                .take()
+                .unwrap_or_else(|| model.init_compressed_state());
             stream_states.push(state);
             handles.push((*idx, Arc::clone(&handle.state)));
         }
@@ -183,9 +182,9 @@ fn forward_with_streaming<B: BackendTrait>(
             Tensor::cat(stream_inputs.clone(), 0)
         };
 
-        if let Some(mut stacked_state) = ModelState::try_stack(&stream_states) {
+        if let Some(mut stacked_state) = ModelState::try_stack(stream_states.clone()) {
             let logits_stream = model.forward_with_state(stream_inputs_batched, &mut stacked_state);
-            let updated_states = stacked_state.split(stream_states.len());
+            let updated_states = stacked_state.split(handles.len());
 
             for (pos, (idx, handle)) in handles.into_iter().enumerate() {
                 let slice = logits_stream.clone().slice_dim(0, pos..pos + 1);

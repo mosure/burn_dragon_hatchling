@@ -128,7 +128,7 @@ impl<B: Backend> AttentionCache<B> {
         self.last_attention.clone()
     }
 
-    pub fn try_stack(caches: &[Self]) -> Option<Self> {
+    pub fn try_stack(mut caches: Vec<Self>) -> Option<Self> {
         let first = caches.first()?;
         let steps = first.steps;
 
@@ -143,30 +143,31 @@ impl<B: Backend> AttentionCache<B> {
             return None;
         }
 
-        let mut linear_parts: Vec<Tensor<B, 4>> = Vec::new();
-        for cache in caches {
-            if let Some(kv) = cache.linear_kv.clone() {
+        if caches.len() == 1 {
+            return Some(caches.pop().unwrap());
+        }
+
+        let mut linear_parts: Vec<Tensor<B, 4>> = Vec::with_capacity(caches.len());
+        for mut cache in caches {
+            if let Some(kv) = cache.linear_kv.take() {
                 linear_parts.push(kv);
-            } else if !linear_parts.is_empty() {
+            } else {
                 return None;
             }
         }
 
-        let linear_kv = if linear_parts.is_empty() {
-            None
-        } else {
-            let dims_first = linear_parts
-                .first()
-                .map(|kv| kv.shape().dims::<4>())
-                .unwrap_or([0, 0, 0, 0]);
-            let consistent = linear_parts
-                .iter()
-                .all(|kv| kv.shape().dims::<4>()[1..] == dims_first[1..]);
-            if !consistent {
-                return None;
-            }
-            Some(Tensor::cat(linear_parts, 0))
-        };
+        let dims_first = linear_parts
+            .first()
+            .map(|kv| kv.shape().dims::<4>())
+            .unwrap_or([0, 0, 0, 0]);
+        let consistent = linear_parts
+            .iter()
+            .all(|kv| kv.shape().dims::<4>()[1..] == dims_first[1..]);
+        if !consistent {
+            return None;
+        }
+
+        let linear_kv = Some(Tensor::cat(linear_parts, 0));
 
         Some(Self {
             q_rot: None,
@@ -411,34 +412,66 @@ impl<B: Backend> Attention<B> {
         let n_embd = value_rep.shape().dims::<4>()[3];
         let device = k_rot.device();
 
-        let mut synaptic = cache
+        if time == 0 {
+            return Tensor::<B, 4>::zeros([batch, heads, 0, n_embd], &device);
+        }
+
+        // Synaptic state S_t holds sum of previous K ⊗ V; constant in sequence length.
+        let synaptic = cache
             .linear_kv
             .take()
             .unwrap_or_else(|| Tensor::<B, 4>::zeros([batch, heads, latent, n_embd], &device));
 
-        let mut outputs: Vec<Tensor<B, 4>> = Vec::with_capacity(time);
+        // K⊗V for each token: [B, H, T, latent, D]
+        let kv_outer = k_rot
+            .clone()
+            .unsqueeze_dim::<5>(4)
+            .mul(value_rep.clone().unsqueeze_dim::<5>(3));
 
-        for t in 0..time {
-            let q_t = q_rot.clone().slice_dim(2, t..t + 1);
-            let ctx_t = q_t.clone().matmul(synaptic.clone());
-            outputs.push(ctx_t);
+        // Strictly lower-triangular accumulator to exclude the current token from context.
+        let tri = Tensor::<B, 2>::ones([time, time], &device).tril(-1);
 
-            let k_t = k_rot.clone().slice_dim(2, t..t + 1);
-            let v_t = value_rep.clone().slice_dim(2, t..t + 1);
-            let outer = k_t.swap_dims(2, 3).matmul(v_t);
-            synaptic = synaptic + outer;
-        }
+        // Flatten batch/head/latent to apply prefix accumulation in a single matmul.
+        let bh = batch * heads;
+        let kv_flat = kv_outer
+            .clone()
+            .swap_dims(2, 3) // [B, H, latent, T, D]
+            .reshape([bh * latent, time, n_embd]);
+        let tri_batched = tri
+            .clone()
+            .unsqueeze_dim::<3>(0)
+            .repeat_dim(0, bh * latent);
+        let prefix_flat = tri_batched.matmul(kv_flat); // [bh*latent, time, D]
 
-        cache.linear_kv = Some(synaptic);
+        let prefix = prefix_flat
+            .reshape([batch, heads, latent, time, n_embd])
+            .swap_dims(2, 3); // [B, H, T, latent, D]
+
+        let synaptic_expanded = synaptic
+            .clone()
+            .unsqueeze_dim::<5>(2); // [B, H, 1, latent, D] -> broadcast over time
+        let context = prefix + synaptic_expanded; // S_t before current token
+
+        // y_t = q_t · S_t
+        let y = q_rot
+            .clone()
+            .unsqueeze_dim::<5>(4) // [B, H, T, latent, 1]
+            .mul(context)
+            .sum_dim(3)
+            .reshape([batch, heads, time, n_embd]); // [B, H, T, D]
+
+        // Update synaptic state: S_{end} = S_0 + sum_{t} K⊗V
+        let kv_update = kv_outer
+            .sum_dim(2)
+            .reshape([batch, heads, latent, n_embd]); // [B, H, latent, D]
+        let new_synaptic = synaptic + kv_update;
+
+        cache.linear_kv = Some(new_synaptic);
         cache.steps = cache.steps.saturating_add(time);
         cache.q_rot = None;
         cache.value = None;
 
-        if outputs.is_empty() {
-            return Tensor::<B, 4>::zeros([batch, heads, 0, n_embd], &device);
-        }
-
-        Tensor::cat(outputs, 2)
+        y
     }
 
     fn rope(&self, phases: Tensor<B, 4>, values: Tensor<B, 4>) -> Tensor<B, 4> {

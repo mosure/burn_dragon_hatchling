@@ -99,20 +99,31 @@ impl<B: Backend> ModelState<B> {
         }
     }
 
-    pub fn try_stack(states: &[Self]) -> Option<Self> {
-        let first = states.first()?;
-        if states.iter().any(|s| s.compressed != first.compressed) {
+    pub fn try_stack(mut states: Vec<Self>) -> Option<Self> {
+        let position = states.first().map(|s| s.position)?;
+        let compressed = states.first().map(|s| s.compressed)?;
+        let layer_len = states.first().map(|s| s.layers.len())?;
+
+        if states.iter().any(|s| s.compressed != compressed) {
             return None;
         }
 
-        let mut layers = Vec::with_capacity(first.layers.len());
-        for layer_idx in 0..first.layers.len() {
+        if states.len() == 1 {
+            return states.pop();
+        }
+
+        if states.iter().any(|s| s.layers.len() != layer_len) {
+            return None;
+        }
+
+        let mut layers = Vec::with_capacity(layer_len);
+        for layer_idx in 0..layer_len {
             let mut caches = Vec::with_capacity(states.len());
-            for state in states {
-                let cache = state.layers.get(layer_idx)?.attention.clone();
+            for state in states.iter_mut() {
+                let cache = state.layers.get_mut(layer_idx)?.attention.clone();
                 caches.push(cache);
             }
-            let stacked = AttentionCache::try_stack(&caches)?;
+            let stacked = AttentionCache::try_stack(caches)?;
             layers.push(LayerState {
                 attention: stacked,
                 #[cfg(feature = "viz")]
@@ -122,8 +133,8 @@ impl<B: Backend> ModelState<B> {
 
         Some(Self {
             layers,
-            position: first.position,
-            compressed: first.compressed,
+            position,
+            compressed,
         })
     }
 
