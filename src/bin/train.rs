@@ -48,7 +48,7 @@ use burn_dragon_hatchling::wgpu::init_runtime;
 use burn_dragon_hatchling::{
     BDH, BDHConfig, BdhEsConfig, ContextStrategyConfig, Dataset, DatasetConfig, DatasetSplit,
     EggrollObjective, EggrollTrainer, LearningRateScheduleConfig, ModelOverrides, OptimizerConfig,
-    RandomDataLoader, SequenceBatch, TrainingConfig, TrainingHyperparameters, TrainingMode,
+    ModelState, RandomDataLoader, SequenceBatch, TrainingConfig, TrainingHyperparameters, TrainingMode,
     bdh_param_specs, build_dataset, language_model_loss, load_training_config,
 };
 
@@ -146,19 +146,65 @@ fn forward_with_streaming<B: BackendTrait>(
     let mut logits_by_index: Vec<(usize, Tensor<B, 3>)> =
         Vec::with_capacity(batch.inputs.shape().dims::<2>()[0]);
     let mut fresh_indices = Vec::new();
+    let mut stream_entries = Vec::new();
 
     for (idx, entry) in stream.entries.iter().enumerate() {
         if let Some(handle) = entry {
+            stream_entries.push((idx, handle));
+        } else {
+            fresh_indices.push(idx);
+        }
+    }
+
+    if !stream_entries.is_empty() {
+        let mut stream_inputs = Vec::with_capacity(stream_entries.len());
+        let mut stream_states: Vec<ModelState<B>> = Vec::with_capacity(stream_entries.len());
+        let mut handles = Vec::with_capacity(stream_entries.len());
+
+        for (idx, handle) in &stream_entries {
+            let input_slice = batch.inputs.clone().slice_dim(0, *idx..*idx + 1);
+            stream_inputs.push(input_slice);
+
             let mut guard = handle.state.lock().expect("lock stream state");
             if guard.is_none() {
                 *guard = Some(model.init_compressed_state());
             }
-            let state = guard.as_mut().expect("stream state initialized");
-            let input_slice = batch.inputs.clone().slice_dim(0, idx..idx + 1);
-            let logits = model.forward_with_state(input_slice, state);
-            logits_by_index.push((idx, logits));
+            let state = guard.as_ref().expect("stream state initialized").clone();
+            stream_states.push(state);
+            handles.push((*idx, Arc::clone(&handle.state)));
+        }
+
+        let stream_inputs_batched = if stream_inputs.len() == 1 {
+            stream_inputs
+                .first()
+                .expect("single stream input")
+                .clone()
         } else {
-            fresh_indices.push(idx);
+            Tensor::cat(stream_inputs.clone(), 0)
+        };
+
+        if let Some(mut stacked_state) = ModelState::try_stack(&stream_states) {
+            let logits_stream = model.forward_with_state(stream_inputs_batched, &mut stacked_state);
+            let updated_states = stacked_state.split(stream_states.len());
+
+            for (pos, (idx, handle)) in handles.into_iter().enumerate() {
+                let slice = logits_stream.clone().slice_dim(0, pos..pos + 1);
+                if let Some(updated) = updated_states.get(pos).cloned() {
+                    let mut guard = handle.lock().expect("lock stream state");
+                    *guard = Some(updated);
+                }
+                logits_by_index.push((idx, slice));
+            }
+        } else {
+            for ((input, (idx, handle)), mut state) in
+                stream_inputs.into_iter().zip(handles.into_iter()).zip(stream_states.into_iter())
+            {
+                let logits = model.forward_with_state(input, &mut state);
+                if let Ok(mut guard) = handle.lock() {
+                    *guard = Some(state);
+                }
+                logits_by_index.push((idx, logits));
+            }
         }
     }
 

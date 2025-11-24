@@ -38,7 +38,7 @@ batch_size = 16
 max_iters = 100000
 log_frequency = 100
 # fraction of batch slots that keep streaming model state between steps (0.0 disables)
-stream_retain_pct = 0.0
+stream_retain_pct = 0.5
 # optional cap on tokens kept in a stream's cached state (0 or unset = follow context_strategy)
 # stream_max_context = 0
 

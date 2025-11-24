@@ -127,6 +127,105 @@ impl<B: Backend> AttentionCache<B> {
     pub fn last_attention(&self) -> Option<Tensor<B, 3>> {
         self.last_attention.clone()
     }
+
+    pub fn try_stack(caches: &[Self]) -> Option<Self> {
+        let first = caches.first()?;
+        let steps = first.steps;
+
+        if caches.iter().any(|cache| cache.steps != steps) {
+            return None;
+        }
+
+        if caches
+            .iter()
+            .any(|cache| cache.q_rot.is_some() || cache.value.is_some())
+        {
+            return None;
+        }
+
+        let mut linear_parts: Vec<Tensor<B, 4>> = Vec::new();
+        for cache in caches {
+            if let Some(kv) = cache.linear_kv.clone() {
+                linear_parts.push(kv);
+            } else if !linear_parts.is_empty() {
+                return None;
+            }
+        }
+
+        let linear_kv = if linear_parts.is_empty() {
+            None
+        } else {
+            let dims_first = linear_parts
+                .first()
+                .map(|kv| kv.shape().dims::<4>())
+                .unwrap_or([0, 0, 0, 0]);
+            let consistent = linear_parts
+                .iter()
+                .all(|kv| kv.shape().dims::<4>()[1..] == dims_first[1..]);
+            if !consistent {
+                return None;
+            }
+            Some(Tensor::cat(linear_parts, 0))
+        };
+
+        Some(Self {
+            q_rot: None,
+            value: None,
+            linear_kv,
+            steps,
+            #[cfg(feature = "viz")]
+            last_attention: None,
+        })
+    }
+
+    pub fn split(self, parts: usize) -> Vec<Self> {
+        if parts == 0 {
+            return Vec::new();
+        }
+
+        if let Some(kv) = self.linear_kv {
+            let [batch, _, _, _] = kv.shape().dims::<4>();
+            let mut out = Vec::with_capacity(parts);
+            let stride = batch.div_ceil(parts);
+            for idx in 0..parts {
+                let start = idx * stride;
+                if start >= batch {
+                    out.push(Self {
+                        q_rot: None,
+                        value: None,
+                        linear_kv: None,
+                        steps: self.steps,
+                        #[cfg(feature = "viz")]
+                        last_attention: None,
+                    });
+                    continue;
+                }
+                let end = usize::min(start + stride, batch);
+                let slice = kv.clone().slice_dim(0, start..end);
+                out.push(Self {
+                    q_rot: None,
+                    value: None,
+                    linear_kv: Some(slice),
+                    steps: self.steps,
+                    #[cfg(feature = "viz")]
+                    last_attention: None,
+                });
+            }
+            out
+        } else {
+            vec![
+                Self {
+                    q_rot: None,
+                    value: None,
+                    linear_kv: None,
+                    steps: self.steps,
+                    #[cfg(feature = "viz")]
+                    last_attention: None,
+                };
+                parts
+            ]
+        }
+    }
 }
 
 #[derive(Module, Debug)]
