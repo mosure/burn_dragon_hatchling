@@ -15,6 +15,7 @@ pub struct LayerState<B: Backend> {
 pub struct ModelState<B: Backend> {
     pub layers: Vec<LayerState<B>>,
     pub position: usize,
+    pub compressed: bool,
 }
 
 #[cfg(feature = "viz")]
@@ -36,7 +37,26 @@ impl<B: Backend> ModelState<B> {
                 })
                 .collect(),
             position: 0,
+            compressed: false,
         }
+    }
+
+    pub fn new_compressed(num_layers: usize) -> Self {
+        Self {
+            layers: (0..num_layers)
+                .map(|_| LayerState {
+                    attention: AttentionCache::new(),
+                    #[cfg(feature = "viz")]
+                    viz: None,
+                })
+                .collect(),
+            position: 0,
+            compressed: true,
+        }
+    }
+
+    pub fn new_recurrent(num_layers: usize) -> Self {
+        Self::new_compressed(num_layers)
     }
 
     pub fn reset(&mut self) {

@@ -327,8 +327,7 @@ impl<B: Backend> EggrollNoiser<B> {
                 .mul_scalar(sign);
             let b = noise
                 .slice_dim(1, rows..(rows + cols))
-                .reshape([stack, cols, rank])
-                .mul_scalar(sign);
+                .reshape([stack, cols, rank]);
             WorkerFactors::D3 { a, b }
         } else {
             let noise = self.noise_block_2d(spec, es_tree_key, key_worker);
@@ -342,8 +341,7 @@ impl<B: Backend> EggrollNoiser<B> {
                 .mul_scalar(sign);
             let b = noise
                 .slice_dim(0, rows..(rows + cols))
-                .reshape([cols, rank])
-                .mul_scalar(sign);
+                .reshape([cols, rank]);
             WorkerFactors::D2 { a, b }
         }
     }
@@ -364,7 +362,8 @@ impl<B: Backend> EggrollNoiser<B> {
         for spec in &self.frozen.param_specs {
             let pop = worker_ids.len() as f32;
             let sigma = self.params.config.sigma.max(1e-8);
-            let scale = 1.0 / (pop * sigma);
+            let noise_scale = self.scale(spec);
+            let scale = noise_scale / (pop * sigma);
 
             match (spec.stack, spec.shape) {
                 (Some(stack), (rows, cols)) => {

@@ -91,6 +91,10 @@ pub struct TrainingHyperparameters {
     pub log_frequency: usize,
     #[serde(default = "default_context_strategy")]
     pub context_strategy: ContextStrategyConfig,
+    #[serde(default = "default_stream_retain_pct")]
+    pub stream_retain_pct: f32,
+    #[serde(default)]
+    pub stream_max_context: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -170,6 +174,10 @@ pub enum ContextStrategyConfig {
 
 fn default_context_strategy() -> ContextStrategyConfig {
     ContextStrategyConfig::Infinite
+}
+
+fn default_stream_retain_pct() -> f32 {
+    0.0
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -424,6 +432,8 @@ mod tests {
                 max_iters: 2000,
                 log_frequency: 50,
                 context_strategy: ContextStrategyConfig::Infinite,
+                stream_retain_pct: 0.0,
+                stream_max_context: None,
             }
         );
         assert!((config.optimizer.learning_rate - 0.0005).abs() < f64::EPSILON);

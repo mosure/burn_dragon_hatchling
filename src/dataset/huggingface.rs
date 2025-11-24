@@ -21,6 +21,7 @@ const DEFAULT_RECORD_DELIMITER: &str = "\n";
 #[derive(Clone)]
 pub struct HuggingFaceDataset {
     tokens: Vec<u32>,
+    doc_ids: Option<Vec<u64>>,
     train_len: usize,
     block_size: usize,
     batch_size: usize,
@@ -124,7 +125,9 @@ impl HuggingFaceDataset {
         }
 
         let mut tokens = Vec::new();
+        let mut doc_ids: Vec<u64> = Vec::new();
         let mut train_len = 0usize;
+        let mut doc_counter: u64 = 0;
 
         for record in train_records.into_iter() {
             let mut encoded = tokenizer.encode(record.as_str(), false, false);
@@ -137,6 +140,8 @@ impl HuggingFaceDataset {
                 continue;
             }
             train_len += encoded.len();
+            doc_ids.extend(std::iter::repeat(doc_counter).take(encoded.len()));
+            doc_counter = doc_counter.wrapping_add(1);
             tokens.append(&mut encoded);
         }
 
@@ -152,6 +157,8 @@ impl HuggingFaceDataset {
                 continue;
             }
             val_token_count += encoded.len();
+            doc_ids.extend(std::iter::repeat(doc_counter).take(encoded.len()));
+            doc_counter = doc_counter.wrapping_add(1);
             tokens.append(&mut encoded);
         }
 
@@ -179,6 +186,7 @@ impl HuggingFaceDataset {
 
         Ok(Self {
             tokens,
+            doc_ids: (!doc_ids.is_empty()).then_some(doc_ids),
             train_len,
             block_size,
             batch_size,
@@ -245,6 +253,10 @@ impl TokenSequenceDataset for HuggingFaceDataset {
 
     fn tokens(&self) -> &[u32] {
         &self.tokens
+    }
+
+    fn doc_ids(&self) -> Option<&[u64]> {
+        self.doc_ids.as_deref()
     }
 
     fn train_len(&self) -> usize {

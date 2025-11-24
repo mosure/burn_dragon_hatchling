@@ -46,8 +46,8 @@ use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 
 use burn_dragon_hatchling::wgpu::init_runtime;
 use burn_dragon_hatchling::{
-    BDH, BDHConfig, BdhEsConfig, Dataset, DatasetConfig, DatasetSplit, EggrollObjective,
-    EggrollTrainer, LearningRateScheduleConfig, ModelOverrides, OptimizerConfig,
+    BDH, BDHConfig, BdhEsConfig, ContextStrategyConfig, Dataset, DatasetConfig, DatasetSplit,
+    EggrollObjective, EggrollTrainer, LearningRateScheduleConfig, ModelOverrides, OptimizerConfig,
     RandomDataLoader, SequenceBatch, TrainingConfig, TrainingHyperparameters, TrainingMode,
     bdh_param_specs, build_dataset, language_model_loss, load_training_config,
 };
@@ -131,9 +131,62 @@ impl<B: AutodiffBackend> ItemLazy for LanguageModelTrainItem<B> {
 
 type ValidBackend<B> = <B as AutodiffBackend>::InnerBackend;
 
+fn forward_with_streaming<B: BackendTrait>(
+    model: &BDH<B>,
+    batch: &SequenceBatch<B>,
+) -> Tensor<B, 3> {
+    let Some(stream) = &batch.stream else {
+        return model.forward(batch.inputs.clone());
+    };
+
+    if !stream.has_streams() {
+        return model.forward(batch.inputs.clone());
+    }
+
+    let mut logits_by_index: Vec<(usize, Tensor<B, 3>)> =
+        Vec::with_capacity(batch.inputs.shape().dims::<2>()[0]);
+    let mut fresh_indices = Vec::new();
+
+    for (idx, entry) in stream.entries.iter().enumerate() {
+        if let Some(handle) = entry {
+            let mut guard = handle.state.lock().expect("lock stream state");
+            if guard.is_none() {
+                *guard = Some(model.init_compressed_state());
+            }
+            let state = guard.as_mut().expect("stream state initialized");
+            let input_slice = batch.inputs.clone().slice_dim(0, idx..idx + 1);
+            let logits = model.forward_with_state(input_slice, state);
+            logits_by_index.push((idx, logits));
+        } else {
+            fresh_indices.push(idx);
+        }
+    }
+
+    if !fresh_indices.is_empty() {
+        let mut fresh_inputs = Vec::with_capacity(fresh_indices.len());
+        for &idx in &fresh_indices {
+            fresh_inputs.push(batch.inputs.clone().slice_dim(0, idx..idx + 1));
+        }
+        let fresh_inputs = if fresh_inputs.len() == 1 {
+            fresh_inputs.pop().expect("single fresh slice")
+        } else {
+            Tensor::cat(fresh_inputs, 0)
+        };
+        let logits_fresh = model.forward(fresh_inputs);
+        for (pos, &idx) in fresh_indices.iter().enumerate() {
+            let slice = logits_fresh.clone().slice_dim(0, pos..pos + 1);
+            logits_by_index.push((idx, slice));
+        }
+    }
+
+    logits_by_index.sort_by_key(|(idx, _)| *idx);
+    let ordered: Vec<_> = logits_by_index.into_iter().map(|(_, logits)| logits).collect();
+    Tensor::cat(ordered, 0)
+}
+
 impl<B: AutodiffBackend> TrainStep<SequenceBatch<B>, LanguageModelTrainItem<B>> for BDH<B> {
     fn step(&self, batch: SequenceBatch<B>) -> TrainOutput<LanguageModelTrainItem<B>> {
-        let logits = self.forward(batch.inputs);
+        let logits = forward_with_streaming(self, &batch);
         let loss = language_model_loss::<B>(logits, batch.targets);
         let grads = loss.backward();
 
@@ -143,7 +196,7 @@ impl<B: AutodiffBackend> TrainStep<SequenceBatch<B>, LanguageModelTrainItem<B>> 
 
 impl<B: BackendTrait> ValidStep<SequenceBatch<B>, LanguageModelOutput<B>> for BDH<B> {
     fn step(&self, batch: SequenceBatch<B>) -> LanguageModelOutput<B> {
-        let logits = self.forward(batch.inputs);
+        let logits = forward_with_streaming(self, &batch);
         let loss = language_model_loss::<B>(logits, batch.targets);
         LanguageModelOutput::new(loss)
     }
@@ -331,6 +384,7 @@ where
     let steps_per_epoch = dataset.steps_per_epoch(DatasetSplit::Train);
     let total_steps = training.max_iters.max(1);
     let total_epochs = usize::max(1, total_steps.div_ceil(steps_per_epoch));
+    let stream_context = resolve_training_context_window(training);
 
     info!(
         "train schedule: steps_per_epoch={steps_per_epoch}, total_steps={total_steps}, epochs={total_epochs}"
@@ -342,6 +396,8 @@ where
             &device,
             steps_per_epoch,
             Some(total_steps),
+            training.stream_retain_pct,
+            stream_context,
         ));
 
     let val_steps_per_epoch = dataset.steps_per_epoch(DatasetSplit::Val);
@@ -355,6 +411,8 @@ where
             DatasetSplit::Val,
             &valid_device,
             valid_steps,
+            None,
+            0.0,
             None,
         ));
 
@@ -450,6 +508,8 @@ where
         &device,
         steps_per_epoch,
         Some(total_steps),
+        0.0,
+        None,
     );
     let mut train_loader: Box<dyn DataLoaderIterator<SequenceBatch<B>>> =
         train_loader_base.iter();
@@ -633,6 +693,29 @@ where
     );
 
     Ok(model)
+}
+
+fn resolve_training_context_window(
+    training: &TrainingHyperparameters,
+) -> Option<usize> {
+    if let Some(max_ctx) = training.stream_max_context {
+        if max_ctx == 0 {
+            return None;
+        }
+        return Some(max_ctx.max(1));
+    }
+
+    match &training.context_strategy {
+        ContextStrategyConfig::Infinite => None,
+        ContextStrategyConfig::Sliding { window } => {
+            let win = if *window == 0 {
+                training.block_size.max(1)
+            } else {
+                *window
+            };
+            Some(win)
+        }
+    }
 }
 
 fn resolve_lr_scheduler(

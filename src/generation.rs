@@ -38,8 +38,8 @@ pub fn prefill_state<B: Backend>(
         device,
     );
 
-    let mut state = model.init_state();
-    let logits = model.forward_with_state(prompt_tensor, &mut state);
+    let mut state = model.init_recurrent_state();
+    let logits = model.forward_recurrent(prompt_tensor, &mut state);
     let [_, time, vocab] = logits.shape().dims::<3>();
     if time != prompt_len {
         return Err(anyhow!(
@@ -110,11 +110,12 @@ pub fn sample_next_token<B: Backend>(
     let mut rng = thread_rng();
     let next = dist.sample(&mut rng) as i64;
 
-    let next_tensor = Tensor::<B, 2, Int>::from_data(TensorData::new(vec![next], [1, 1]), device);
+    let next_tensor =
+        Tensor::<B, 1, Int>::from_data(TensorData::new(vec![next], [1]), device);
 
-    let logits = model.forward_with_state(next_tensor, state);
-    let [_, time, vocab] = logits.shape().dims::<3>();
-    let new_last_logits = logits.slice_dim(1, (time - 1)..time).reshape([vocab]);
+    let logits = model.step(next_tensor, state);
+    let [_, vocab] = logits.shape().dims::<2>();
+    let new_last_logits = logits.reshape([vocab]);
 
     Ok((next, new_last_logits))
 }

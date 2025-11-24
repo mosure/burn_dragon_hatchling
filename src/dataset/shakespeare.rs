@@ -129,6 +129,10 @@ impl ShakespeareDataset {
         &self.tokens
     }
 
+    pub fn doc_ids(&self) -> Option<&[u64]> {
+        None
+    }
+
     pub fn train_len(&self) -> usize {
         self.train_len
     }

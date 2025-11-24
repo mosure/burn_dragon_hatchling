@@ -382,8 +382,8 @@ impl<B: Backend> BDH<B> {
         let [batch, _] = indices.shape().dims();
         assert_eq!(batch, 1, "generation currently supports batch size 1");
 
-        let mut state = self.init_state();
-        let mut logits = self.forward_with_state(indices.clone(), &mut state);
+        let mut state = self.init_recurrent_state();
+        let logits = self.forward_recurrent(indices.clone(), &mut state);
         let [_, mut time, vocab] = logits.shape().dims();
         assert_eq!(time, indices.shape().dims::<2>()[1]);
 
@@ -444,11 +444,14 @@ impl<B: Backend> BDH<B> {
             );
             indices = Tensor::cat(vec![indices, next_token.clone()], 1);
 
-            logits = self.forward_with_state(next_token, &mut state);
-            let [_, new_time, _] = logits.shape().dims();
-            time = new_time;
-            last_logits = logits
-                .slice_dim(1, (time - 1)..time)
+            let logits_step = self.step(
+                next_token.reshape([1]),
+                &mut state,
+            );
+            let logits_step = logits_step.reshape([1, 1, vocab]);
+            time = time.saturating_add(1);
+            last_logits = logits_step
+                .slice_dim(1, 0..1)
                 .reshape([vocab])
                 .div_scalar(temperature);
         }
@@ -458,6 +461,42 @@ impl<B: Backend> BDH<B> {
 
     pub fn init_state(&self) -> ModelState<B> {
         ModelState::new(self.n_layer)
+    }
+
+    pub fn init_compressed_state(&self) -> ModelState<B> {
+        ModelState::new_compressed(self.n_layer)
+    }
+
+    pub fn init_recurrent_state(&self) -> ModelState<B> {
+        ModelState::new_recurrent(self.n_layer)
+    }
+
+    pub fn forward_recurrent(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        state: &mut ModelState<B>,
+    ) -> Tensor<B, 3> {
+        assert!(
+            state.compressed,
+            "forward_recurrent requires a recurrent state; call init_recurrent_state()"
+        );
+        self.forward_with_state(tokens, state)
+    }
+
+    pub fn step(
+        &self,
+        token: Tensor<B, 1, Int>,
+        state: &mut ModelState<B>,
+    ) -> Tensor<B, 2> {
+        assert!(
+            state.compressed,
+            "step requires a recurrent state; call init_recurrent_state()"
+        );
+        let [batch] = token.shape().dims();
+        let token_2d = token.reshape([batch, 1]);
+        let logits = self.forward_with_state(token_2d, state);
+        let [batch, _time, vocab] = logits.shape().dims::<3>();
+        logits.reshape([batch, vocab])
     }
 
     pub fn forward_with_state(
@@ -555,11 +594,19 @@ impl<B: Backend> BDH<B> {
                 activation::relu(x_latent)
             };
 
-            let attn = self.attention.forward_cached(
-                x_sparse.clone(),
-                current.clone(),
-                &mut layer_state.attention,
-            );
+            let attn = if state.compressed {
+                self.attention.forward_linear_cached(
+                    x_sparse.clone(),
+                    current.clone(),
+                    &mut layer_state.attention,
+                )
+            } else {
+                self.attention.forward_cached(
+                    x_sparse.clone(),
+                    current.clone(),
+                    &mut layer_state.attention,
+                )
+            };
             let attn = self.layer_norm(attn);
 
             let y_sparse = if fused {

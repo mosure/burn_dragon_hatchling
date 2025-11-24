@@ -17,8 +17,8 @@ pub use config::{
 };
 pub use dataset::{
     Dataset, DatasetSplit, HuggingFaceDataset, RandomDataLoader, SequenceBatch, ShakespeareBatch,
-    ShakespeareDataset, ShakespeareRandomDataLoader, ShakespeareSplit, TokenSequenceDataset,
-    build_dataset,
+    ShakespeareDataset, ShakespeareRandomDataLoader, ShakespeareSplit, StreamBatchState,
+    StreamHandle, TokenSequenceDataset, build_dataset,
 };
 pub use generation::{
     ContextStrategy, GenerationSettings, generate_text, generate_tokens, prefill_state,

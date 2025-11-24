@@ -91,7 +91,7 @@ fn pop_update_matches_unbiased_estimator() {
         pop_vectorized: false,
         antithetic: false,
     };
-    let noiser = EggrollNoiser::new(vec![spec.clone()], config.clone(), &device);
+    let noiser: EggrollNoiser<B> = EggrollNoiser::new(vec![spec.clone()], config.clone(), &device);
     let tree_key = EsTreeKey::new(EggrollKey::from_seed(config.seed));
     let step = 0;
     let worker_ids: Vec<u32> = (0..config.pop_size as u32).collect();
@@ -158,7 +158,7 @@ fn antithetic_pairs_cancel_when_scores_match() {
         pop_vectorized: false,
         antithetic: true,
     };
-    let noiser = EggrollNoiser::new(vec![spec.clone()], config.clone(), &device);
+    let noiser: EggrollNoiser<B> = EggrollNoiser::new(vec![spec.clone()], config.clone(), &device);
     let tree_key = EsTreeKey::new(EggrollKey::from_seed(config.seed));
     let worker_ids: Vec<u32> = (0..config.pop_size as u32).collect();
     // Pair 0/1 share base noise with opposite sign and same score; should cancel.

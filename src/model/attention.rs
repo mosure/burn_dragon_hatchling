@@ -11,6 +11,8 @@ use crate::kernel::{BlockPattern2d, linear_attention};
 pub struct AttentionCache<B: Backend> {
     q_rot: Option<Tensor<B, 4>>,
     value: Option<Tensor<B, 4>>,
+    linear_kv: Option<Tensor<B, 4>>,
+    steps: usize,
     #[cfg(feature = "viz")]
     last_attention: Option<Tensor<B, 3>>,
 }
@@ -21,6 +23,9 @@ impl<B: Backend> AttentionCache<B> {
     }
 
     pub fn len(&self) -> usize {
+        if self.steps > 0 {
+            return self.steps;
+        }
         self.q_rot
             .as_ref()
             .map(|tensor| tensor.shape().dims::<4>()[2])
@@ -30,6 +35,8 @@ impl<B: Backend> AttentionCache<B> {
     pub fn reset(&mut self) {
         self.q_rot = None;
         self.value = None;
+        self.linear_kv = None;
+        self.steps = 0;
         #[cfg(feature = "viz")]
         {
             self.last_attention = None;
@@ -37,6 +44,7 @@ impl<B: Backend> AttentionCache<B> {
     }
 
     pub fn append(&mut self, q_rot: Tensor<B, 4>, value: Tensor<B, 4>) {
+        let time = q_rot.shape().dims::<4>()[2];
         self.q_rot = Some(match self.q_rot.take() {
             Some(prev) => Tensor::cat(vec![prev, q_rot], 2),
             None => q_rot,
@@ -45,6 +53,7 @@ impl<B: Backend> AttentionCache<B> {
             Some(prev) => Tensor::cat(vec![prev, value], 2),
             None => value,
         });
+        self.steps = self.steps.saturating_add(time);
         #[cfg(feature = "viz")]
         {
             self.last_attention = None;
@@ -54,6 +63,17 @@ impl<B: Backend> AttentionCache<B> {
     pub fn retain_last(&mut self, max_len: usize) {
         if max_len == 0 {
             self.reset();
+            return;
+        }
+
+        // Recurrent / linear attention state cannot be partially trimmed;
+        // drop it entirely if the requested window is smaller than the
+        // number of cached steps to avoid inconsistent positional phases.
+        if self.linear_kv.is_some() && self.q_rot.is_none() && self.value.is_none() {
+            if self.steps > max_len {
+                self.linear_kv = None;
+                self.steps = 0;
+            }
             return;
         }
 
@@ -82,6 +102,20 @@ impl<B: Backend> AttentionCache<B> {
         {
             self.last_attention = None;
         }
+
+        if max_len == 0 {
+            self.linear_kv = None;
+        }
+
+        self.steps = self
+            .q_rot
+            .as_ref()
+            .map(|tensor| tensor.shape().dims::<4>()[2])
+            .unwrap_or(0);
+    }
+
+    pub fn clear_linear(&mut self) {
+        self.linear_kv = None;
     }
 
     #[cfg(feature = "viz")]
@@ -263,6 +297,51 @@ impl<B: Backend> Attention<B> {
         context
     }
 
+    pub fn forward_linear_cached(
+        &self,
+        query: Tensor<B, 4>,
+        value: Tensor<B, 4>,
+        cache: &mut AttentionCache<B>,
+    ) -> Tensor<B, 4> {
+        let position = cache.len();
+        let q_rot = self.rotate(query, position);
+        let k_rot = q_rot.clone();
+        let value_rep = value.repeat_dim(1, self.n_head);
+
+        let [batch, heads, time, latent] = k_rot.shape().dims::<4>();
+        let n_embd = value_rep.shape().dims::<4>()[3];
+        let device = k_rot.device();
+
+        let mut synaptic = cache
+            .linear_kv
+            .take()
+            .unwrap_or_else(|| Tensor::<B, 4>::zeros([batch, heads, latent, n_embd], &device));
+
+        let mut outputs: Vec<Tensor<B, 4>> = Vec::with_capacity(time);
+
+        for t in 0..time {
+            let q_t = q_rot.clone().slice_dim(2, t..t + 1);
+            let ctx_t = q_t.clone().matmul(synaptic.clone());
+            outputs.push(ctx_t);
+
+            let k_t = k_rot.clone().slice_dim(2, t..t + 1);
+            let v_t = value_rep.clone().slice_dim(2, t..t + 1);
+            let outer = k_t.swap_dims(2, 3).matmul(v_t);
+            synaptic = synaptic + outer;
+        }
+
+        cache.linear_kv = Some(synaptic);
+        cache.steps = cache.steps.saturating_add(time);
+        cache.q_rot = None;
+        cache.value = None;
+
+        if outputs.is_empty() {
+            return Tensor::<B, 4>::zeros([batch, heads, 0, n_embd], &device);
+        }
+
+        Tensor::cat(outputs, 2)
+    }
+
     fn rope(&self, phases: Tensor<B, 4>, values: Tensor<B, 4>) -> Tensor<B, 4> {
         let cos = phases.clone().cos();
         let sin = phases.sin();
@@ -302,5 +381,110 @@ impl<B: Backend> Attention<B> {
             data.push(value);
         }
         Tensor::<B, 1>::from_floats(data.as_slice(), device).reshape([1, 1, 1, latent])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::tensor::backend::Backend as BackendTrait;
+    use burn::tensor::{Distribution as TensorDistribution, Tensor};
+    use burn_ndarray::NdArray;
+
+    type Backend = NdArray<f32>;
+
+    fn assert_close(lhs: Tensor<Backend, 4>, rhs: Tensor<Backend, 4>, atol: f32, rtol: f32) {
+        let lhs_data = lhs
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("lhs vec");
+        let rhs_data = rhs
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("rhs vec");
+
+        for (a, b) in lhs_data.iter().zip(rhs_data.iter()) {
+            let diff = (a - b).abs();
+            let tol = atol + rtol * b.abs();
+            assert!(
+                diff <= tol,
+                "difference {diff} exceeds tolerance {tol} (lhs={a}, rhs={b})"
+            );
+        }
+    }
+
+    #[test]
+    fn linear_cached_matches_full_attention() {
+        let device = <Backend as BackendTrait>::Device::default();
+        <Backend as BackendTrait>::seed(&device, 7);
+
+        let batch = 2;
+        let heads = 2;
+        let time = 5;
+        let latent = 4;
+        let n_embd = 6;
+
+        let attention = Attention::new(latent, heads, &device, &FusedKernelConfig::default());
+
+        let query = Tensor::<Backend, 4>::random(
+            [batch, heads, time, latent],
+            TensorDistribution::Normal(0.0, 1.0),
+            &device,
+        );
+        let value = Tensor::<Backend, 4>::random(
+            [batch, 1, time, n_embd],
+            TensorDistribution::Normal(0.0, 1.0),
+            &device,
+        );
+
+        let full = attention.forward(query.clone(), value.clone());
+
+        let mut cache = AttentionCache::new();
+        let linear = attention.forward_linear_cached(query, value, &mut cache);
+
+        assert_close(linear, full, 1e-4, 1e-4);
+    }
+
+    #[test]
+    fn linear_cached_streaming_matches_full_attention() {
+        let device = <Backend as BackendTrait>::Device::default();
+        <Backend as BackendTrait>::seed(&device, 99);
+
+        let batch = 1;
+        let heads = 3;
+        let time = 6;
+        let latent = 8;
+        let n_embd = 5;
+
+        let attention = Attention::new(latent, heads, &device, &FusedKernelConfig::default());
+
+        let query = Tensor::<Backend, 4>::random(
+            [batch, heads, time, latent],
+            TensorDistribution::Normal(0.0, 1.0),
+            &device,
+        );
+        let value = Tensor::<Backend, 4>::random(
+            [batch, 1, time, n_embd],
+            TensorDistribution::Normal(0.0, 1.0),
+            &device,
+        );
+
+        let full = attention.forward(query.clone(), value.clone());
+
+        let mut cache = AttentionCache::new();
+        let split = 2;
+        let q_first = query.clone().slice_dim(2, 0..split);
+        let v_first = value.clone().slice_dim(2, 0..split);
+        let out_first = attention.forward_linear_cached(q_first, v_first, &mut cache);
+
+        let q_second = query.clone().slice_dim(2, split..time);
+        let v_second = value.clone().slice_dim(2, split..time);
+        let out_second = attention.forward_linear_cached(q_second, v_second, &mut cache);
+
+        let streaming = Tensor::cat(vec![out_first, out_second], 2);
+
+        assert_close(streaming, full, 1e-4, 1e-4);
     }
 }
