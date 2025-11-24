@@ -35,7 +35,7 @@ vocab_path = "vocab.json"
 [training]
 block_size = 512
 batch_size = 16
-max_iters = 3000
+max_iters = 10000
 log_frequency = 100
 
 [optimizer]
@@ -46,7 +46,7 @@ weight_decay = 0.1
 # type variants: "constant", "cosine", "linear", "exponential", "step", "noam"
 type = "cosine"
 min_lr = 0.00005
-num_iters = 6000
+num_iters = 10000
 
 [generation]
 prompt = "To be or "

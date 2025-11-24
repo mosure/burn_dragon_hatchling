@@ -171,7 +171,7 @@ impl<B: BackendTrait> EggrollObjective<BDH<B>, B> for LanguageModelEsObjective<B
             .convert::<f32>()
             .into_vec::<f32>()
             .unwrap_or_default();
-        -data.first().copied().unwrap_or(0.0)
+        data.first().copied().unwrap_or(0.0)
     }
 
     fn evaluate_population(
@@ -198,9 +198,6 @@ impl<B: BackendTrait> EggrollObjective<BDH<B>, B> for LanguageModelEsObjective<B
             .convert::<f32>()
             .into_vec::<f32>()
             .unwrap_or_default()
-            .into_iter()
-            .map(|v| -v)
-            .collect()
     }
 
     fn forward_population(
