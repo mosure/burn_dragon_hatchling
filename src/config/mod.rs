@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
+use crate::eggroll::EggrollConfig;
 use crate::tokenizer::TokenizerConfig;
 use toml::Value;
 
@@ -90,6 +91,10 @@ pub struct TrainingHyperparameters {
     pub log_frequency: usize,
     #[serde(default = "default_context_strategy")]
     pub context_strategy: ContextStrategyConfig,
+    #[serde(default = "default_stream_retain_pct")]
+    pub stream_retain_pct: f32,
+    #[serde(default)]
+    pub stream_max_context: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -171,6 +176,10 @@ fn default_context_strategy() -> ContextStrategyConfig {
     ContextStrategyConfig::Infinite
 }
 
+fn default_stream_retain_pct() -> f32 {
+    0.0
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 pub struct ModelOverrides {
     pub n_layer: Option<usize>,
@@ -191,6 +200,58 @@ pub struct TrainingConfig {
     pub generation: GenerationConfig,
     #[serde(default)]
     pub model: ModelOverrides,
+    #[serde(default)]
+    pub mode: TrainingMode,
+    #[serde(default)]
+    pub eggroll: Option<EggrollConfigSection>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingMode {
+    #[default]
+    Backprop,
+    Eggroll,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct EggrollConfigSection {
+    pub pop_size: usize,
+    pub rank: usize,
+    pub sigma: f32,
+    pub lr: f32,
+    pub weight_decay: f32,
+    #[serde(default)]
+    pub max_param_norm: Option<f32>,
+    #[serde(default = "default_eggroll_seed")]
+    pub seed: u64,
+    #[serde(default)]
+    pub pop_chunk_size: Option<usize>,
+    #[serde(default = "default_pop_vectorized")]
+    pub pop_vectorized: bool,
+    #[serde(default)]
+    pub antithetic: bool,
+}
+
+impl EggrollConfigSection {
+    pub fn into_runtime(self) -> EggrollConfig {
+        EggrollConfig {
+            pop_size: self.pop_size,
+            pop_chunk_size: self.pop_chunk_size.unwrap_or(default_pop_chunk_size()),
+            rank: self.rank,
+            sigma: self.sigma,
+            lr: self.lr,
+            weight_decay: self.weight_decay,
+            seed: self.seed,
+            max_param_norm: self.max_param_norm,
+            pop_vectorized: self.pop_vectorized,
+            antithetic: self.antithetic,
+        }
+    }
+}
+
+fn default_pop_vectorized() -> bool {
+    true
 }
 
 pub fn load_training_config(paths: &[PathBuf]) -> Result<TrainingConfig> {
@@ -272,6 +333,14 @@ fn default_temperature() -> f32 {
 
 fn default_step_gamma() -> f64 {
     0.1
+}
+
+fn default_eggroll_seed() -> u64 {
+    2025
+}
+
+fn default_pop_chunk_size() -> usize {
+    16
 }
 
 #[cfg(test)]
@@ -363,6 +432,8 @@ mod tests {
                 max_iters: 2000,
                 log_frequency: 50,
                 context_strategy: ContextStrategyConfig::Infinite,
+                stream_retain_pct: 0.0,
+                stream_max_context: None,
             }
         );
         assert!((config.optimizer.learning_rate - 0.0005).abs() < f64::EPSILON);

@@ -7,7 +7,9 @@ use crate::tokenizer::SharedTokenizer;
 
 pub use factory::build_dataset;
 pub use huggingface::HuggingFaceDataset;
-pub use scheduler::{RandomDataLoader, SequenceBatch, TokenSequenceDataset};
+pub use scheduler::{
+    RandomDataLoader, SequenceBatch, StreamBatchState, StreamHandle, TokenSequenceDataset,
+};
 pub use shakespeare::ShakespeareDataset;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +37,10 @@ impl Dataset {
         TokenSequenceDataset::tokenizer(self)
     }
 
+    pub fn doc_ids(&self) -> Option<&[u64]> {
+        TokenSequenceDataset::doc_ids(self)
+    }
+
     pub fn train_split_ratio(&self) -> f32 {
         TokenSequenceDataset::train_split_ratio(self)
     }
@@ -60,6 +66,13 @@ impl TokenSequenceDataset for Dataset {
         match self {
             Dataset::Shakespeare(dataset) => dataset.tokens(),
             Dataset::HuggingFace(dataset) => dataset.tokens(),
+        }
+    }
+
+    fn doc_ids(&self) -> Option<&[u64]> {
+        match self {
+            Dataset::Shakespeare(dataset) => dataset.doc_ids(),
+            Dataset::HuggingFace(dataset) => dataset.doc_ids(),
         }
     }
 
