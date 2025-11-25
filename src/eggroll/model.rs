@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use burn::module::{Module, ModuleMapper, Param, ParamId};
-use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
+use burn::tensor::backend::Backend;
 
 use super::noiser::{
     EggrollConfig, EggrollNoiseTensor, EggrollNoiser, EggrollParamSpec, EggrollState,
@@ -13,11 +13,7 @@ pub trait EggrollObjective<M, B: Backend> {
     type Batch;
     fn evaluate(&mut self, logits: &Tensor<B, 3>, batch: &Self::Batch) -> f32;
 
-    fn evaluate_population(
-        &mut self,
-        logits: &Tensor<B, 4>,
-        batch: &Self::Batch,
-    ) -> Vec<f32> {
+    fn evaluate_population(&mut self, logits: &Tensor<B, 4>, batch: &Self::Batch) -> Vec<f32> {
         let [pop, batch_size, time, vocab] = logits.shape().dims::<4>();
         let mut scores = Vec::with_capacity(pop);
         for idx in 0..pop {
@@ -81,10 +77,7 @@ where
         objective: Obj,
     ) -> Self {
         let devices = model.devices();
-        let device = devices
-            .first()
-            .cloned()
-            .unwrap_or_else(B::Device::default);
+        let device = devices.first().cloned().unwrap_or_else(B::Device::default);
         let noiser = EggrollNoiser::new(param_specs.clone(), config.clone(), &device);
         let base_key = EggrollKey::from_seed(config.seed);
         let es_key = EsTreeKey::new(base_key);
@@ -96,16 +89,16 @@ where
             noiser,
             state: EggrollState {
                 mean_record,
-            config,
-            param_specs,
-            step: 0,
-            es_key,
-            base_key,
-            last_fitness_mean: None,
-            last_fitness_std: None,
-        },
+                config,
+                param_specs,
+                step: 0,
+                es_key,
+                base_key,
+                last_fitness_mean: None,
+                last_fitness_std: None,
+            },
+        }
     }
-}
 }
 
 impl<M, B, Obj> EggrollTrainer<M, B, Obj>
@@ -120,12 +113,7 @@ where
             return &self.model;
         }
 
-        let chunk_size = self
-            .state
-            .config
-            .pop_chunk_size
-            .max(1)
-            .min(pop.max(1));
+        let chunk_size = self.state.config.pop_chunk_size.max(1).min(pop.max(1));
         let tree_key = self.state.es_key.clone();
         let es_key = tree_key.clone().with_step(self.state.step);
         let global_workers: Vec<u32> = (0..pop as u32).collect();
@@ -189,8 +177,7 @@ where
             .sum::<f32>()
             / (pop_count as f32).max(1.0);
         let std = var.sqrt().max(1e-8);
-        let fitness_norm: Vec<f32> =
-            fitness.iter().map(|&f| (f - mean_f) / std).collect();
+        let fitness_norm: Vec<f32> = fitness.iter().map(|&f| (f - mean_f) / std).collect();
         self.state.last_fitness_mean = Some(mean_f);
         self.state.last_fitness_std = Some(std);
 
@@ -219,17 +206,13 @@ where
                 let mut updated = tensor.clone();
                 match (D, self.updates.get(&id)) {
                     (2, Some(EggrollNoiseTensor::D2(delta))) => {
-                        let delta = Tensor::<B, D>::from_data(
-                            delta.clone().to_data(),
-                            &tensor.device(),
-                        );
+                        let delta =
+                            Tensor::<B, D>::from_data(delta.clone().to_data(), &tensor.device());
                         updated = updated + delta.mul_scalar(self.lr);
                     }
                     (3, Some(EggrollNoiseTensor::D3(delta))) => {
-                        let delta = Tensor::<B, D>::from_data(
-                            delta.clone().to_data(),
-                            &tensor.device(),
-                        );
+                        let delta =
+                            Tensor::<B, D>::from_data(delta.clone().to_data(), &tensor.device());
                         updated = updated + delta.mul_scalar(self.lr);
                     }
                     _ => {}

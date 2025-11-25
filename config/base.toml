@@ -33,12 +33,12 @@ include_unknown = true
 vocab_path = "vocab.json"
 
 [training]
-block_size = 64
-batch_size = 16
+block_size = 512
+batch_size = 32
 max_iters = 100000
 log_frequency = 100
 # fraction of batch slots that keep streaming model state between steps (0.0 disables)
-stream_retain_pct = 0.2
+stream_retain_pct = 0.6
 # optional cap on tokens kept in a stream's cached state (0 or unset = follow context_strategy)
 # stream_max_context = 0
 

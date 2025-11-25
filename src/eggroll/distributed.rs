@@ -1,5 +1,5 @@
-use burn::tensor::backend::Backend;
 use burn::module::Module;
+use burn::tensor::backend::Backend;
 
 use super::model::{EggrollObjective, EggrollTrainer};
 

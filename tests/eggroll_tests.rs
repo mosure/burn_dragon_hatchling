@@ -1,15 +1,15 @@
 use burn::module::{Module, Param, ParamId};
-use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
+use burn::tensor::backend::Backend;
 use burn_ndarray::NdArray;
 
-use burn_dragon_hatchling::eggroll::{
-    EggrollConfig, EggrollNoiseTensor, EggrollObjective, EggrollTrainer, EggrollNoiser,
-    EggrollKey, EsTreeKey, EggrollParamSpec, discover_param_specs,
-};
-use burn_dragon_hatchling::{BDH, BDHConfig, BdhEsConfig};
 use burn::tensor::Int;
 use burn::tensor::module::embedding as emb_lookup;
+use burn_dragon_hatchling::eggroll::{
+    EggrollConfig, EggrollKey, EggrollNoiseTensor, EggrollNoiser, EggrollObjective,
+    EggrollParamSpec, EggrollTrainer, EsTreeKey, discover_param_specs,
+};
+use burn_dragon_hatchling::{BDH, BDHConfig, BdhEsConfig};
 
 type B = NdArray<f32>;
 
@@ -38,10 +38,7 @@ struct StackedParams<B: Backend> {
 impl<B: Backend> StackedParams<B> {
     fn new(device: &B::Device) -> Self {
         let w = Tensor::<B, 3>::from_floats(
-            [
-                [[0.1, -0.2], [0.3, 0.4]],
-                [[-0.1, 0.2], [0.5, -0.6]],
-            ],
+            [[[0.1, -0.2], [0.3, 0.4]], [[-0.1, 0.2], [0.5, -0.6]]],
             device,
         );
         Self {
@@ -66,7 +63,11 @@ impl<B: Backend> MseObjective<B> {
 
     fn mse(&self, pred: Tensor<B, 2>) -> f32 {
         let diff = pred - self.target.clone();
-        let mse = diff.clone().powf_scalar(2.0).sum().div_scalar(diff.shape().num_elements() as f32);
+        let mse = diff
+            .clone()
+            .powf_scalar(2.0)
+            .sum()
+            .div_scalar(diff.shape().num_elements() as f32);
         mse.to_data()
             .convert::<f32>()
             .into_vec::<f32>()
@@ -131,7 +132,10 @@ fn setup_linear() -> (SimpleLinear<B>, Tensor<B, 2>, Tensor<B, 2>) {
 fn eggroll_sigma_zero_is_noop() {
     let (model, batch, target) = setup_linear();
     let specs = discover_param_specs(&model, 2);
-    assert!(!specs.is_empty(), "no parameter specs discovered for SimpleLinear");
+    assert!(
+        !specs.is_empty(),
+        "no parameter specs discovered for SimpleLinear"
+    );
     let mut trainer = EggrollTrainer::new(
         model.clone(),
         EggrollConfig {
@@ -161,7 +165,11 @@ fn eggroll_sigma_zero_is_noop() {
         .convert::<f32>()
         .into_vec::<f32>()
         .unwrap();
-    assert!(diff[0] < 1e-6, "expected no change when sigma=0, got diff {}", diff[0]);
+    assert!(
+        diff[0] < 1e-6,
+        "expected no change when sigma=0, got diff {}",
+        diff[0]
+    );
 
     let w_before = model.weight.val();
     let w_after = trainer.model.weight.val();
@@ -172,7 +180,11 @@ fn eggroll_sigma_zero_is_noop() {
         .convert::<f32>()
         .into_vec::<f32>()
         .unwrap();
-    assert!(w_diff[0] < 1e-6, "weights changed despite sigma=0, diff {}", w_diff[0]);
+    assert!(
+        w_diff[0] < 1e-6,
+        "weights changed despite sigma=0, diff {}",
+        w_diff[0]
+    );
 }
 
 #[test]
@@ -206,9 +218,7 @@ fn eggroll_improves_on_linear_mse() {
     let w_start = trainer.model.weight.val().clone();
 
     // Ensure noise application actually perturbs parameters for evaluation.
-    let noise = trainer
-        .noiser
-        .build_noise_map(&trainer.state.es_key, 0);
+    let noise = trainer.noiser.build_noise_map(&trainer.state.es_key, 0);
     let candidate = trainer.noiser.apply_noise(&trainer.model, &noise);
     let candidate_diff = (candidate.weight.val() - trainer.model.weight.val())
         .abs()
@@ -336,7 +346,10 @@ fn embedding_sigma_zero_matches_plain() {
         .convert::<f32>()
         .into_vec::<f32>()
         .unwrap();
-    assert!(diff[0] < 1e-6, "sigma=0 embedding should match plain lookup");
+    assert!(
+        diff[0] < 1e-6,
+        "sigma=0 embedding should match plain lookup"
+    );
 }
 
 #[test]
@@ -464,12 +477,7 @@ fn pop_update_matches_naive_delta() {
         .map(|i| (i as f32 - 4.0) * 0.1)
         .collect();
 
-    let updates = noiser.compute_updates_from_population(
-        &tree_key,
-        step,
-        &worker_ids,
-        &scores,
-    );
+    let updates = noiser.compute_updates_from_population(&tree_key, step, &worker_ids, &scores);
     let delta_pop = match updates.get(&spec.id) {
         Some(EggrollNoiseTensor::D2(t)) => t.clone(),
         _ => panic!("expected 2D update"),
@@ -524,26 +532,12 @@ fn bdh_pop_forward_matches_single_worker() {
     let step = 3;
     let es_key = tree_key.clone().with_step(step);
 
-    let single = model.forward_with_noise_det(
-        tokens.clone(),
-        &noiser,
-        &es_key,
-        0,
-        true,
-    );
-    let pop_logits = model.forward_population_with_noise(
-        &tokens,
-        &noiser,
-        &tree_key,
-        step,
-        &[0],
-        true,
-    );
+    let single = model.forward_with_noise_det(tokens.clone(), &noiser, &es_key, 0, true);
+    let pop_logits =
+        model.forward_population_with_noise(&tokens, &noiser, &tree_key, step, &[0], true);
 
     let [batch, time, vocab] = single.shape().dims();
-    let pop0 = pop_logits
-        .slice_dim(0, 0..1)
-        .reshape([batch, time, vocab]);
+    let pop0 = pop_logits.slice_dim(0, 0..1).reshape([batch, time, vocab]);
     let diff = (pop0 - single)
         .abs()
         .sum()

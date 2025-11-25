@@ -25,11 +25,7 @@ fn noise_vec<B: Backend>(device: &B::Device) -> Vec<f32> {
         EggrollNoiseTensor::D2(noise) => noise,
         EggrollNoiseTensor::D3(_) => panic!("expected 2D noise block"),
     };
-    noise
-        .to_data()
-        .convert::<f32>()
-        .into_vec::<f32>()
-        .unwrap()
+    noise.to_data().convert::<f32>().into_vec::<f32>().unwrap()
 }
 
 #[test]

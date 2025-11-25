@@ -416,62 +416,76 @@ impl<B: Backend> Attention<B> {
             return Tensor::<B, 4>::zeros([batch, heads, 0, n_embd], &device);
         }
 
-        // Synaptic state S_t holds sum of previous K ⊗ V; constant in sequence length.
+        // Synaptic state S_t holds sum of previous K x V; constant in sequence length.
         let synaptic = cache
             .linear_kv
             .take()
             .unwrap_or_else(|| Tensor::<B, 4>::zeros([batch, heads, latent, n_embd], &device));
 
-        // K⊗V for each token: [B, H, T, latent, D]
-        let kv_outer = k_rot
-            .clone()
-            .unsqueeze_dim::<5>(4)
-            .mul(value_rep.clone().unsqueeze_dim::<5>(3));
-
-        // Strictly lower-triangular accumulator to exclude the current token from context.
-        let tri = Tensor::<B, 2>::ones([time, time], &device).tril(-1);
-
-        // Flatten batch/head/latent to apply prefix accumulation in a single matmul.
-        let bh = batch * heads;
-        let kv_flat = kv_outer
-            .clone()
-            .swap_dims(2, 3) // [B, H, latent, T, D]
-            .reshape([bh * latent, time, n_embd]);
-        let tri_batched = tri
-            .clone()
-            .unsqueeze_dim::<3>(0)
-            .repeat_dim(0, bh * latent);
-        let prefix_flat = tri_batched.matmul(kv_flat); // [bh*latent, time, D]
-
-        let prefix = prefix_flat
-            .reshape([batch, heads, latent, time, n_embd])
-            .swap_dims(2, 3); // [B, H, T, latent, D]
-
-        let synaptic_expanded = synaptic
-            .clone()
-            .unsqueeze_dim::<5>(2); // [B, H, 1, latent, D] -> broadcast over time
-        let context = prefix + synaptic_expanded; // S_t before current token
-
-        // y_t = q_t · S_t
-        let y = q_rot
-            .clone()
-            .unsqueeze_dim::<5>(4) // [B, H, T, latent, 1]
-            .mul(context)
-            .sum_dim(3)
-            .reshape([batch, heads, time, n_embd]); // [B, H, T, D]
-
-        // Update synaptic state: S_{end} = S_0 + sum_{t} K⊗V
-        let kv_update = kv_outer
-            .sum_dim(2)
-            .reshape([batch, heads, latent, n_embd]); // [B, H, latent, D]
-        let new_synaptic = synaptic + kv_update;
-
-        cache.linear_kv = Some(new_synaptic);
+        let (y, synaptic) = self.linear_blocked(q_rot, k_rot, value_rep, synaptic);
+        cache.linear_kv = Some(synaptic);
         cache.steps = cache.steps.saturating_add(time);
         cache.q_rot = None;
         cache.value = None;
 
         y
+    }
+
+    pub fn forward_linear_stateful(
+        &self,
+        query: Tensor<B, 4>,
+        value: Tensor<B, 4>,
+        synaptic: Tensor<B, 4>,
+        start_positions: Tensor<B, 1, Int>,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        let [batch, heads, time, _latent] = query.shape().dims::<4>();
+        let n_embd = value.shape().dims::<4>()[3];
+        let device = query.device();
+
+        if time == 0 {
+            return (
+                Tensor::<B, 4>::zeros([batch, heads, 0, n_embd], &device),
+                synaptic,
+            );
+        }
+
+        let offsets = Tensor::<B, 1, Int>::arange(0..time as i64, &device)
+            .float()
+            .reshape([1, 1, time, 1]);
+        let start = start_positions
+            .float()
+            .reshape([batch, 1, 1, 1]);
+        let positions = offsets + start;
+
+        let raw = positions.clone() * self.freqs.clone();
+        let phases = (raw.clone() - raw.floor()) * (2.0 * PI);
+        let q_rot = self.rope(phases.clone(), query.clone());
+        let k_rot = q_rot.clone();
+
+        let value_rep = value.repeat_dim(1, self.n_head);
+
+        if self.fused {
+            let block_ctx = linear_attention::fused_state_aligned_rotated(
+                q_rot.clone(),
+                k_rot.clone(),
+                value_rep.clone(),
+                positions.clone(),
+                self.use_alibi.then_some(self.alibi_slopes.clone()),
+                &self.block_pattern,
+            );
+
+            let prefix_ctx = q_rot.clone().matmul(synaptic.clone());
+            let y = block_ctx + prefix_ctx;
+
+            let synaptic_update = k_rot
+                .swap_dims(2, 3)
+                .matmul(value_rep.clone());
+            let synaptic = synaptic + synaptic_update;
+
+            return (y, synaptic);
+        }
+
+        self.linear_blocked(q_rot, k_rot, value_rep, synaptic)
     }
 
     fn rope(&self, phases: Tensor<B, 4>, values: Tensor<B, 4>) -> Tensor<B, 4> {
@@ -481,10 +495,7 @@ impl<B: Backend> Attention<B> {
         let [b, h, t, n] = values.shape().dims();
         let pairs = values.clone().reshape([b, h, t, n / 2, 2]);
 
-        let even = pairs
-            .clone()
-            .slice_dim(4, 0..1)
-            .squeeze_dim::<4>(4);
+        let even = pairs.clone().slice_dim(4, 0..1).squeeze_dim::<4>(4);
         let odd = pairs.slice_dim(4, 1..2).squeeze_dim::<4>(4);
 
         let rotated = Tensor::stack::<5>(vec![odd.clone().neg(), even], 4).reshape([b, h, t, n]);
@@ -514,13 +525,104 @@ impl<B: Backend> Attention<B> {
         }
         Tensor::<B, 1>::from_floats(data.as_slice(), device).reshape([1, 1, 1, latent])
     }
+
+    /// Linear-attention helper that processes time in blocks to limit buffer size while
+    /// keeping per-block math vectorized on the device.
+    fn linear_blocked(
+        &self,
+        q_rot: Tensor<B, 4>,
+        k_rot: Tensor<B, 4>,
+        value_rep: Tensor<B, 4>,
+        mut synaptic: Tensor<B, 4>,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        let [batch, heads, time, latent] = k_rot.shape().dims::<4>();
+        let n_embd = value_rep.shape().dims::<4>()[3];
+        let device = k_rot.device();
+
+        if time == 0 {
+            return (
+                Tensor::<B, 4>::zeros([batch, heads, 0, n_embd], &device),
+                synaptic,
+            );
+        }
+
+        // Cap temporary buffer to avoid cubecl BufferTooBig, but allow larger blocks by default
+        // for performance. Override with BDH_LINEAR_MAX_TMP_ELEMS if needed.
+        let max_tmp_elements = std::env::var("BDH_LINEAR_MAX_TMP_ELEMS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(120_000_000); // ~480MB at f32
+
+        let denom = batch
+            .saturating_mul(heads)
+            .saturating_mul(latent)
+            .saturating_mul(n_embd)
+            .max(1);
+        let mut chunk = max_tmp_elements / denom;
+        chunk = chunk.max(1).min(time);
+
+        let mut outputs: Vec<Tensor<B, 4>> = Vec::with_capacity(time.div_ceil(chunk));
+        let mut start = 0;
+        while start < time {
+            let end = usize::min(start + chunk, time);
+            let len = end - start;
+
+            let q_block = q_rot.clone().slice_dim(2, start..end);
+            let k_block = k_rot.clone().slice_dim(2, start..end);
+            let v_block = value_rep.clone().slice_dim(2, start..end);
+
+            if len == 1 {
+                // Fast path for tiny chunks to avoid the large 5D intermediate.
+                let context = synaptic.clone().unsqueeze_dim::<5>(2); // [B, H, 1, latent, D]
+                let y_block = q_block
+                    .clone()
+                    .unsqueeze_dim::<5>(4)
+                    .mul(context)
+                    .sum_dim(3)
+                    .reshape([batch, heads, 1, n_embd]);
+
+                let block_update = k_block.swap_dims(2, 3).matmul(v_block);
+                synaptic = synaptic + block_update;
+                outputs.push(y_block);
+            } else {
+                // KxV for the block: [B, H, len, latent, D]
+                let kv_outer = k_block
+                    .clone()
+                    .unsqueeze_dim::<5>(4)
+                    .mul(v_block.clone().unsqueeze_dim::<5>(3));
+
+                let prefix_inclusive = kv_outer.clone().cumsum(2);
+                let prefix_exclusive = prefix_inclusive.clone() - kv_outer.clone();
+
+                let synaptic_expanded = synaptic.clone().unsqueeze_dim::<5>(2);
+                let context = prefix_exclusive + synaptic_expanded;
+
+                let y_block = q_block
+                    .clone()
+                    .unsqueeze_dim::<5>(4)
+                    .mul(context)
+                    .sum_dim(3)
+                    .reshape([batch, heads, len, n_embd]);
+
+                let block_update = prefix_inclusive
+                    .slice_dim(2, (len - 1)..len)
+                    .reshape([batch, heads, latent, n_embd]);
+                synaptic = synaptic + block_update;
+
+                outputs.push(y_block);
+            }
+            start = end;
+        }
+
+        (Tensor::cat(outputs, 2), synaptic)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use burn::tensor::backend::Backend as BackendTrait;
-    use burn::tensor::{Distribution as TensorDistribution, Tensor};
+    use burn::tensor::{Distribution as TensorDistribution, Tensor, TensorData};
     use burn_ndarray::NdArray;
 
     type Backend = NdArray<f32>;
@@ -618,5 +720,64 @@ mod tests {
         let streaming = Tensor::cat(vec![out_first, out_second], 2);
 
         assert_close(streaming, full, 1e-4, 1e-4);
+    }
+
+    #[test]
+    fn linear_stateful_fused_matches_blocked() {
+        let device = <Backend as BackendTrait>::Device::default();
+        <Backend as BackendTrait>::seed(&device, 123);
+
+        let batch = 2;
+        let heads = 2;
+        let time = 4;
+        let latent = 6;
+        let n_embd = 5;
+
+        let mut kernel_fused = FusedKernelConfig::default();
+        kernel_fused.enabled = true;
+        kernel_fused.block_sparse = crate::kernel::BlockSparseConfig::dense(latent, time);
+
+        let mut kernel_blocked = kernel_fused.clone();
+        kernel_blocked.enabled = false;
+
+        let attn_fused = Attention::new(latent, heads, &device, &kernel_fused);
+        let attn_blocked = Attention::new(latent, heads, &device, &kernel_blocked);
+
+        let query = Tensor::<Backend, 4>::random(
+            [batch, heads, time, latent],
+            TensorDistribution::Normal(0.0, 1.0),
+            &device,
+        );
+        let value = Tensor::<Backend, 4>::random(
+            [batch, 1, time, n_embd],
+            TensorDistribution::Normal(0.0, 1.0),
+            &device,
+        );
+
+        let synaptic = Tensor::<Backend, 4>::random(
+            [batch, heads, latent, n_embd],
+            TensorDistribution::Normal(0.0, 1.0),
+            &device,
+        );
+        let start_positions = Tensor::<Backend, 1, Int>::from_data(
+            TensorData::new(vec![3i64, 7i64], [batch]),
+            &device,
+        );
+
+        let (y_fused, s_fused) = attn_fused.forward_linear_stateful(
+            query.clone(),
+            value.clone(),
+            synaptic.clone(),
+            start_positions.clone(),
+        );
+        let (y_blocked, s_blocked) = attn_blocked.forward_linear_stateful(
+            query,
+            value,
+            synaptic,
+            start_positions,
+        );
+
+        assert_close(y_fused, y_blocked, 1e-4, 1e-4);
+        assert_close(s_fused, s_blocked, 1e-4, 1e-4);
     }
 }

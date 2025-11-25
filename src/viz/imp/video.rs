@@ -296,7 +296,9 @@ fn sample_gradient(stops: &[ColorStop], value: f32) -> Color {
         return stops[0].color;
     }
     for window in stops.windows(2) {
-        if let [start, end] = window && clamped <= end.at {
+        if let [start, end] = window
+            && clamped <= end.at
+        {
             let span = (end.at - start.at).max(f32::EPSILON);
             let t = ((clamped - start.at) / span).clamp(0.0, 1.0);
             return start.color.lerp(end.color, t);
@@ -680,7 +682,9 @@ impl VideoHandle {
 impl VizTarget for VideoHandle {
     fn push(&self, snapshot: FrameSnapshot) {
         let mut guard = self.tx.lock();
-        if let Some(sender) = guard.as_ref() && sender.send(snapshot).is_err() {
+        if let Some(sender) = guard.as_ref()
+            && sender.send(snapshot).is_err()
+        {
             eprintln!("viz: encoder channel closed; disabling visualization output");
             *guard = None;
         }
@@ -688,7 +692,9 @@ impl VizTarget for VideoHandle {
 
     fn finalize(&self) {
         self.tx.lock().take();
-        if let Some(join) = self.join.lock().take() && let Err(err) = join.join() {
+        if let Some(join) = self.join.lock().take()
+            && let Err(err) = join.join()
+        {
             eprintln!("viz: encoder thread join failed: {err:?}");
         }
         if let Some(err) = self.errors.lock().take() {
@@ -909,7 +915,9 @@ fn encode_with_ffmpeg(
 }
 
 fn run_encoder(rx: Receiver<FrameSnapshot>, config: VideoConfig) -> Result<()> {
-    if let Some(parent) = config.path.parent() && !parent.as_os_str().is_empty() {
+    if let Some(parent) = config.path.parent()
+        && !parent.as_os_str().is_empty()
+    {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create viz output directory {parent:?}"))?;
     }
@@ -1815,13 +1823,17 @@ fn compute_panel_heights(modules: &[LayoutModule], total_height: usize) -> Vec<u
             heights[*idx] = portion;
             undistributed = undistributed.saturating_sub(portion);
         }
-        if undistributed > 0 && let Some((idx, _)) = flex_modules.last() {
+        if undistributed > 0
+            && let Some((idx, _)) = flex_modules.last()
+        {
             heights[*idx] += undistributed;
         }
     }
 
     let assigned: usize = heights.iter().sum();
-    if assigned < total_height && let Some(last) = heights.last_mut() {
+    if assigned < total_height
+        && let Some(last) = heights.last_mut()
+    {
         *last += total_height - assigned;
     }
 

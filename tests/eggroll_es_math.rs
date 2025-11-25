@@ -1,11 +1,11 @@
-use burn::tensor::backend::Backend;
-use burn::tensor::Tensor;
-use burn_ndarray::NdArray;
-use burn_dragon_hatchling::eggroll::{
-    EggrollConfig, EggrollNoiseTensor, EggrollObjective, EggrollParamSpec, EggrollNoiser,
-    EggrollKey, EsTreeKey,
-};
 use burn::module::Module;
+use burn::tensor::Tensor;
+use burn::tensor::backend::Backend;
+use burn_dragon_hatchling::eggroll::{
+    EggrollConfig, EggrollKey, EggrollNoiseTensor, EggrollNoiser, EggrollObjective,
+    EggrollParamSpec, EsTreeKey,
+};
+use burn_ndarray::NdArray;
 
 #[derive(Module, Debug)]
 struct ScalarModel<B: Backend> {
@@ -97,12 +97,7 @@ fn pop_update_matches_unbiased_estimator() {
     let worker_ids: Vec<u32> = (0..config.pop_size as u32).collect();
     let scores: Vec<f32> = vec![0.4, -0.2, 0.1, -0.1];
 
-    let updates = noiser.compute_updates_from_population(
-        &tree_key,
-        step,
-        &worker_ids,
-        &scores,
-    );
+    let updates = noiser.compute_updates_from_population(&tree_key, step, &worker_ids, &scores);
     let delta_pop = match updates.get(&spec.id) {
         Some(EggrollNoiseTensor::D2(t)) => t.clone(),
         _ => panic!("expected 2D update"),
@@ -164,12 +159,7 @@ fn antithetic_pairs_cancel_when_scores_match() {
     // Pair 0/1 share base noise with opposite sign and same score; should cancel.
     let scores = vec![1.0, 1.0, 0.0, 0.0];
 
-    let updates = noiser.compute_updates_from_population(
-        &tree_key,
-        0,
-        &worker_ids,
-        &scores,
-    );
+    let updates = noiser.compute_updates_from_population(&tree_key, 0, &worker_ids, &scores);
     let delta_pop = match updates.get(&spec.id) {
         Some(EggrollNoiseTensor::D2(t)) => t.clone(),
         _ => panic!("expected 2D update"),
@@ -228,28 +218,26 @@ fn es_gradient_aligns_with_finite_difference() {
         let mut deltas = Vec::new();
         let es_key = EsTreeKey::new(EggrollKey::from_seed(config.seed)).with_step(0);
         for tid in 0..config.pop_size {
-            let delta: Tensor<B, 2> = match EggrollNoiser::new(
-                vec![spec.clone()],
-                config.clone(),
-                &device,
-            )
-            .low_rank_delta(&spec, &es_key, tid as u32)
-            {
-                EggrollNoiseTensor::D2(delta) => delta,
-                EggrollNoiseTensor::D3(_) => panic!("expected 2D delta"),
-            };
+            let delta: Tensor<B, 2> =
+                match EggrollNoiser::new(vec![spec.clone()], config.clone(), &device)
+                    .low_rank_delta(&spec, &es_key, tid as u32)
+                {
+                    EggrollNoiseTensor::D2(delta) => delta,
+                    EggrollNoiseTensor::D3(_) => panic!("expected 2D delta"),
+                };
             let candidate = base_w.clone() + delta.clone();
-            let val = candidate.to_data().convert::<f32>().into_vec::<f32>().unwrap()[0];
+            let val = candidate
+                .to_data()
+                .convert::<f32>()
+                .into_vec::<f32>()
+                .unwrap()[0];
             let fit = -(val - target) * (val - target);
             fitness.push(fit);
             deltas.push(delta);
         }
 
         let mean = fitness.iter().copied().sum::<f32>() / fitness.len() as f32;
-        let var = fitness
-            .iter()
-            .map(|f| (f - mean) * (f - mean))
-            .sum::<f32>()
+        let var = fitness.iter().map(|f| (f - mean) * (f - mean)).sum::<f32>()
             / (fitness.len() as f32).max(1.0);
         let std = var.sqrt().max(1e-8);
         let fitness_norm: Vec<f32> = fitness.iter().map(|f| (f - mean) / std).collect();
@@ -265,7 +253,15 @@ fn es_gradient_aligns_with_finite_difference() {
         let end = new_w.to_data().convert::<f32>().into_vec::<f32>().unwrap()[0];
         let delta_norm: f32 = deltas
             .iter()
-            .map(|d| d.clone().abs().sum().to_data().convert::<f32>().into_vec::<f32>().unwrap()[0])
+            .map(|d| {
+                d.clone()
+                    .abs()
+                    .sum()
+                    .to_data()
+                    .convert::<f32>()
+                    .into_vec::<f32>()
+                    .unwrap()[0]
+            })
             .sum();
         if delta_norm > 0.0 && end > start {
             moved = true;
@@ -273,5 +269,8 @@ fn es_gradient_aligns_with_finite_difference() {
         }
     }
 
-    assert!(moved, "ES update did not move toward higher fitness for any tested seed");
+    assert!(
+        moved,
+        "ES update did not move toward higher fitness for any tested seed"
+    );
 }

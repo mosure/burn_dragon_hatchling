@@ -20,20 +20,18 @@ use burn::lr_scheduler::{
 };
 use burn::optim::adaptor::OptimizerAdaptor;
 use burn::optim::{AdamW, AdamWConfig, LearningRate};
-use burn::tensor::{Tensor, activation};
 use burn::tensor::backend::{AutodiffBackend, Backend as BackendTrait};
+use burn::tensor::{Tensor, activation};
 use burn_autodiff::Autodiff;
-use burn_train::metric::{Adaptor, ItemLazy, LearningRateMetric, LossInput, LossMetric, MetricEntry, NumericEntry};
-use burn_train::renderer::{MetricState, MetricsRendererTraining, TrainingProgress};
-use burn_train::renderer::tui::TuiMetricsRenderer;
 use burn_train::Interrupter;
+use burn_train::metric::{
+    Adaptor, ItemLazy, LearningRateMetric, LossInput, LossMetric, MetricEntry, MetricId,
+    NumericEntry, SerializedEntry,
+};
+use burn_train::renderer::tui::TuiMetricsRenderer;
+use burn_train::renderer::{MetricState, MetricsRendererTraining, TrainingProgress};
 use burn_train::{
-    LearnerBuilder,
-    LearningStrategy,
-    TrainingResult,
-    TrainOutput,
-    TrainStep,
-    ValidStep,
+    LearnerBuilder, LearningStrategy, TrainOutput, TrainStep, TrainingResult, ValidStep,
 };
 use burn_wgpu::Wgpu;
 use tracing::info;
@@ -48,7 +46,7 @@ use burn_dragon_hatchling::wgpu::init_runtime;
 use burn_dragon_hatchling::{
     BDH, BDHConfig, BdhEsConfig, ContextStrategyConfig, Dataset, DatasetConfig, DatasetSplit,
     EggrollObjective, EggrollTrainer, LearningRateScheduleConfig, ModelOverrides, OptimizerConfig,
-    ModelState, RandomDataLoader, SequenceBatch, TrainingConfig, TrainingHyperparameters, TrainingMode,
+    RandomDataLoader, SequenceBatch, TrainingConfig, TrainingHyperparameters, TrainingMode,
     bdh_param_specs, build_dataset, language_model_loss, load_training_config,
 };
 
@@ -143,89 +141,103 @@ fn forward_with_streaming<B: BackendTrait>(
         return model.forward(batch.inputs.clone());
     }
 
-    let mut logits_by_index: Vec<(usize, Tensor<B, 3>)> =
-        Vec::with_capacity(batch.inputs.shape().dims::<2>()[0]);
-    let mut fresh_indices = Vec::new();
-    let mut stream_entries = Vec::new();
+    let batch_size = batch.inputs.shape().dims::<2>()[0];
+    let time = batch.inputs.shape().dims::<2>()[1];
+    let device = batch.inputs.device();
 
-    for (idx, entry) in stream.entries.iter().enumerate() {
-        if let Some(handle) = entry {
-            stream_entries.push((idx, handle));
-        } else {
-            fresh_indices.push(idx);
-        }
+    let stream_mask: Vec<bool> = stream.entries.iter().map(|entry| entry.is_some()).collect();
+    let stream_indices: Vec<usize> = stream
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| entry.as_ref().map(|_| idx))
+        .collect();
+    if stream_indices.is_empty() {
+        return model.forward(batch.inputs.clone());
     }
 
-    if !stream_entries.is_empty() {
-        let mut stream_inputs = Vec::with_capacity(stream_entries.len());
-        let mut stream_states: Vec<ModelState<B>> = Vec::with_capacity(stream_entries.len());
-        let mut handles = Vec::with_capacity(stream_entries.len());
+    let fresh_indices: Vec<usize> = stream
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| entry.is_none().then_some(idx))
+        .collect();
 
-        for (idx, handle) in &stream_entries {
-            let input_slice = batch.inputs.clone().slice_dim(0, *idx..*idx + 1);
-            stream_inputs.push(input_slice);
+    let contiguous_stream = stream_indices
+        .iter()
+        .copied()
+        .eq(0..stream_indices.len())
+        && stream_mask
+            .iter()
+            .take_while(|flag| **flag)
+            .count()
+            == stream_indices.len();
+    debug_assert!(
+        contiguous_stream,
+        "stream rows should be the leading positions in the batch"
+    );
 
-            let mut guard = handle.state.lock().expect("lock stream state");
-            let state = guard
-                .take()
-                .unwrap_or_else(|| model.init_compressed_state());
-            stream_states.push(state);
-            handles.push((*idx, Arc::clone(&handle.state)));
+    let stream_inputs = if contiguous_stream {
+        batch
+            .inputs
+            .clone()
+            .slice_dim(0, 0..stream_indices.len())
+    } else {
+        let mut slices = Vec::with_capacity(stream_indices.len());
+        for &idx in &stream_indices {
+            slices.push(batch.inputs.clone().slice_dim(0, idx..idx + 1));
         }
+        Tensor::cat(slices, 0)
+    };
 
-        let stream_inputs_batched = if stream_inputs.len() == 1 {
-            stream_inputs
-                .first()
-                .expect("single stream input")
-                .clone()
-        } else {
-            Tensor::cat(stream_inputs.clone(), 0)
-        };
+    let stream_pool = stream.pool.clone();
+    let mut pool_guard = stream_pool.lock().expect("lock stream pool");
+    let pool = pool_guard.ensure_pool(|max_streams| model.init_state_pool(max_streams, &device));
+    let state_view = pool.prefix_view(stream_indices.len());
+    drop(pool_guard);
 
-        if let Some(mut stacked_state) = ModelState::try_stack(stream_states.clone()) {
-            let logits_stream = model.forward_with_state(stream_inputs_batched, &mut stacked_state);
-            let updated_states = stacked_state.split(handles.len());
+    let (logits_stream, updated_states) =
+        model.forward_with_state_pool(stream_inputs, state_view, false);
 
-            for (pos, (idx, handle)) in handles.into_iter().enumerate() {
-                let slice = logits_stream.clone().slice_dim(0, pos..pos + 1);
-                if let Some(updated) = updated_states.get(pos).cloned() {
-                    let mut guard = handle.lock().expect("lock stream state");
-                    *guard = Some(updated);
-                }
-                logits_by_index.push((idx, slice));
-            }
-        } else {
-            for ((input, (idx, handle)), mut state) in
-                stream_inputs.into_iter().zip(handles.into_iter()).zip(stream_states.into_iter())
-            {
-                let logits = model.forward_with_state(input, &mut state);
-                if let Ok(mut guard) = handle.lock() {
-                    *guard = Some(state);
-                }
-                logits_by_index.push((idx, logits));
-            }
-        }
+    let mut logits_ordered: Vec<Option<Tensor<B, 3>>> = vec![None; batch_size];
+    for (pos, &idx) in stream_indices.iter().enumerate() {
+        logits_ordered[idx] = Some(logits_stream.clone().slice_dim(0, pos..pos + 1));
     }
+
+    let mut pool_guard = stream_pool.lock().expect("lock stream pool");
+    let pool = pool_guard.ensure_pool(|max_streams| model.init_state_pool(max_streams, &device));
+    pool.write_prefix(stream_indices.len(), &updated_states, stream.max_context, time);
+    drop(pool_guard);
 
     if !fresh_indices.is_empty() {
-        let mut fresh_inputs = Vec::with_capacity(fresh_indices.len());
-        for &idx in &fresh_indices {
-            fresh_inputs.push(batch.inputs.clone().slice_dim(0, idx..idx + 1));
-        }
-        let fresh_inputs = if fresh_inputs.len() == 1 {
-            fresh_inputs.pop().expect("single fresh slice")
+        let fresh_inputs = if contiguous_stream && stream_indices.len() < batch_size {
+            batch
+                .inputs
+                .clone()
+                .slice_dim(0, stream_indices.len()..batch_size)
+        } else if fresh_indices.len() == 1 {
+            batch
+                .inputs
+                .clone()
+                .slice_dim(0, fresh_indices[0]..fresh_indices[0] + 1)
         } else {
-            Tensor::cat(fresh_inputs, 0)
+            let mut slices = Vec::with_capacity(fresh_indices.len());
+            for &idx in &fresh_indices {
+                slices.push(batch.inputs.clone().slice_dim(0, idx..idx + 1));
+            }
+            Tensor::cat(slices, 0)
         };
+
         let logits_fresh = model.forward(fresh_inputs);
-        for (pos, &idx) in fresh_indices.iter().enumerate() {
-            let slice = logits_fresh.clone().slice_dim(0, pos..pos + 1);
-            logits_by_index.push((idx, slice));
+        for (pos, idx) in fresh_indices.into_iter().enumerate() {
+            logits_ordered[idx] = Some(logits_fresh.clone().slice_dim(0, pos..pos + 1));
         }
     }
 
-    logits_by_index.sort_by_key(|(idx, _)| *idx);
-    let ordered: Vec<_> = logits_by_index.into_iter().map(|(_, logits)| logits).collect();
+    let ordered: Vec<_> = logits_ordered
+        .into_iter()
+        .map(|item| item.expect("all logits present"))
+        .collect();
     Tensor::cat(ordered, 0)
 }
 
@@ -272,11 +284,7 @@ impl<B: BackendTrait> EggrollObjective<BDH<B>, B> for LanguageModelEsObjective<B
         data.first().copied().unwrap_or(0.0)
     }
 
-    fn evaluate_population(
-        &mut self,
-        logits: &Tensor<B, 4>,
-        batch: &Self::Batch,
-    ) -> Vec<f32> {
+    fn evaluate_population(&mut self, logits: &Tensor<B, 4>, batch: &Self::Batch) -> Vec<f32> {
         let [pop, batch_size, time, _vocab] = logits.shape().dims::<4>();
         let targets = batch
             .targets
@@ -380,15 +388,13 @@ fn run() -> Result<()> {
             #[cfg(feature = "cuda")]
             {
                 match mode {
-                    TrainingMode::Eggroll => {
-                        train_backend_eggroll::<Cuda<f32>, _>(
-                            &config,
-                            dataset,
-                            "cuda",
-                            |_| {},
-                            args.train.checkpoint.as_ref(),
-                        )
-                    }
+                    TrainingMode::Eggroll => train_backend_eggroll::<Cuda<f32>, _>(
+                        &config,
+                        dataset,
+                        "cuda",
+                        |_| {},
+                        args.train.checkpoint.as_ref(),
+                    ),
                     TrainingMode::Backprop => {
                         train_backend::<Autodiff<Cuda<f32>>, _>(&config, dataset, "cuda", |_| {})
                     }
@@ -556,15 +562,14 @@ where
         0.0,
         None,
     );
-    let mut train_loader: Box<dyn DataLoaderIterator<SequenceBatch<B>>> =
-        train_loader_base.iter();
+    let mut train_loader: Box<dyn DataLoaderIterator<SequenceBatch<B>>> = train_loader_base.iter();
 
     let eggroll_cfg = resolve_bdh_eggroll(config);
     let mut model = BDH::<B>::new(model_config.clone(), &device);
     if let Some(path) = checkpoint {
         info!("Loading checkpoint from {}", path.display());
-        let record = BinFileRecorder::<FullPrecisionSettings>::new()
-            .load(path.to_path_buf(), &device)?;
+        let record =
+            BinFileRecorder::<FullPrecisionSettings>::new().load(path.to_path_buf(), &device)?;
         model = model.load_record(record);
     }
     let param_specs = bdh_param_specs(&model, &eggroll_cfg);
@@ -579,9 +584,7 @@ where
     let interrupter = Interrupter::new();
     let mut tui = use_tui.then(|| TuiMetricsRenderer::new(interrupter.clone(), None));
     let epoch_total = total_steps.div_ceil(steps_per_epoch);
-    let run_dir = PathBuf::from("runs")
-        .join(backend_name)
-        .join("eggroll");
+    let run_dir = PathBuf::from("runs").join(backend_name).join("eggroll");
     fs::create_dir_all(&run_dir)?;
 
     for step_idx in 0..total_steps {
@@ -613,40 +616,58 @@ where
                 iteration: items_processed,
             };
             let metric = MetricEntry::new(
-                Arc::new("fitness_mean".to_string()),
-                format!("{:.4}", mean),
-                format!("{}", mean),
+                MetricId::new(Arc::new("fitness_mean".to_string())),
+                SerializedEntry::new(format!("{:.4}", mean), format!("{}", mean)),
             );
             let metric_std = MetricEntry::new(
-                Arc::new("fitness_std".to_string()),
-                format!("{:.4}", std_dev),
-                format!("{}", std_dev),
+                MetricId::new(Arc::new("fitness_std".to_string())),
+                SerializedEntry::new(format!("{:.4}", std_dev), format!("{}", std_dev)),
             );
             let metric_step = MetricEntry::new(
-                Arc::new("step_ms".to_string()),
-                format!("{:.1}", step_ms),
-                format!("{}", step_ms),
+                MetricId::new(Arc::new("step_ms".to_string())),
+                SerializedEntry::new(format!("{:.1}", step_ms), format!("{}", step_ms)),
             );
             let metric_pop = MetricEntry::new(
-                Arc::new("pop_size".to_string()),
-                trainer.state.config.pop_size.to_string(),
-                trainer.state.config.pop_size.to_string(),
+                MetricId::new(Arc::new("pop_size".to_string())),
+                SerializedEntry::new(
+                    trainer.state.config.pop_size.to_string(),
+                    trainer.state.config.pop_size.to_string(),
+                ),
             );
             let metric_sigma = MetricEntry::new(
-                Arc::new("sigma".to_string()),
-                format!("{:.4}", trainer.state.config.sigma),
-                format!("{}", trainer.state.config.sigma),
+                MetricId::new(Arc::new("sigma".to_string())),
+                SerializedEntry::new(
+                    format!("{:.4}", trainer.state.config.sigma),
+                    format!("{}", trainer.state.config.sigma),
+                ),
             );
             let metric_lr = MetricEntry::new(
-                Arc::new("lr".to_string()),
-                format!("{:.5}", trainer.state.config.lr),
-                format!("{}", trainer.state.config.lr),
+                MetricId::new(Arc::new("lr".to_string())),
+                SerializedEntry::new(
+                    format!("{:.5}", trainer.state.config.lr),
+                    format!("{}", trainer.state.config.lr),
+                ),
             );
-            tui.update_train(MetricState::Numeric(metric, NumericEntry::Value(mean as f64)));
-            tui.update_train(MetricState::Numeric(metric_std, NumericEntry::Value(std_dev as f64)));
-            tui.update_train(MetricState::Numeric(metric_step, NumericEntry::Value(step_ms)));
-            tui.update_train(MetricState::Numeric(metric_pop, NumericEntry::Value(trainer.state.config.pop_size as f64)));
-            tui.update_train(MetricState::Numeric(metric_sigma, NumericEntry::Value(trainer.state.config.sigma as f64)));
+            tui.update_train(MetricState::Numeric(
+                metric,
+                NumericEntry::Value(mean as f64),
+            ));
+            tui.update_train(MetricState::Numeric(
+                metric_std,
+                NumericEntry::Value(std_dev as f64),
+            ));
+            tui.update_train(MetricState::Numeric(
+                metric_step,
+                NumericEntry::Value(step_ms),
+            ));
+            tui.update_train(MetricState::Numeric(
+                metric_pop,
+                NumericEntry::Value(trainer.state.config.pop_size as f64),
+            ));
+            tui.update_train(MetricState::Numeric(
+                metric_sigma,
+                NumericEntry::Value(trainer.state.config.sigma as f64),
+            ));
             tui.update_train(MetricState::Numeric(
                 metric_lr,
                 NumericEntry::Value(trainer.state.config.lr as f64),
@@ -716,19 +737,21 @@ where
 
     let builder = LearnerBuilder::new(env.run_dir)
         .num_epochs(env.epochs)
-        .learning_strategy(LearningStrategy::SingleDevice(env.device.clone()))
         .with_file_checkpointer(BinFileRecorder::<FullPrecisionSettings>::new())
         .metric_train_numeric(LossMetric::<ValidBackend<B>>::new())
         .metric_valid_numeric(LossMetric::<ValidBackend<B>>::new())
         .metric_train_numeric(LearningRateMetric::new())
         .summary();
 
-    let learner = builder.build(model, optimizer, scheduler);
-
-    let TrainingResult { model, .. } = learner.fit(
-        Arc::clone(&env.train_loader),
-        Arc::clone(&env.valid_loader),
+    let learner = builder.build(
+        model,
+        optimizer,
+        scheduler,
+        LearningStrategy::SingleDevice(env.device.clone()),
     );
+
+    let TrainingResult { model, .. } =
+        learner.fit(Arc::clone(&env.train_loader), Arc::clone(&env.valid_loader));
 
     log_theoretical_profile(
         env.model_config,
@@ -740,9 +763,7 @@ where
     Ok(model)
 }
 
-fn resolve_training_context_window(
-    training: &TrainingHyperparameters,
-) -> Option<usize> {
+fn resolve_training_context_window(training: &TrainingHyperparameters) -> Option<usize> {
     if let Some(max_ctx) = training.stream_max_context {
         if max_ctx == 0 {
             return None;
@@ -963,4 +984,367 @@ fn log_theoretical_profile(config: &BDHConfig, batch: usize, block: usize, backe
         value = attn_value as f64 / 1e9,
         dec = decoder_matmul as f64 / 1e9,
     );
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use burn::tensor::backend::Backend as BackendTrait;
+    use burn::tensor::{Int, Tensor, TensorData};
+    use burn_ndarray::NdArray;
+    use burn_dragon_hatchling::{
+        ModelState,
+        RecurrentStateStore,
+        StreamBatchState,
+        StreamHandle,
+    };
+    use std::sync::Mutex;
+
+    type Backend = NdArray<f32>;
+
+    fn assert_close(lhs: Tensor<Backend, 3>, rhs: Tensor<Backend, 3>, atol: f32, rtol: f32) {
+        let lhs_data = lhs
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("lhs vec");
+        let rhs_data = rhs
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("rhs vec");
+
+        for (a, b) in lhs_data.iter().zip(rhs_data.iter()) {
+            let diff = (a - b).abs();
+            let tol = atol + rtol * b.abs();
+            assert!(
+                diff <= tol,
+                "difference {diff} exceeds tolerance {tol} (lhs={a}, rhs={b})"
+            );
+        }
+    }
+
+    fn make_stream_batch(
+        pool: Arc<Mutex<RecurrentStateStore<Backend>>>,
+        inputs: Tensor<Backend, 2, Int>,
+        targets: Tensor<Backend, 2, Int>,
+    ) -> SequenceBatch<Backend> {
+        let entries = vec![
+            Some(StreamHandle {
+                id: 0,
+                offset: 0,
+                slot: 0,
+                pool: Arc::clone(&pool),
+            }),
+            None,
+        ];
+
+        let stream_state = StreamBatchState {
+            entries,
+            max_context: None,
+            pool,
+        };
+
+        SequenceBatch::with_stream(inputs, targets, stream_state)
+    }
+
+    #[test]
+    fn pooled_streaming_matches_baseline() {
+        let device = <Backend as BackendTrait>::Device::default();
+        <Backend as BackendTrait>::seed(&device, 2025);
+
+        let model = BDH::<Backend>::new(BDHConfig::default(), &device);
+
+        let batch = 2;
+        let time = 4;
+
+        let mut input_step1 = Vec::new();
+        let mut target_step1 = Vec::new();
+        let mut input_step2 = Vec::new();
+        let mut target_step2 = Vec::new();
+        for idx in 0..(batch * time) {
+            input_step1.push((idx % 17) as i64);
+            target_step1.push(((idx + 1) % 17) as i64);
+            input_step2.push(((idx + 3) % 23) as i64);
+            target_step2.push(((idx + 4) % 23) as i64);
+        }
+
+        let inputs1 = Tensor::<Backend, 2, Int>::from_data(
+            TensorData::new(input_step1, [batch, time]),
+            &device,
+        );
+        let targets1 = Tensor::<Backend, 2, Int>::from_data(
+            TensorData::new(target_step1, [batch, time]),
+            &device,
+        );
+
+        let inputs2 = Tensor::<Backend, 2, Int>::from_data(
+            TensorData::new(input_step2, [batch, time]),
+            &device,
+        );
+        let targets2 = Tensor::<Backend, 2, Int>::from_data(
+            TensorData::new(target_step2, [batch, time]),
+            &device,
+        );
+
+        let pool = Arc::new(Mutex::new(RecurrentStateStore::new(1)));
+
+        let batch1 = make_stream_batch(Arc::clone(&pool), inputs1.clone(), targets1);
+        let streamed_logits = forward_with_streaming(&model, &batch1);
+
+        let mut baseline_state = model.init_recurrent_state();
+        let logits_stream = model.forward_with_state(
+            inputs1.clone().slice_dim(0, 0..1),
+            &mut baseline_state,
+        );
+        let logits_fresh = model.forward(inputs1.clone().slice_dim(0, 1..2));
+        let baseline = Tensor::cat(vec![logits_stream.clone(), logits_fresh.clone()], 0);
+
+        assert_close(streamed_logits.clone(), baseline.clone(), 1e-4, 1e-4);
+
+        let batch2 = make_stream_batch(pool, inputs2.clone(), targets2);
+        let streamed_logits_step2 = forward_with_streaming(&model, &batch2);
+
+        let logits_stream_step2 = model.forward_with_state(
+            inputs2.clone().slice_dim(0, 0..1),
+            &mut baseline_state,
+        );
+        let logits_fresh_step2 = model.forward(inputs2.clone().slice_dim(0, 1..2));
+        let baseline_step2 = Tensor::cat(vec![logits_stream_step2, logits_fresh_step2], 0);
+
+        assert_close(streamed_logits_step2, baseline_step2, 1e-4, 1e-4);
+    }
+
+    fn make_stream_batch_with_mask(
+        pool: Arc<Mutex<RecurrentStateStore<Backend>>>,
+        inputs: Tensor<Backend, 2, Int>,
+        targets: Tensor<Backend, 2, Int>,
+        mask: &[bool],
+        max_context: Option<usize>,
+    ) -> SequenceBatch<Backend> {
+        let mut entries = Vec::with_capacity(mask.len());
+        let mut slot = 0;
+        for (idx, &is_stream) in mask.iter().enumerate() {
+            if is_stream {
+                entries.push(Some(StreamHandle {
+                    id: idx as u64,
+                    offset: idx * inputs.shape().dims::<2>()[1],
+                    slot,
+                    pool: Arc::clone(&pool),
+                }));
+                slot += 1;
+            } else {
+                entries.push(None);
+            }
+        }
+
+        let stream_state = StreamBatchState {
+            entries,
+            max_context,
+            pool,
+        };
+
+        SequenceBatch::with_stream(inputs, targets, stream_state)
+    }
+
+    fn baseline_logits(
+        model: &BDH<Backend>,
+        inputs: Tensor<Backend, 2, Int>,
+        mask: &[bool],
+        states: &mut [ModelState<Backend>],
+        max_context: Option<usize>,
+    ) -> Tensor<Backend, 3> {
+        let batch = inputs.shape().dims::<2>()[0];
+        let mut fresh_indices = Vec::new();
+        let mut fresh_slices = Vec::new();
+        let mut logits_ordered: Vec<Option<Tensor<Backend, 3>>> = vec![None; batch];
+
+        let mut stream_pos = 0;
+        for (idx, is_stream) in mask.iter().enumerate() {
+            if *is_stream {
+                let slice = inputs.clone().slice_dim(0, idx..idx + 1);
+                let state = states
+                    .get_mut(stream_pos)
+                    .expect("state per stream available");
+                let logits = model.forward_with_state(slice, state);
+                if let Some(limit) = max_context {
+                    state.trim(limit);
+                }
+                logits_ordered[idx] = Some(logits);
+                stream_pos += 1;
+            } else {
+                fresh_indices.push(idx);
+                fresh_slices.push(inputs.clone().slice_dim(0, idx..idx + 1));
+            }
+        }
+
+        if !fresh_slices.is_empty() {
+            let fresh_inputs = if fresh_slices.len() == 1 {
+                fresh_slices.pop().expect("single fresh input")
+            } else {
+                Tensor::cat(fresh_slices, 0)
+            };
+            let logits_fresh = model.forward(fresh_inputs);
+            for (pos, idx) in fresh_indices.into_iter().enumerate() {
+                logits_ordered[idx] = Some(logits_fresh.clone().slice_dim(0, pos..pos + 1));
+            }
+        }
+
+        let ordered: Vec<_> = logits_ordered
+            .into_iter()
+            .map(|item| item.expect("logits present"))
+            .collect();
+        Tensor::cat(ordered, 0)
+    }
+
+    #[test]
+    fn pooled_streaming_handles_mixed_stream_and_fresh_rows() {
+        let device = <Backend as BackendTrait>::Device::default();
+        <Backend as BackendTrait>::seed(&device, 7);
+
+        let mut model_config = BDHConfig::default();
+        model_config.dropout = 0.0;
+        let model = BDH::<Backend>::new(model_config, &device);
+
+        let batch = 4;
+        let time = 3;
+        let mask = [true, true, false, false];
+
+        let mut inputs_step1 = Vec::new();
+        let mut targets_step1 = Vec::new();
+        let mut inputs_step2 = Vec::new();
+        let mut targets_step2 = Vec::new();
+        for idx in 0..(batch * time) {
+            inputs_step1.push((idx % 31) as i64);
+            targets_step1.push(((idx + 1) % 31) as i64);
+            inputs_step2.push(((idx + 5) % 37) as i64);
+            targets_step2.push(((idx + 6) % 37) as i64);
+        }
+
+        let inputs1 = Tensor::<Backend, 2, Int>::from_data(
+            TensorData::new(inputs_step1, [batch, time]),
+            &device,
+        );
+        let targets1 = Tensor::<Backend, 2, Int>::from_data(
+            TensorData::new(targets_step1, [batch, time]),
+            &device,
+        );
+        let inputs2 = Tensor::<Backend, 2, Int>::from_data(
+            TensorData::new(inputs_step2, [batch, time]),
+            &device,
+        );
+        let targets2 = Tensor::<Backend, 2, Int>::from_data(
+            TensorData::new(targets_step2, [batch, time]),
+            &device,
+        );
+
+        let pool = Arc::new(Mutex::new(RecurrentStateStore::new(mask.iter().filter(|m| **m).count())));
+        let batch1 = make_stream_batch_with_mask(Arc::clone(&pool), inputs1.clone(), targets1, &mask, None);
+        let batch2 = make_stream_batch_with_mask(pool, inputs2.clone(), targets2, &mask, None);
+
+        let mut stream_states: Vec<ModelState<Backend>> = (0..mask.iter().filter(|m| **m).count())
+            .map(|_| model.init_recurrent_state())
+            .collect();
+
+        let baseline1 =
+            baseline_logits(&model, inputs1.clone(), &mask, &mut stream_states, None);
+        let streamed1 = forward_with_streaming(&model, &batch1);
+        assert_close(streamed1, baseline1, 1e-4, 1e-4);
+
+        let baseline2 =
+            baseline_logits(&model, inputs2.clone(), &mask, &mut stream_states, None);
+        let streamed2 = forward_with_streaming(&model, &batch2);
+        assert_close(streamed2, baseline2, 1e-4, 1e-4);
+    }
+
+    #[test]
+    fn pooled_streaming_respects_max_context() {
+        let device = <Backend as BackendTrait>::Device::default();
+        <Backend as BackendTrait>::seed(&device, 11);
+
+        let mut model_config = BDHConfig::default();
+        model_config.dropout = 0.0;
+        let model = BDH::<Backend>::new(model_config, &device);
+
+        let batch = 2;
+        let time = 4;
+        let mask = [true, true];
+        let max_ctx = Some(2);
+
+        let mut inputs = Vec::new();
+        let mut targets = Vec::new();
+        for idx in 0..(batch * time) {
+            inputs.push((idx % 19) as i64);
+            targets.push(((idx + 1) % 19) as i64);
+        }
+
+        let inputs1 = Tensor::<Backend, 2, Int>::from_data(
+            TensorData::new(inputs.clone(), [batch, time]),
+            &device,
+        );
+        let targets1 = Tensor::<Backend, 2, Int>::from_data(
+            TensorData::new(targets.clone(), [batch, time]),
+            &device,
+        );
+
+        let inputs2 = Tensor::<Backend, 2, Int>::from_data(
+            TensorData::new(
+                inputs.iter().map(|v| (v + 3) % 19).collect::<Vec<_>>(),
+                [batch, time],
+            ),
+            &device,
+        );
+        let targets2 = Tensor::<Backend, 2, Int>::from_data(
+            TensorData::new(
+                targets.iter().map(|v| (v + 3) % 19).collect::<Vec<_>>(),
+                [batch, time],
+            ),
+            &device,
+        );
+
+        let pool = Arc::new(Mutex::new(RecurrentStateStore::new(mask.len())));
+        let batch1 =
+            make_stream_batch_with_mask(Arc::clone(&pool), inputs1.clone(), targets1, &mask, max_ctx);
+        let batch2 = make_stream_batch_with_mask(pool, inputs2.clone(), targets2, &mask, max_ctx);
+
+        let mut stream_states: Vec<ModelState<Backend>> =
+            (0..mask.len()).map(|_| model.init_recurrent_state()).collect();
+
+        let baseline1 =
+            baseline_logits(&model, inputs1.clone(), &mask, &mut stream_states, max_ctx);
+        let streamed1 = forward_with_streaming(&model, &batch1);
+        assert_close(streamed1, baseline1, 1e-4, 1e-4);
+
+        let baseline2 =
+            baseline_logits(&model, inputs2.clone(), &mask, &mut stream_states, max_ctx);
+        let streamed2 = forward_with_streaming(&model, &batch2);
+        assert_close(streamed2, baseline2, 1e-4, 1e-4);
+    }
+
+    #[test]
+    #[should_panic]
+    fn streaming_panics_on_non_leading_stream_rows() {
+        let device = <Backend as BackendTrait>::Device::default();
+        <Backend as BackendTrait>::seed(&device, 13);
+
+        let mut model_config = BDHConfig::default();
+        model_config.dropout = 0.0;
+        let model = BDH::<Backend>::new(model_config, &device);
+
+        let batch = 3;
+        let time = 2;
+        let mask = [false, true, true];
+
+        let inputs = Tensor::<Backend, 2, Int>::from_data(
+            TensorData::new(vec![1, 2, 3, 4, 5, 6], [batch, time]),
+            &device,
+        );
+        let targets = inputs.clone();
+
+        let pool =
+            Arc::new(Mutex::new(RecurrentStateStore::new(mask.iter().filter(|m| **m).count())));
+        let batch = make_stream_batch_with_mask(pool, inputs, targets, &mask, None);
+
+        let _ = forward_with_streaming(&model, &batch);
+    }
 }

@@ -110,8 +110,7 @@ pub fn sample_next_token<B: Backend>(
     let mut rng = thread_rng();
     let next = dist.sample(&mut rng) as i64;
 
-    let next_tensor =
-        Tensor::<B, 1, Int>::from_data(TensorData::new(vec![next], [1]), device);
+    let next_tensor = Tensor::<B, 1, Int>::from_data(TensorData::new(vec![next], [1]), device);
 
     let logits = model.step(next_tensor, state);
     let [_, vocab] = logits.shape().dims::<2>();

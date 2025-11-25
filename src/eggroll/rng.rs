@@ -64,11 +64,7 @@ impl EsTreeKey {
 ///
 /// This intentionally mirrors the counter/key split used by JAX's PRNG design
 /// (though the underlying mixing is splitmix64 here rather than Random123).
-pub fn normal_f32<B: Backend>(
-    key: EggrollKey,
-    count: usize,
-    device: &B::Device,
-) -> Tensor<B, 1> {
+pub fn normal_f32<B: Backend>(key: EggrollKey, count: usize, device: &B::Device) -> Tensor<B, 1> {
     normal_f32_from_offset::<B>(key, count, 0, device)
 }
 
@@ -101,8 +97,7 @@ pub fn normal_f32_from_offset<B: Backend>(
 
 fn unit_from_key(key: EggrollKey, counter: u64) -> f64 {
     let word = philox2x32(key, counter).0 as u64;
-    let scaled =
-        ((word >> 11) as f64) * (1.0 / ((1u64 << 53) as f64)); // 53 bits -> (0,1)
+    let scaled = ((word >> 11) as f64) * (1.0 / ((1u64 << 53) as f64)); // 53 bits -> (0,1)
     scaled.clamp(f64::MIN_POSITIVE, 1.0 - f64::EPSILON)
 }
 
@@ -156,7 +151,10 @@ mod tests {
         let device = <NdArray<f32> as Backend>::Device::default();
         let out1 = normal_f32::<B>(key, 8, &device);
         let out2 = normal_f32::<B>(key, 8, &device);
-        assert_eq!(out1.to_data().convert::<f32>(), out2.to_data().convert::<f32>());
+        assert_eq!(
+            out1.to_data().convert::<f32>(),
+            out2.to_data().convert::<f32>()
+        );
     }
 
     #[test]
@@ -166,7 +164,10 @@ mod tests {
         let device = <NdArray<f32> as Backend>::Device::default();
         let out_a = normal_f32::<B>(key_a, 8, &device);
         let out_b = normal_f32::<B>(key_b, 8, &device);
-        assert_ne!(out_a.to_data().convert::<f32>(), out_b.to_data().convert::<f32>());
+        assert_ne!(
+            out_a.to_data().convert::<f32>(),
+            out_b.to_data().convert::<f32>()
+        );
     }
 
     #[test]
@@ -179,8 +180,14 @@ mod tests {
         let b_first = normal_f32::<B>(fold_in(key, 1), 4, &device);
         let a_second = normal_f32::<B>(key, 4, &device);
 
-        assert_eq!(a_first.to_data().convert::<f32>(), a_second.to_data().convert::<f32>());
-        assert_eq!(b_first.to_data().convert::<f32>(), b_second.to_data().convert::<f32>());
+        assert_eq!(
+            a_first.to_data().convert::<f32>(),
+            a_second.to_data().convert::<f32>()
+        );
+        assert_eq!(
+            b_first.to_data().convert::<f32>(),
+            b_second.to_data().convert::<f32>()
+        );
     }
 
     #[test]
@@ -189,7 +196,10 @@ mod tests {
         let key = EggrollKey::from_seed(7);
         let out_step0 = normal_f32_from_offset::<B>(key, 4, 0, &device);
         let out_step1 = normal_f32_from_offset::<B>(key, 4, 1024, &device);
-        assert_ne!(out_step0.to_data().convert::<f32>(), out_step1.to_data().convert::<f32>());
+        assert_ne!(
+            out_step0.to_data().convert::<f32>(),
+            out_step1.to_data().convert::<f32>()
+        );
     }
 
     #[test]
@@ -202,7 +212,9 @@ mod tests {
         let mut map_a = std::collections::HashMap::new();
         for &p in &params {
             for &t in &threads {
-                let k = EsTreeKey::new(key).with_step(0).for_param_thread(ParamId::from(p), t);
+                let k = EsTreeKey::new(key)
+                    .with_step(0)
+                    .for_param_thread(ParamId::from(p), t);
                 let noise = normal_f32::<B>(k, 4, &device).to_data().convert::<f32>();
                 map_a.insert((p, t), noise);
             }
@@ -211,7 +223,9 @@ mod tests {
         let mut map_b = std::collections::HashMap::new();
         for &t in threads.iter().rev() {
             for &p in params.iter().rev() {
-                let k = EsTreeKey::new(key).with_step(0).for_param_thread(ParamId::from(p), t);
+                let k = EsTreeKey::new(key)
+                    .with_step(0)
+                    .for_param_thread(ParamId::from(p), t);
                 let noise = normal_f32::<B>(k, 4, &device).to_data().convert::<f32>();
                 map_b.insert((p, t), noise);
             }

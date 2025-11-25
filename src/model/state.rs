@@ -1,6 +1,9 @@
-#[cfg(feature = "viz")]
-use burn::tensor::Tensor;
-use burn::tensor::backend::Backend;
+use burn::tensor::{
+    Int,
+    Tensor,
+    TensorData,
+    backend::Backend,
+};
 
 use super::attention::AttentionCache;
 
@@ -171,5 +174,192 @@ impl<B: Backend> ModelState<B> {
 impl<B: Backend> LayerState<B> {
     pub fn take_viz(&mut self) -> Option<LayerVizState<B>> {
         self.viz.take()
+    }
+}
+
+#[derive(Debug)]
+pub struct RecurrentStateStore<B: Backend> {
+    pool: Option<ModelStatePool<B>>,
+    max_streams: usize,
+}
+
+impl<B: Backend> RecurrentStateStore<B> {
+    pub fn new(max_streams: usize) -> Self {
+        Self {
+            pool: None,
+            max_streams,
+        }
+    }
+
+    pub fn max_streams(&self) -> usize {
+        self.max_streams
+    }
+
+    pub fn ensure_pool<F>(&mut self, init: F) -> &mut ModelStatePool<B>
+    where
+        F: FnOnce(usize) -> ModelStatePool<B>,
+    {
+        if self.pool.is_none() {
+            self.pool = Some(init(self.max_streams));
+        }
+        self.pool
+            .as_mut()
+            .expect("state pool initialized")
+    }
+
+    pub fn pool(&self) -> Option<&ModelStatePool<B>> {
+        self.pool.as_ref()
+    }
+
+    pub fn reset_slot(&mut self, slot: usize) {
+        if let Some(pool) = &mut self.pool {
+            pool.reset_slot(slot);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct RecurrentStateView<B: Backend> {
+    pub positions: Tensor<B, 1, Int>,
+    pub positions_host: Vec<usize>,
+    pub layers: Vec<Tensor<B, 4>>,
+}
+
+#[derive(Debug)]
+pub struct ModelStatePool<B: Backend> {
+    layers: Vec<Tensor<B, 4>>,
+    steps: Vec<usize>,
+    max_streams: usize,
+    heads: usize,
+    latent: usize,
+    dim: usize,
+    device: B::Device,
+}
+
+impl<B: Backend> ModelStatePool<B> {
+    pub fn new(
+        num_layers: usize,
+        max_streams: usize,
+        heads: usize,
+        latent: usize,
+        dim: usize,
+        device: &B::Device,
+    ) -> Self {
+        let mut layers = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            layers.push(Tensor::<B, 4>::zeros(
+                [max_streams, heads, latent, dim],
+                device,
+            ));
+        }
+        Self {
+            layers,
+            steps: vec![0; max_streams],
+            max_streams,
+            heads,
+            latent,
+            dim,
+            device: device.clone(),
+        }
+    }
+
+    pub fn prefix_view(&self, count: usize) -> RecurrentStateView<B> {
+        let count = count.min(self.max_streams);
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            layers.push(layer.clone().slice_dim(0, 0..count).detach());
+        }
+        let positions_host: Vec<usize> = self.steps.iter().take(count).cloned().collect();
+        let positions = Tensor::<B, 1, Int>::from_data(
+            TensorData::new(
+                positions_host
+                    .iter()
+                    .map(|value| *value as i64)
+                    .collect::<Vec<_>>(),
+                [count],
+            ),
+            &self.device,
+        );
+        RecurrentStateView {
+            positions,
+            positions_host,
+            layers,
+        }
+    }
+
+    pub fn write_prefix(
+        &mut self,
+        count: usize,
+        updated: &[Tensor<B, 4>],
+        max_context: Option<usize>,
+        advance: usize,
+    ) {
+        let count = count.min(self.max_streams);
+        if count == 0 {
+            return;
+        }
+
+        let mut reset_mask = vec![1.0_f32; count];
+        if let Some(limit) = max_context {
+            for idx in 0..count {
+                let new_steps = self.steps.get(idx).copied().unwrap_or(0).saturating_add(advance);
+                if new_steps > limit {
+                    reset_mask[idx] = 0.0;
+                    self.steps[idx] = 0;
+                } else {
+                    self.steps[idx] = new_steps;
+                }
+            }
+        } else {
+            for idx in 0..count {
+                let new_steps = self.steps.get(idx).copied().unwrap_or(0).saturating_add(advance);
+                self.steps[idx] = new_steps;
+            }
+        }
+
+        let mask_tensor = Tensor::<B, 1>::from_floats(reset_mask.as_slice(), &self.device)
+            .reshape([count, 1, 1, 1]);
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let mut updated_rows = updated
+                .get(layer_idx)
+                .cloned()
+                .expect("updated layer state matches layout");
+            // Reuse cached states without carrying the previous graph forward.
+            updated_rows = updated_rows.detach();
+            if reset_mask.iter().any(|value| *value == 0.0) {
+                updated_rows = updated_rows * mask_tensor.clone();
+            }
+
+            if count < self.max_streams {
+                let tail = layer.clone().slice_dim(0, count..self.max_streams);
+                *layer = Tensor::cat(vec![updated_rows, tail], 0);
+            } else {
+                *layer = updated_rows;
+            }
+        }
+    }
+
+    pub fn reset_slot(&mut self, slot: usize) {
+        if slot >= self.max_streams {
+            return;
+        }
+        self.steps[slot] = 0;
+        let zero = Tensor::<B, 4>::zeros([1, self.heads, self.latent, self.dim], &self.device);
+        for layer in &mut self.layers {
+            if slot + 1 >= self.max_streams {
+                *layer = Tensor::cat(
+                    vec![layer.clone().slice_dim(0, 0..slot), zero.clone()],
+                    0,
+                );
+            } else if slot == 0 {
+                let tail = layer.clone().slice_dim(0, 1..self.max_streams);
+                *layer = Tensor::cat(vec![zero.clone(), tail], 0);
+            } else {
+                let head = layer.clone().slice_dim(0, 0..slot);
+                let tail = layer.clone().slice_dim(0, slot + 1..self.max_streams);
+                *layer = Tensor::cat(vec![head, zero.clone(), tail], 0);
+            }
+        }
     }
 }

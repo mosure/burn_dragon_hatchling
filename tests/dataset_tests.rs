@@ -95,7 +95,8 @@ fn streamed_batches_continue_across_steps() {
     let handle_first = stream_first.entries[idx].as_ref().unwrap();
     let handle_second = stream_second.entries[idx].as_ref().unwrap();
 
-    assert!(Arc::ptr_eq(&handle_first.state, &handle_second.state));
+    assert_eq!(handle_first.slot, handle_second.slot);
+    assert!(Arc::ptr_eq(&handle_first.pool, &handle_second.pool));
     assert_eq!(stream_first.max_context, Some(block_size));
 
     if handle_first.id == handle_second.id {
@@ -208,12 +209,9 @@ fn stream_respects_document_boundaries() {
         let offset = handle.offset;
 
         // All tokens in this sample should share a single doc id.
-        let sample_doc_ids =
-            &doc_ids[offset..offset + block_size];
+        let sample_doc_ids = &doc_ids[offset..offset + block_size];
         assert!(
-            sample_doc_ids
-                .windows(2)
-                .all(|w| w[0] == w[1]),
+            sample_doc_ids.windows(2).all(|w| w[0] == w[1]),
             "streamed sample should not cross doc boundary"
         );
     }

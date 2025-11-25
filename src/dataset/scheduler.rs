@@ -1,7 +1,7 @@
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::ops::Range;
 
 use burn::data::dataloader::{DataLoader, DataLoaderIterator, Progress};
 use burn::tensor::backend::Backend;
@@ -9,7 +9,7 @@ use burn::tensor::{Int, Tensor, TensorData};
 use rand::prelude::*;
 use rand::seq::SliceRandom;
 
-use crate::model::ModelState;
+use crate::model::RecurrentStateStore;
 use crate::tokenizer::SharedTokenizer;
 
 use super::DatasetSplit;
@@ -151,13 +151,15 @@ impl<B: Backend> SequenceBatch<B> {
 pub struct StreamHandle<B: Backend> {
     pub id: u64,
     pub offset: usize,
-    pub state: Arc<Mutex<Option<ModelState<B>>>>,
+    pub slot: usize,
+    pub pool: Arc<Mutex<RecurrentStateStore<B>>>,
 }
 
 #[derive(Clone)]
 pub struct StreamBatchState<B: Backend> {
     pub entries: Vec<Option<StreamHandle<B>>>,
     pub max_context: Option<usize>,
+    pub pool: Arc<Mutex<RecurrentStateStore<B>>>,
 }
 
 impl<B: Backend> StreamBatchState<B> {
@@ -246,31 +248,26 @@ where
         let (split_offset, split_span) = self.dataset.split_offset_and_span(self.split);
         let block_size = self.dataset.block_size();
         let batch_size = self.dataset.batch_size();
-        let doc_ranges = build_doc_ranges(
-            self.dataset.doc_ids(),
-            split_offset,
-            split_span,
-            block_size,
-        );
-        let stream_pool = if self.stream_retain_pct > 0.0
-            && matches!(self.split, DatasetSplit::Train)
-        {
-            let max_stream = ((batch_size as f32) * self.stream_retain_pct).floor() as usize;
-            if max_stream == 0 {
-                None
+        let doc_ranges =
+            build_doc_ranges(self.dataset.doc_ids(), split_offset, split_span, block_size);
+        let stream_pool =
+            if self.stream_retain_pct > 0.0 && matches!(self.split, DatasetSplit::Train) {
+                let max_stream = ((batch_size as f32) * self.stream_retain_pct).floor() as usize;
+                if max_stream == 0 {
+                    None
+                } else {
+                    Some(StreamPool::new(
+                        max_stream,
+                        self.stream_context_len,
+                        split_offset,
+                        split_span,
+                        block_size,
+                        doc_ranges.clone(),
+                    ))
+                }
             } else {
-                Some(StreamPool::new(
-                    max_stream,
-                    self.stream_context_len,
-                    split_offset,
-                    split_span,
-                    block_size,
-                    doc_ranges.clone(),
-                ))
-            }
-        } else {
-            None
-        };
+                None
+            };
 
         Box::new(RandomIterator {
             dataset: Arc::clone(&self.dataset),
@@ -341,7 +338,8 @@ struct RandomIterator<B: Backend> {
 #[derive(Clone)]
 struct StreamCursor<B: Backend> {
     offset: usize,
-    state: Arc<Mutex<Option<ModelState<B>>>>,
+    slot: usize,
+    pool: Arc<Mutex<RecurrentStateStore<B>>>,
     id: u64,
     range_idx: Option<usize>,
 }
@@ -355,6 +353,7 @@ struct StreamPool<B: Backend> {
     block_size: usize,
     context_len: Option<usize>,
     doc_ranges: Option<Vec<Range<usize>>>,
+    state_pool: Arc<Mutex<RecurrentStateStore<B>>>,
 }
 
 impl<B: Backend> StreamPool<B> {
@@ -375,6 +374,7 @@ impl<B: Backend> StreamPool<B> {
             block_size,
             context_len,
             doc_ranges,
+            state_pool: Arc::new(Mutex::new(RecurrentStateStore::new(max_stream))),
         }
     }
 
@@ -399,18 +399,15 @@ impl<B: Backend> StreamPool<B> {
         (relative, None, None)
     }
 
-    fn prepare_batch(
-        &mut self,
-        batch_size: usize,
-        rng: &mut ThreadRng,
-    ) -> StreamBatchState<B> {
+    fn prepare_batch(&mut self, batch_size: usize, rng: &mut ThreadRng) -> StreamBatchState<B> {
         let desired = self.max_stream.min(batch_size);
         while self.slots.len() < desired {
             let (start, _range_end, range_idx) = self.sample_start(rng);
             let id = self.alloc_id();
             self.slots.push(StreamCursor {
                 offset: start,
-                state: Arc::new(Mutex::new(None)),
+                slot: self.slots.len(),
+                pool: Arc::clone(&self.state_pool),
                 id,
                 range_idx,
             });
@@ -423,7 +420,8 @@ impl<B: Backend> StreamPool<B> {
             entries.push(Some(StreamHandle {
                 id: cursor.id,
                 offset: abs_offset,
-                state: Arc::clone(&cursor.state),
+                slot: cursor.slot,
+                pool: Arc::clone(&cursor.pool),
             }));
             cursor.advance(
                 &mut self.next_id,
@@ -440,6 +438,7 @@ impl<B: Backend> StreamPool<B> {
         StreamBatchState {
             entries,
             max_context: self.context_len,
+            pool: Arc::clone(&self.state_pool),
         }
     }
 
@@ -501,8 +500,8 @@ impl<B: Backend> StreamCursor<B> {
         self.range_idx = range_idx;
         *next_id = (*next_id).wrapping_add(1);
         self.id = *next_id;
-        if let Ok(mut guard) = self.state.lock() {
-            *guard = None;
+        if let Ok(mut guard) = self.pool.lock() {
+            guard.reset_slot(self.slot);
         }
     }
 }

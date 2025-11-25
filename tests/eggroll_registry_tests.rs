@@ -1,6 +1,6 @@
 use burn::tensor::backend::Backend;
-use burn_ndarray::NdArray;
 use burn_dragon_hatchling::{BDH, BDHConfig, BdhEsConfig};
+use burn_ndarray::NdArray;
 
 #[test]
 fn bdh_es_registry_contains_expected_targets() {
@@ -16,13 +16,14 @@ fn bdh_es_registry_contains_expected_targets() {
         targets.insert(spec.path.clone(), spec);
     }
 
-    assert_eq!(targets.len(), 5, "expected embedding, decoder_x, decoder_y, encoder, lm_head");
+    assert_eq!(
+        targets.len(),
+        5,
+        "expected embedding, decoder_x, decoder_y, encoder, lm_head"
+    );
     for name in ["embedding", "lm_head"] {
         assert!(
-            targets
-                .get(name)
-                .and_then(|spec| spec.stack)
-                .is_none(),
+            targets.get(name).and_then(|spec| spec.stack).is_none(),
             "{name} should be treated as 2D"
         );
     }

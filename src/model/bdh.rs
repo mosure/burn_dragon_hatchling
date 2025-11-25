@@ -6,15 +6,15 @@ use rand::distributions::{Distribution, WeightedIndex};
 use rand::prelude::*;
 use std::cmp::Ordering;
 
-use crate::kernel::{BlockPattern1d, relu_lowrank};
-use crate::eggroll::{EggrollNoiser, EsTreeKey, EggrollParamSpec};
 use crate::eggroll::bdh_integration::BdhEsConfig;
+use crate::eggroll::{EggrollNoiser, EggrollParamSpec, EsTreeKey};
+use crate::kernel::{BlockPattern1d, relu_lowrank};
 
 use super::attention::Attention;
 use super::config::{BDHConfig, FusedKernelConfig};
 #[cfg(feature = "viz")]
 use super::state::LayerVizState;
-use super::state::ModelState;
+use super::state::{ModelState, ModelStatePool, RecurrentStateView};
 
 const LAYER_NORM_EPS: f32 = 1e-5;
 
@@ -90,6 +90,10 @@ impl<B: Backend> BDH<B> {
         tensor.sub(mean).div(var.add_scalar(LAYER_NORM_EPS).sqrt())
     }
 
+    fn latent_per_head_value(&self) -> usize {
+        (self.mlp_internal_dim_multiplier * self.n_embd) / self.n_head
+    }
+
     pub fn forward(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         self.forward_inner(tokens, None, None, None, false)
     }
@@ -141,21 +145,14 @@ impl<B: Backend> BDH<B> {
         let es_key = tree_key.clone().with_step(step);
         if pop == 1 {
             let tid = *global_workers.first().unwrap_or(&0);
-            let logits = self.forward_with_noise_det(
-                tokens.clone(),
-                noiser,
-                &es_key,
-                tid,
-                deterministic,
-            );
+            let logits =
+                self.forward_with_noise_det(tokens.clone(), noiser, &es_key, tid, deterministic);
             return logits.unsqueeze_dim::<4>(0);
         }
 
         if noiser.params.config.sigma == 0.0 {
             let logits = self.forward(tokens.clone());
-            return logits
-                .unsqueeze_dim::<4>(0)
-                .repeat_dim(0, pop);
+            return logits.unsqueeze_dim::<4>(0).repeat_dim(0, pop);
         }
 
         let [batch, time] = tokens.shape().dims();
@@ -189,21 +186,23 @@ impl<B: Backend> BDH<B> {
             }
             let x_sparse = activation::relu(x_latent);
 
-            let attn_q = x_sparse.clone().reshape([
-                pop * batch,
+            let attn_q =
+                x_sparse
+                    .clone()
+                    .reshape([pop * batch, self.n_head, time, latent_per_head]);
+            let attn_v = state.clone().reshape([pop * batch, 1, time, self.n_embd]);
+            let attn = self.attention.forward(attn_q, attn_v).reshape([
+                pop,
+                batch,
                 self.n_head,
                 time,
-                latent_per_head,
+                self.n_embd,
             ]);
-            let attn_v = state.clone().reshape([pop * batch, 1, time, self.n_embd]);
-            let attn = self
-                .attention
-                .forward(attn_q, attn_v)
-                .reshape([pop, batch, self.n_head, time, self.n_embd]);
             let attn = self.layer_norm(attn);
 
-            let attn_flat =
-                attn.clone().reshape([pop * batch, self.n_head, time, self.n_embd]);
+            let attn_flat = attn
+                .clone()
+                .reshape([pop * batch, self.n_head, time, self.n_embd]);
             let y_latent_all = noiser.do_stack_tmm_pop(
                 attn_flat,
                 &decoder_y,
@@ -233,8 +232,7 @@ impl<B: Backend> BDH<B> {
                 &es_key,
                 global_workers,
             );
-            let mlp_flat =
-                Self::slice_pop_blocks(mlp_flat_all, batch * time, pop);
+            let mlp_flat = Self::slice_pop_blocks(mlp_flat_all, batch * time, pop);
             let mlp_out = mlp_flat
                 .reshape([pop, batch, time, self.n_embd])
                 .unsqueeze_dim::<5>(2);
@@ -281,7 +279,13 @@ impl<B: Backend> BDH<B> {
         deterministic: bool,
     ) -> Tensor<B, 3> {
         let embed_out = if let (Some(n), Some(k), Some(tid)) = (noiser, es_key, thread_id) {
-            n.do_emb(&self.embed.weight.val(), &tokens, self.embed.weight.id, k, tid)
+            n.do_emb(
+                &self.embed.weight.val(),
+                &tokens,
+                self.embed.weight.id,
+                k,
+                tid,
+            )
         } else {
             self.embed.forward(tokens)
         };
@@ -308,7 +312,9 @@ impl<B: Backend> BDH<B> {
                     if let (Some(n), Some(k), Some(tid)) = (noiser, es_key, thread_id) {
                         n.do_stack_tmm(state.clone(), &decoder_x, self.decoder_x.id, k, tid)
                     } else {
-                        state.clone().matmul(decoder_x.clone().unsqueeze_dim::<4>(0))
+                        state
+                            .clone()
+                            .matmul(decoder_x.clone().unsqueeze_dim::<4>(0))
                     };
                 if self.kernel.relu_threshold != 0.0 {
                     x_latent = x_latent.sub_scalar(self.kernel.relu_threshold);
@@ -444,10 +450,7 @@ impl<B: Backend> BDH<B> {
             );
             indices = Tensor::cat(vec![indices, next_token.clone()], 1);
 
-            let logits_step = self.step(
-                next_token.reshape([1]),
-                &mut state,
-            );
+            let logits_step = self.step(next_token.reshape([1]), &mut state);
             let logits_step = logits_step.reshape([1, 1, vocab]);
             time = time.saturating_add(1);
             last_logits = logits_step
@@ -471,6 +474,17 @@ impl<B: Backend> BDH<B> {
         ModelState::new_recurrent(self.n_layer)
     }
 
+    pub fn init_state_pool(&self, max_streams: usize, device: &B::Device) -> ModelStatePool<B> {
+        ModelStatePool::new(
+            self.n_layer,
+            max_streams,
+            self.n_head,
+            self.latent_per_head_value(),
+            self.n_embd,
+            device,
+        )
+    }
+
     pub fn forward_recurrent(
         &self,
         tokens: Tensor<B, 2, Int>,
@@ -483,11 +497,7 @@ impl<B: Backend> BDH<B> {
         self.forward_with_state(tokens, state)
     }
 
-    pub fn step(
-        &self,
-        token: Tensor<B, 1, Int>,
-        state: &mut ModelState<B>,
-    ) -> Tensor<B, 2> {
+    pub fn step(&self, token: Tensor<B, 1, Int>, state: &mut ModelState<B>) -> Tensor<B, 2> {
         assert!(
             state.compressed,
             "step requires a recurrent state; call init_recurrent_state()"
@@ -515,14 +525,7 @@ impl<B: Backend> BDH<B> {
         es_key: &EsTreeKey,
         thread_id: u32,
     ) -> Tensor<B, 3> {
-        self.forward_with_state_and_noise_det(
-            tokens,
-            state,
-            noiser,
-            es_key,
-            thread_id,
-            true,
-        )
+        self.forward_with_state_and_noise_det(tokens, state, noiser, es_key, thread_id, true)
     }
 
     pub fn forward_with_state_and_noise_det(
@@ -544,6 +547,100 @@ impl<B: Backend> BDH<B> {
         )
     }
 
+    pub fn forward_with_state_pool(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        state: RecurrentStateView<B>,
+        deterministic: bool,
+    ) -> (Tensor<B, 3>, Vec<Tensor<B, 4>>) {
+        assert_eq!(
+            state.layers.len(),
+            self.n_layer,
+            "pooled state layers mismatch"
+        );
+
+        let embed_out = self.embed.forward(tokens);
+        let mut current = embed_out.unsqueeze_dim::<4>(1);
+        current = self.layer_norm(current);
+
+        let decoder_x = self.decoder_x.val();
+        let decoder_y = self.decoder_y.val();
+        let encoder = self.encoder.val();
+        let fused = self.kernel.enabled;
+        let latent_pattern: &BlockPattern1d = &self.kernel.block_sparse.latent;
+
+        let mut updated_states = Vec::with_capacity(self.n_layer);
+
+        for layer_state in state.layers.iter() {
+            let x_sparse = if fused {
+                relu_lowrank::fused_forward(
+                    current.clone(),
+                    decoder_x.clone().unsqueeze_dim::<4>(0),
+                    None,
+                    self.kernel.relu_threshold,
+                    latent_pattern,
+                )
+            } else {
+                let mut x_latent = current
+                    .clone()
+                    .matmul(decoder_x.clone().unsqueeze_dim::<4>(0));
+                if self.kernel.relu_threshold != 0.0 {
+                    x_latent = x_latent.sub_scalar(self.kernel.relu_threshold);
+                }
+                activation::relu(x_latent)
+            };
+
+            let (attn_ctx, new_state) = self.attention.forward_linear_stateful(
+                x_sparse.clone(),
+                current.clone(),
+                layer_state.clone(),
+                state.positions.clone(),
+            );
+            updated_states.push(new_state);
+            let attn = self.layer_norm(attn_ctx);
+
+            let y_sparse = if fused {
+                relu_lowrank::fused_forward(
+                    attn.clone(),
+                    decoder_y.clone().unsqueeze_dim::<4>(0),
+                    None,
+                    self.kernel.relu_threshold,
+                    latent_pattern,
+                )
+            } else {
+                let mut y_latent = attn.matmul(decoder_y.clone().unsqueeze_dim::<4>(0));
+                if self.kernel.relu_threshold != 0.0 {
+                    y_latent = y_latent.sub_scalar(self.kernel.relu_threshold);
+                }
+                activation::relu(y_latent)
+            };
+
+            let xy_sparse = x_sparse * y_sparse;
+            let xy_sparse = if deterministic {
+                xy_sparse
+            } else {
+                self.dropout.forward(xy_sparse)
+            };
+
+            let mixed = xy_sparse.clone().swap_dims(1, 2);
+            let [batch, time, heads, latent] = mixed.shape().dims();
+            let mixed_flat = mixed.reshape([batch * time, heads * latent]);
+
+            let mlp_flat = mixed_flat.matmul(encoder.clone());
+            let mlp_out = mlp_flat
+                .reshape([batch, time, self.n_embd])
+                .unsqueeze_dim::<4>(1);
+            let mlp_out = self.layer_norm(mlp_out);
+            current = self.layer_norm(current + mlp_out);
+        }
+
+        let [batch, _, time, dim] = current.shape().dims();
+        let logits_in = current.reshape([batch * time, dim]);
+        let logits = logits_in.matmul(self.lm_head.val()).reshape([batch, time, self.vocab_size]);
+
+        (logits, updated_states)
+    }
+
     fn forward_with_state_inner(
         &self,
         tokens: Tensor<B, 2, Int>,
@@ -559,7 +656,13 @@ impl<B: Backend> BDH<B> {
             "model state layers mismatch"
         );
         let embed_out = if let (Some(n), Some(k), Some(tid)) = (noiser, es_key, thread_id) {
-            n.do_emb(&self.embed.weight.val(), &tokens, self.embed.weight.id, k, tid)
+            n.do_emb(
+                &self.embed.weight.val(),
+                &tokens,
+                self.embed.weight.id,
+                k,
+                tid,
+            )
         } else {
             self.embed.forward(tokens)
         };
@@ -586,7 +689,9 @@ impl<B: Backend> BDH<B> {
                     if let (Some(n), Some(k), Some(tid)) = (noiser, es_key, thread_id) {
                         n.do_stack_tmm(current.clone(), &decoder_x, self.decoder_x.id, k, tid)
                     } else {
-                        current.clone().matmul(decoder_x.clone().unsqueeze_dim::<4>(0))
+                        current
+                            .clone()
+                            .matmul(decoder_x.clone().unsqueeze_dim::<4>(0))
                     };
                 if self.kernel.relu_threshold != 0.0 {
                     x_latent = x_latent.sub_scalar(self.kernel.relu_threshold);

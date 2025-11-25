@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use burn::optim::{AdamWConfig, GradientsParams, LearningRate, Optimizer};
@@ -8,9 +8,10 @@ use burn::tensor::backend::{AutodiffBackend, Backend as BackendTrait};
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_autodiff::Autodiff;
 use burn_dragon_hatchling::{
+    BDH, BDHConfig, BdhEsConfig, RecurrentStateStore, StreamHandle, bdh_param_specs,
     eggroll::{EggrollKey, EggrollNoiser, EsTreeKey},
-    bdh_param_specs, language_model_loss,
-    BDH, BDHConfig, BdhEsConfig, ModelState, StreamHandle, wgpu::init_runtime,
+    language_model_loss,
+    wgpu::init_runtime,
 };
 use burn_wgpu::Wgpu;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -69,6 +70,28 @@ fn stream_retain_bench(c: &mut Criterion) {
     run_stream_retain_backend::<Cuda<f32>, _>(c, "cuda", |_| {});
 }
 
+fn context_mode_bench(c: &mut Criterion) {
+    run_context_modes_backend::<Wgpu<f32>, _>(c, "wgpu", init_runtime);
+
+    #[cfg(feature = "cuda")]
+    run_context_modes_backend::<Cuda<f32>, _>(c, "cuda", |_| {});
+}
+
+fn init_backend_once<B, Init>(backend_name: &str, init_backend: Init, device: &<B as BackendTrait>::Device)
+where
+    B: BackendTrait,
+    Init: Fn(&<B as BackendTrait>::Device),
+{
+    static INIT_WGPU: Once = Once::new();
+    static INIT_CUDA: Once = Once::new();
+
+    match backend_name {
+        "wgpu" => INIT_WGPU.call_once(|| init_backend(device)),
+        "cuda" => INIT_CUDA.call_once(|| init_backend(device)),
+        _ => init_backend(device),
+    }
+}
+
 fn run_training_backend<B, Init>(c: &mut Criterion, backend_name: &'static str, init_backend: Init)
 where
     B: AutodiffBackend + Clone + 'static,
@@ -76,7 +99,7 @@ where
 {
     let device = <B as BackendTrait>::Device::default();
     <B as BackendTrait>::seed(&device, 42);
-    init_backend(&device);
+    init_backend_once::<B, _>(backend_name, init_backend, &device);
 
     let model_config = BDHConfig::default();
     let base_model = BDH::<B>::new(model_config.clone(), &device);
@@ -160,14 +183,13 @@ fn run_eggroll_forward_backend<B, Init>(
     c: &mut Criterion,
     backend_name: &'static str,
     init_backend: Init,
-)
-where
+) where
     B: BackendTrait + Clone + 'static,
     Init: Fn(&<B as BackendTrait>::Device),
 {
     let device = <B as BackendTrait>::Device::default();
     <B as BackendTrait>::seed(&device, 42);
-    init_backend(&device);
+    init_backend_once::<B, _>(backend_name, init_backend, &device);
 
     let model_config = BDHConfig::default();
     let mut es_cfg = BdhEsConfig::default();
@@ -187,8 +209,7 @@ where
         &device,
     );
 
-    let mut group =
-        c.benchmark_group(format!("bdh_forward_vs_eggroll/{backend_name}"));
+    let mut group = c.benchmark_group(format!("bdh_forward_vs_eggroll/{backend_name}"));
 
     for cfg in TRAIN_CONFIGS {
         let inputs = base_inputs
@@ -208,43 +229,30 @@ where
         log_theoretical_profile(&model_config, cfg);
         group.throughput(Throughput::Elements(cfg.batch as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("plain", cfg.name),
-            cfg,
-            |b, _| {
-                b.iter_custom(|iters| {
-                    let mut total = Duration::ZERO;
-                    for _ in 0..iters {
-                        let start = Instant::now();
-                        let _ = model.forward(inputs.clone());
-                        total += start.elapsed();
-                    }
-                    total
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("plain", cfg.name), cfg, |b, _| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let start = Instant::now();
+                    let _ = model.forward(inputs.clone());
+                    total += start.elapsed();
+                }
+                total
+            });
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("eggroll", cfg.name),
-            cfg,
-            |b, _| {
-                b.iter_custom(|iters| {
-                    let mut total = Duration::ZERO;
-                    for step in 0..iters {
-                        let es_step = es_key.clone().with_step(step as u64);
-                        let start = Instant::now();
-                        let _ = model.forward_with_noise(
-                            inputs.clone(),
-                            &noiser,
-                            &es_step,
-                            0,
-                        );
-                        total += start.elapsed();
-                    }
-                    total
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("eggroll", cfg.name), cfg, |b, _| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for step in 0..iters {
+                    let es_step = es_key.clone().with_step(step as u64);
+                    let start = Instant::now();
+                    let _ = model.forward_with_noise(inputs.clone(), &noiser, &es_step, 0);
+                    total += start.elapsed();
+                }
+                total
+            });
+        });
     }
 
     group.finish();
@@ -254,20 +262,19 @@ fn run_stream_retain_backend<B, Init>(
     c: &mut Criterion,
     backend_name: &'static str,
     init_backend: Init,
-)
-where
+) where
     B: BackendTrait + Clone + 'static,
     Init: Fn(&<B as BackendTrait>::Device),
 {
     let device = <B as BackendTrait>::Device::default();
     <B as BackendTrait>::seed(&device, 1337);
-    init_backend(&device);
+    init_backend_once::<B, _>(backend_name, init_backend, &device);
 
-    // Keep the benchmark small enough for quick iteration while still exercising attention.
+    // Keep the benchmark small enough for GPU memory while still exercising attention.
     let cfg = TrainConfig {
-        name: "stream_b8_t128",
-        batch: 8,
-        block: 128,
+        name: "stream_b4_t64",
+        batch: 4,
+        block: 32,
     };
 
     let total_tokens = cfg.batch * cfg.block;
@@ -283,17 +290,29 @@ where
 
     let model = BDH::<B>::new(BDHConfig::default(), &device);
 
-    let mut group =
-        c.benchmark_group(format!("bdh_stream_retain_pct/{backend_name}/{cfg_name}", cfg_name = cfg.name));
+    let mut group = c.benchmark_group(format!(
+        "bdh_stream_retain_pct/{backend_name}/{cfg_name}",
+        cfg_name = cfg.name
+    ));
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
     group.throughput(Throughput::Elements(cfg.batch as u64));
 
-    let pct_values = [0.0_f32, 0.25, 0.5, 1.0];
+    let pct_values = [0.0_f32, 0.25];
 
     for &pct in &pct_values {
         let handles_template = build_stream_handles(&model, cfg.batch, cfg.block, pct);
+        let max_ctx = Some(cfg.block); // keep stream states bounded per iter
+        let reset_state = true; // ensure per-iteration isolation for fair timing
 
         // Warm-up once to avoid including shader compilation.
-        let _ = forward_streaming(&model, inputs.clone(), handles_template.clone());
+        let _ = forward_streaming(
+            &model,
+            inputs.clone(),
+            handles_template.clone(),
+            max_ctx,
+            reset_state,
+        );
 
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("pct_{pct:.2}")),
@@ -304,7 +323,13 @@ where
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
                         let start = Instant::now();
-                        let _ = forward_streaming(&model, inputs.clone(), handles_template.clone());
+                        let _ = forward_streaming(
+                            &model,
+                            inputs.clone(),
+                            handles_template.clone(),
+                            max_ctx,
+                            reset_state,
+                        );
                         total += start.elapsed();
                     }
                     total
@@ -316,8 +341,112 @@ where
     group.finish();
 }
 
+#[derive(Clone, Copy)]
+struct ContextMode {
+    name: &'static str,
+    retain_pct: f32,
+    max_context: Option<usize>,
+    reset_each_iter: bool,
+}
+
+fn run_context_modes_backend<B, Init>(
+    c: &mut Criterion,
+    backend_name: &'static str,
+    init_backend: Init,
+) where
+    B: BackendTrait + Clone + 'static,
+    Init: Fn(&<B as BackendTrait>::Device),
+{
+    let force = std::env::var("BDH_RUN_STREAM_BENCH").unwrap_or_default() == "1";
+    if backend_name == "cuda" && !force {
+        eprintln!("Skipping cuda context_mode bench (cubecl fast_math divide-by-zero on this device). Set BDH_RUN_STREAM_BENCH=1 to force.");
+        return;
+    }
+
+    let device = <B as BackendTrait>::Device::default();
+    <B as BackendTrait>::seed(&device, 2024);
+    init_backend_once::<B, _>(backend_name, init_backend, &device);
+
+    // Mid-size batch/time to stress attention while keeping runtime acceptable.
+    let cfg = TrainConfig {
+        name: "ctx_b4_t128",
+        batch: 4,
+        block: 64,
+    };
+
+    let total_tokens = cfg.batch * cfg.block;
+    let mut base_input_tokens = Vec::with_capacity(total_tokens);
+    for idx in 0..total_tokens {
+        base_input_tokens.push((idx % 255) as i64);
+    }
+
+    let inputs = Tensor::<B, 2, Int>::from_data(
+        TensorData::new(base_input_tokens.clone(), [cfg.batch, cfg.block]),
+        &device,
+    );
+
+    let model = BDH::<B>::new(BDHConfig::default(), &device);
+    let modes = [
+        ContextMode {
+            name: "dense_no_stream",
+            retain_pct: 0.0,
+            max_context: None,
+            reset_each_iter: false,
+        },
+        ContextMode {
+            name: "stream_pct25_reset",
+            retain_pct: 0.25,
+            max_context: Some(cfg.block / 2),
+            reset_each_iter: true,
+        },
+    ];
+
+    let mut group = c.benchmark_group(format!(
+        "bdh_context_modes/{backend_name}/{cfg_name}",
+        cfg_name = cfg.name
+    ));
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.throughput(Throughput::Elements(cfg.batch as u64));
+
+    for mode in modes {
+        let handles_template =
+            build_stream_handles(&model, cfg.batch, cfg.block, mode.retain_pct);
+
+        // Warm-up to exclude shader compilation.
+        let _ = forward_streaming(
+            &model,
+            inputs.clone(),
+            handles_template.clone(),
+            mode.max_context,
+            mode.reset_each_iter,
+        );
+
+        group.bench_with_input(BenchmarkId::from_parameter(mode.name), &mode, |b, _| {
+            let handles_template = handles_template.clone();
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let start = Instant::now();
+                    let _ = forward_streaming(
+                        &model,
+                        inputs.clone(),
+                        handles_template.clone(),
+                        mode.max_context,
+                        mode.reset_each_iter,
+                    );
+                    total += start.elapsed();
+                }
+                total
+            })
+        });
+    }
+
+    group.finish();
+}
+
 fn build_stream_handles<B: BackendTrait>(
-    model: &BDH<B>,
+    _model: &BDH<B>,
     batch: usize,
     block: usize,
     retain_pct: f32,
@@ -325,14 +454,15 @@ fn build_stream_handles<B: BackendTrait>(
     let count = ((batch as f32) * retain_pct).round() as usize;
     let streams = count.min(batch);
     let mut handles = Vec::with_capacity(batch);
+    let pool = Arc::new(Mutex::new(RecurrentStateStore::new(streams)));
 
     for idx in 0..batch {
         if idx < streams {
-            let state = Arc::new(Mutex::new(Some(model.init_compressed_state())));
             handles.push(Some(StreamHandle {
                 id: idx as u64,
                 offset: idx * block,
-                state,
+                slot: idx,
+                pool: Arc::clone(&pool),
             }));
         } else {
             handles.push(None);
@@ -346,98 +476,100 @@ fn forward_streaming<B: BackendTrait>(
     model: &BDH<B>,
     inputs: Tensor<B, 2, Int>,
     handles: Vec<Option<StreamHandle<B>>>,
+    max_context: Option<usize>,
+    reset_state: bool,
 ) -> Tensor<B, 3> {
     if handles.iter().all(|h| h.is_none()) {
         return model.forward(inputs);
     }
 
-    let mut logits_by_index: Vec<(usize, Tensor<B, 3>)> =
-        Vec::with_capacity(inputs.shape().dims::<2>()[0]);
-    let mut fresh_indices = Vec::new();
-    let mut stream_entries = Vec::new();
+    let batch_size = inputs.shape().dims::<2>()[0];
+    let time = inputs.shape().dims::<2>()[1];
+    let device = inputs.device();
 
-    for (idx, entry) in handles.into_iter().enumerate() {
-        if let Some(handle) = entry {
-            stream_entries.push((idx, handle));
-        } else {
-            fresh_indices.push(idx);
-        }
+    let stream_indices: Vec<usize> = handles
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| entry.as_ref().map(|_| idx))
+        .collect();
+    let fresh_indices: Vec<usize> = handles
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| entry.is_none().then_some(idx))
+        .collect();
+
+    if stream_indices.is_empty() {
+        return model.forward(inputs);
     }
 
-    if !stream_entries.is_empty() {
-        let mut stream_inputs = Vec::with_capacity(stream_entries.len());
-        let mut stream_states = Vec::with_capacity(stream_entries.len());
-        let mut state_arcs = Vec::with_capacity(stream_entries.len());
+    let pool_handle = handles
+        .iter()
+        .find_map(|handle| handle.as_ref().map(|handle| Arc::clone(&handle.pool)))
+        .expect("stream pool available");
 
-        for (idx, handle) in &stream_entries {
-            let input_slice = inputs.clone().slice_dim(0, *idx..*idx + 1);
-            stream_inputs.push(input_slice);
+    let contiguous = stream_indices
+        .iter()
+        .copied()
+        .eq(0..stream_indices.len());
 
-            let mut guard = handle.state.lock().expect("lock stream state");
-            let state = guard
-                .take()
-                .unwrap_or_else(|| model.init_compressed_state());
-            stream_states.push(state);
-            state_arcs.push((*idx, Arc::clone(&handle.state)));
-        }
-
-        let stream_inputs_batched = if stream_inputs.len() == 1 {
-            stream_inputs
-                .first()
-                .expect("single stream input")
-                .clone()
-        } else {
-            Tensor::cat(stream_inputs.clone(), 0)
-        };
-
-        if let Some(mut stacked_state) = ModelState::try_stack(stream_states.clone()) {
-            let logits_stream =
-                model.forward_with_state(stream_inputs_batched, &mut stacked_state);
-            let updated_states = stacked_state.split(state_arcs.len());
-
-            for (pos, (idx, state_arc)) in state_arcs.into_iter().enumerate() {
-                let slice = logits_stream.clone().slice_dim(0, pos..pos + 1);
-                if let Some(updated) = updated_states.get(pos).cloned() {
-                    if let Ok(mut guard) = state_arc.lock() {
-                        *guard = Some(updated);
-                    }
-                }
-                logits_by_index.push((idx, slice));
-            }
-        } else {
-            for (idx, state_arc) in state_arcs {
-                if let Ok(mut guard) = state_arc.lock() {
-                    let mut state = guard
-                        .take()
-                        .unwrap_or_else(|| model.init_compressed_state());
-                    let input_slice = inputs.clone().slice_dim(0, idx..idx + 1);
-                    let logits = model.forward_with_state(input_slice, &mut state);
-                    *guard = Some(state);
-                    logits_by_index.push((idx, logits));
-                }
-            }
+    let mut pool_guard = pool_handle.lock().expect("lock stream pool");
+    let pool = pool_guard.ensure_pool(|max_streams| model.init_state_pool(max_streams, &device));
+    if reset_state {
+        for slot in 0..stream_indices.len() {
+            pool.reset_slot(slot);
         }
     }
+    let state_view = pool.prefix_view(stream_indices.len());
+    drop(pool_guard);
+
+    let stream_inputs = if contiguous {
+        inputs.clone().slice_dim(0, 0..stream_indices.len())
+    } else {
+        let mut slices = Vec::with_capacity(stream_indices.len());
+        for &idx in &stream_indices {
+            slices.push(inputs.clone().slice_dim(0, idx..idx + 1));
+        }
+        Tensor::cat(slices, 0)
+    };
+
+    let (logits_stream, updated_states) =
+        model.forward_with_state_pool(stream_inputs, state_view, false);
+
+    let mut logits_ordered: Vec<Option<Tensor<B, 3>>> = vec![None; batch_size];
+    for (pos, &idx) in stream_indices.iter().enumerate() {
+        logits_ordered[idx] = Some(logits_stream.clone().slice_dim(0, pos..pos + 1));
+    }
+
+    let mut pool_guard = pool_handle.lock().expect("lock stream pool");
+    let pool = pool_guard.ensure_pool(|max_streams| model.init_state_pool(max_streams, &device));
+    pool.write_prefix(stream_indices.len(), &updated_states, max_context, time);
+    drop(pool_guard);
 
     if !fresh_indices.is_empty() {
-        let mut fresh_inputs = Vec::with_capacity(fresh_indices.len());
-        for &idx in &fresh_indices {
-            fresh_inputs.push(inputs.clone().slice_dim(0, idx..idx + 1));
-        }
-        let fresh_inputs = if fresh_inputs.len() == 1 {
-            fresh_inputs.pop().expect("single fresh slice")
+        let fresh_inputs = if contiguous && stream_indices.len() < batch_size {
+            inputs
+                .clone()
+                .slice_dim(0, stream_indices.len()..batch_size)
+        } else if fresh_indices.len() == 1 {
+            inputs.clone().slice_dim(0, fresh_indices[0]..fresh_indices[0] + 1)
         } else {
-            Tensor::cat(fresh_inputs, 0)
+            let mut slices = Vec::with_capacity(fresh_indices.len());
+            for &idx in &fresh_indices {
+                slices.push(inputs.clone().slice_dim(0, idx..idx + 1));
+            }
+            Tensor::cat(slices, 0)
         };
+
         let logits_fresh = model.forward(fresh_inputs);
-        for (pos, &idx) in fresh_indices.iter().enumerate() {
-            let slice = logits_fresh.clone().slice_dim(0, pos..pos + 1);
-            logits_by_index.push((idx, slice));
+        for (pos, idx) in fresh_indices.into_iter().enumerate() {
+            logits_ordered[idx] = Some(logits_fresh.clone().slice_dim(0, pos..pos + 1));
         }
     }
 
-    logits_by_index.sort_by_key(|(idx, _)| *idx);
-    let ordered: Vec<_> = logits_by_index.into_iter().map(|(_, logits)| logits).collect();
+    let ordered: Vec<_> = logits_ordered
+        .into_iter()
+        .map(|item| item.expect("logits present"))
+        .collect();
     Tensor::cat(ordered, 0)
 }
 
@@ -480,6 +612,7 @@ criterion_group!(
     benches,
     training_step_bench,
     eggroll_forward_bench,
-    stream_retain_bench
+    stream_retain_bench,
+    context_mode_bench
 );
 criterion_main!(benches);
