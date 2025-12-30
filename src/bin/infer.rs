@@ -101,7 +101,7 @@ where
     let (checkpoint_base, epoch) =
         resolve_checkpoint_base(&checkpoint_dir, args.epoch, backend_name)?;
 
-    let mut model_config = build_model_config(&config.model);
+    let mut model_config = build_model_config(&config.model, config.training.block_size);
     model_config.vocab_size = tokenizer.len();
     let mut model = BDH::<B>::new(model_config, &device);
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
@@ -284,7 +284,7 @@ where
     Ok(())
 }
 
-fn build_model_config(overrides: &ModelOverrides) -> BDHConfig {
+fn build_model_config(overrides: &ModelOverrides, training_block_size: usize) -> BDHConfig {
     let mut model_config = BDHConfig::default();
 
     if let Some(n_layer) = overrides.n_layer {
@@ -305,9 +305,11 @@ fn build_model_config(overrides: &ModelOverrides) -> BDHConfig {
     if let Some(enabled) = overrides.fused_kernels {
         model_config.fused_kernels.enabled = enabled;
     }
-    if let Some(block) = overrides.block_size {
-        model_config.fused_kernels.set_block_sizes(block, block);
-    }
+    let block = overrides
+        .block_size
+        .unwrap_or(training_block_size)
+        .max(1);
+    model_config.fused_kernels.set_block_sizes(block, block);
     if let Some(use_alibi) = overrides.use_alibi {
         model_config.fused_kernels.set_use_alibi(use_alibi);
         if !use_alibi {

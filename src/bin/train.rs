@@ -200,7 +200,7 @@ where
     let training = &config.training;
     let optimizer_cfg = &config.optimizer;
 
-    let mut model_config = build_model_config(&config.model);
+    let mut model_config = build_model_config(&config.model, training.block_size);
     let tokenizer = dataset.tokenizer();
     model_config.vocab_size = tokenizer.len();
 
@@ -492,7 +492,7 @@ fn prepare_dataset(
     Ok(dataset)
 }
 
-fn build_model_config(overrides: &ModelOverrides) -> BDHConfig {
+fn build_model_config(overrides: &ModelOverrides, training_block_size: usize) -> BDHConfig {
     let mut model_config = BDHConfig::default();
 
     if let Some(n_layer) = overrides.n_layer {
@@ -513,9 +513,11 @@ fn build_model_config(overrides: &ModelOverrides) -> BDHConfig {
     if let Some(enabled) = overrides.fused_kernels {
         model_config.fused_kernels.enabled = enabled;
     }
-    if let Some(block) = overrides.block_size {
-        model_config.fused_kernels.set_block_sizes(block, block);
-    }
+    let block = overrides
+        .block_size
+        .unwrap_or(training_block_size)
+        .max(1);
+    model_config.fused_kernels.set_block_sizes(block, block);
     if let Some(use_alibi) = overrides.use_alibi {
         model_config.fused_kernels.set_use_alibi(use_alibi);
         if !use_alibi {

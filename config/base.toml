@@ -34,7 +34,7 @@ vocab_path = "vocab.json"
 
 [training]
 block_size = 512
-batch_size = 16
+batch_size = 32
 max_iters = 3000
 log_frequency = 100
 
@@ -61,6 +61,8 @@ n_head = 4
 mlp_internal_dim_multiplier = 64
 dropout = 0.1
 fused_kernels = true
+# block_size overrides fused-kernel tiling; if omitted, training.block_size is used.
+# block_size = 512
 use_alibi = true
 # rotary embedding: "pope" (default) or "rope"
 rotary_embedding = "pope"

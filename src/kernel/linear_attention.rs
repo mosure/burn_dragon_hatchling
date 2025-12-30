@@ -6,6 +6,8 @@ use burn::tensor::{Int, Tensor, activation};
 use super::block_sparse::BlockPattern2d;
 use crate::positional::RotaryEmbedding;
 
+const ROW_NORM_EPS: f32 = 1e-6;
+
 pub fn fused_state_aligned<B: Backend>(
     query: Tensor<B, 4>,
     value: Tensor<B, 4>,
@@ -50,6 +52,7 @@ pub fn fused_state_aligned<B: Backend>(
         let q_block = q_rot.clone().slice_dim(2, row_range.clone());
 
         let mut block_acc = Tensor::<B, 4>::zeros([batch, heads, row_len, dim_v], &device);
+        let mut row_norm = Tensor::<B, 4>::zeros([batch, heads, row_len, 1], &device);
 
         let cols = layout.iter_cols(row, total_blocks);
         if cols.is_empty() {
@@ -91,10 +94,13 @@ pub fn fused_state_aligned<B: Backend>(
 
             let v_block = value.clone().slice_dim(2, col_range);
 
+            row_norm = row_norm + scores.clone().abs().sum_dim(3);
             let contribution = scores.matmul(v_block);
             block_acc = block_acc + contribution;
         }
 
+        let denom = row_norm.add_scalar(ROW_NORM_EPS);
+        block_acc = block_acc / denom;
         outputs.push(block_acc);
     }
 

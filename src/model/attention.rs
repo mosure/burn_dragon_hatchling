@@ -8,6 +8,8 @@ use super::config::FusedKernelConfig;
 use crate::kernel::{BlockPattern2d, linear_attention};
 use crate::positional::RotaryEmbedding;
 
+const ROW_NORM_EPS: f32 = 1e-6;
+
 #[derive(Default, Debug, Clone)]
 pub struct AttentionCache<B: Backend> {
     q_rot: Option<Tensor<B, 4>>,
@@ -152,6 +154,7 @@ impl<B: Backend> Attention<B> {
         let k_rot = q_rot.clone();
 
         let scores = q_rot.matmul(k_rot.swap_dims(2, 3)).tril(-1);
+        let scores = Self::row_normalize(scores);
         let value = value.repeat_dim(1, self.n_head);
 
         scores.matmul(value)
@@ -209,6 +212,7 @@ impl<B: Backend> Attention<B> {
             };
 
             let scores = Tensor::cat(vec![scores_prev, scores_self], 3);
+            let scores = Self::row_normalize(scores);
 
             #[cfg(feature = "viz")]
             {
@@ -243,6 +247,7 @@ impl<B: Backend> Attention<B> {
                 let alibi = slopes * (pos_new - pos_row).tril(-1);
                 scores = scores + alibi;
             }
+            scores = Self::row_normalize(scores);
             #[cfg(feature = "viz")]
             {
                 let dims = scores.shape().dims::<4>();
@@ -265,6 +270,11 @@ impl<B: Backend> Attention<B> {
         }
 
         context
+    }
+
+    fn row_normalize(scores: Tensor<B, 4>) -> Tensor<B, 4> {
+        let denom = scores.clone().abs().sum_dim(3).add_scalar(ROW_NORM_EPS);
+        scores / denom
     }
 
     fn rope(&self, phases: Tensor<B, 4>, values: Tensor<B, 4>) -> Tensor<B, 4> {
