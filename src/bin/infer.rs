@@ -316,6 +316,11 @@ fn build_model_config(overrides: &ModelOverrides) -> BDHConfig {
                 .set_alibi_slopes(vec![0.0; model_config.n_head]);
         }
     }
+    if let Some(rotary_embedding) = overrides.rotary_embedding {
+        model_config
+            .fused_kernels
+            .set_rotary_embedding(rotary_embedding);
+    }
 
     model_config
 }

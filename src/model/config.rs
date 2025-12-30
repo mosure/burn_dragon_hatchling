@@ -5,6 +5,7 @@ use burn::module::{
 use burn::tensor::backend::{AutodiffBackend, Backend};
 
 use crate::kernel::{BlockPattern1d, BlockPattern2d, BlockSparseConfig};
+use crate::positional::RotaryEmbedding;
 
 #[derive(Clone, Debug)]
 pub struct FusedKernelConfig {
@@ -14,6 +15,7 @@ pub struct FusedKernelConfig {
     pub relu_threshold: f32,
     pub alibi_slopes: Option<Vec<f32>>,
     pub use_alibi: bool,
+    pub rotary_embedding: RotaryEmbedding,
 }
 
 impl Default for FusedKernelConfig {
@@ -25,6 +27,7 @@ impl Default for FusedKernelConfig {
             relu_threshold: 0.0,
             alibi_slopes: None,
             use_alibi: false,
+            rotary_embedding: RotaryEmbedding::default(),
         }
     }
 }
@@ -48,6 +51,10 @@ impl FusedKernelConfig {
 
     pub fn set_use_alibi(&mut self, enabled: bool) {
         self.use_alibi = enabled;
+    }
+
+    pub fn set_rotary_embedding(&mut self, rotary_embedding: RotaryEmbedding) {
+        self.rotary_embedding = rotary_embedding;
     }
 }
 
@@ -90,8 +97,9 @@ impl<B: AutodiffBackend> AutodiffModule<B> for FusedKernelConfig {
 impl ModuleDisplayDefault for FusedKernelConfig {
     fn content(&self, content: Content) -> Option<Content> {
         let summary = format!(
-            "enabled={}, use_alibi={}, relu_threshold={}, rope_theta={}, latent_block={}, time_block={}, custom_alibi={}",
+            "enabled={}, rotary_embedding={}, use_alibi={}, relu_threshold={}, rope_theta={}, latent_block={}, time_block={}, custom_alibi={}",
             self.enabled,
+            self.rotary_embedding,
             self.use_alibi,
             self.relu_threshold,
             self.rope_theta,

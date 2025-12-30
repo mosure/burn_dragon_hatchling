@@ -16,6 +16,8 @@ burn inference and training of [dragon hatchling](https://arxiv.org/abs/2509.265
 
 - [x] cached inference
 - [x] training benchmarks and reporting
+- [x] [pope](https://arxiv.org/abs/2509.10534v1) positional embeddings
+- [x] wasm deployments
 - [ ] adaptive tool discovery
 - [ ] conditional (deep) gating
 - [ ] document-coherent dataloading and scale mixup

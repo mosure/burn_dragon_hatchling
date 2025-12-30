@@ -2,10 +2,11 @@ use std::f32::consts::PI;
 
 use burn::module::Module;
 use burn::tensor::backend::Backend;
-use burn::tensor::{Int, Tensor};
+use burn::tensor::{Int, Tensor, activation};
 
 use super::config::FusedKernelConfig;
 use crate::kernel::{BlockPattern2d, linear_attention};
+use crate::positional::RotaryEmbedding;
 
 #[derive(Default, Debug, Clone)]
 pub struct AttentionCache<B: Backend> {
@@ -103,6 +104,7 @@ pub struct Attention<B: Backend> {
     block_pattern: BlockPattern2d,
     use_alibi: bool,
     alibi_slopes: Tensor<B, 1>,
+    rotary_embedding: RotaryEmbedding,
 }
 
 impl<B: Backend> Attention<B> {
@@ -112,7 +114,7 @@ impl<B: Backend> Attention<B> {
         device: &B::Device,
         kernel: &FusedKernelConfig,
     ) -> Self {
-        let freqs = Self::build_freqs(latent, kernel.rope_theta, device);
+        let freqs = Self::build_freqs(latent, kernel.rope_theta, kernel.rotary_embedding, device);
         let (use_alibi, alibi_slopes) = if kernel.enabled && kernel.use_alibi {
             let slopes = kernel
                 .alibi_slopes
@@ -130,6 +132,7 @@ impl<B: Backend> Attention<B> {
             block_pattern: kernel.block_sparse.time.clone(),
             use_alibi,
             alibi_slopes,
+            rotary_embedding: kernel.rotary_embedding,
         }
     }
 
@@ -141,6 +144,7 @@ impl<B: Backend> Attention<B> {
                 self.freqs.clone(),
                 self.use_alibi.then_some(self.alibi_slopes.clone()),
                 &self.block_pattern,
+                self.rotary_embedding,
             );
         }
 
@@ -281,6 +285,15 @@ impl<B: Backend> Attention<B> {
         values * cos + rotated * sin
     }
 
+    fn pope(&self, phases: Tensor<B, 4>, values: Tensor<B, 4>) -> Tensor<B, 4> {
+        let magnitude = activation::softplus(values, 1.0);
+        let cos = phases.clone().cos();
+        let sin = phases.sin();
+        let real = magnitude.clone() * cos;
+        let imag = magnitude * sin;
+        Tensor::cat(vec![real, imag], 3)
+    }
+
     fn rotate(&self, values: Tensor<B, 4>, start: usize) -> Tensor<B, 4> {
         let time = values.shape().dims::<4>()[2];
         let device = values.device();
@@ -290,14 +303,24 @@ impl<B: Backend> Attention<B> {
 
         let raw = positions * self.freqs.clone();
         let phases = (raw.clone() - raw.floor()) * (2.0 * PI);
-        self.rope(phases, values)
+        match self.rotary_embedding {
+            RotaryEmbedding::Rope => self.rope(phases, values),
+            RotaryEmbedding::Pope => self.pope(phases, values),
+        }
     }
 
-    fn build_freqs(latent: usize, theta: f32, device: &B::Device) -> Tensor<B, 4> {
+    fn build_freqs(
+        latent: usize,
+        theta: f32,
+        rotary_embedding: RotaryEmbedding,
+        device: &B::Device,
+    ) -> Tensor<B, 4> {
         let mut data = Vec::with_capacity(latent);
         for idx in 0..latent {
-            let quantized = (idx as f32 / 2.0).floor() * 2.0;
-            let exponent = quantized / latent as f32;
+            let exponent = match rotary_embedding {
+                RotaryEmbedding::Rope => ((idx as f32 / 2.0).floor() * 2.0) / latent as f32,
+                RotaryEmbedding::Pope => idx as f32 / latent as f32,
+            };
             let value = 1.0 / theta.powf(exponent) / (2.0 * PI);
             data.push(value);
         }

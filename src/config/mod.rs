@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 use crate::tokenizer::TokenizerConfig;
+use crate::positional::RotaryEmbedding;
 use toml::Value;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -181,6 +182,7 @@ pub struct ModelOverrides {
     pub fused_kernels: Option<bool>,
     pub use_alibi: Option<bool>,
     pub block_size: Option<usize>,
+    pub rotary_embedding: Option<RotaryEmbedding>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
