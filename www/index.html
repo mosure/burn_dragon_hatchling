@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>burn_dragon_hatchling</title>
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap");
+
+      :root {
+        color-scheme: dark;
+        --bg-0: #030304;
+        --bg-1: #0b1014;
+        --bg-2: #12161b;
+        --text: #e7e9ec;
+        --muted: #9aa3ad;
+        --accent: #6ef5d2;
+        --accent-2: #5fd0ff;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        color: var(--text);
+        font-family: "Space Mono", "JetBrains Mono", monospace;
+      }
+
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        background-image:
+          repeating-linear-gradient(
+            135deg,
+            rgba(255, 255, 255, 0.02) 0px,
+            rgba(255, 255, 255, 0.02) 1px,
+            transparent 1px,
+            transparent 4px
+          );
+        pointer-events: none;
+        mix-blend-mode: screen;
+      }
+
+      #output {
+        min-height: 100vh;
+        padding: clamp(24px, 5vw, 56px);
+        font-size: clamp(15px, 1.4vw, 18px);
+        line-height: 1.6;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      #overlay {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        background: rgba(3, 3, 4, 0.88);
+        backdrop-filter: blur(6px);
+        z-index: 10;
+        transition: opacity 0.4s ease;
+      }
+
+      #overlay.hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      .loader {
+        display: grid;
+        gap: 16px;
+        text-align: center;
+        color: var(--muted);
+        letter-spacing: 0.02em;
+      }
+
+      .spinner {
+        width: 56px;
+        height: 56px;
+        border-radius: 50%;
+        border: 3px solid rgba(110, 245, 210, 0.18);
+        border-top-color: var(--accent);
+        border-right-color: var(--accent-2);
+        animation: spin 1.1s linear infinite;
+        margin: 0 auto;
+        box-shadow: 0 0 24px rgba(110, 245, 210, 0.22);
+      }
+
+      .status {
+        font-size: 14px;
+        text-transform: uppercase;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="overlay">
+      <div class="loader">
+        <div class="spinner"></div>
+        <div class="status" id="status">booting inference runtime</div>
+      </div>
+    </div>
+    <div id="output"></div>
+
+    <script type="module">
+      import init, { loadModel } from "./out/burn_dragon_hatchling.js";
+
+      const overlay = document.getElementById("overlay");
+      const status = document.getElementById("status");
+      const output = document.getElementById("output");
+
+      const params = new URLSearchParams(window.location.search);
+      const modelUrl = params.get("model") || "./assets/model.bin";
+      const vocabUrl = params.get("vocab") || "./assets/vocab.json";
+      const configUrl = params.get("config") || "./assets/config.json";
+      // Config JSON: { "block_size": 256, "overrides": { "n_layer": 6, ... } }
+      const prompt =
+        params.get("prompt") ||
+        "dragon hatchlings dream in sparse pulses\n";
+      const maxTokens = Number(params.get("max_tokens") || 512);
+      const temperature = Number(params.get("temp") || 0.9);
+      const topKParam = params.get("top_k");
+      const topK = topKParam ? Number(topKParam) : undefined;
+      const windowParam = params.get("window");
+      const contextWindow = windowParam ? Number(windowParam) : undefined;
+
+      const cacheName = "bdh-cache-v2";
+
+      const setStatus = (text) => {
+        status.textContent = text;
+      };
+
+      const fetchCached = async (url, asText) => {
+        if (!url) {
+          return null;
+        }
+
+        if ("caches" in window) {
+          const cache = await caches.open(cacheName);
+          const cached = await cache.match(url);
+          if (cached) {
+            return asText ? cached.text() : cached.arrayBuffer();
+          }
+
+          const response = await fetch(url, { cache: "no-store" });
+          if (!response.ok) {
+            throw new Error(`failed to fetch ${url}: ${response.status}`);
+          }
+          cache.put(url, response.clone());
+          return asText ? response.text() : response.arrayBuffer();
+        }
+
+        const response = await fetch(url, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`failed to fetch ${url}: ${response.status}`);
+        }
+        return asText ? response.text() : response.arrayBuffer();
+      };
+
+      const scrollToBottom = () => {
+        window.scrollTo(0, document.body.scrollHeight);
+      };
+
+      const run = async () => {
+        setStatus("loading wasm runtime");
+        await init();
+
+        setStatus("downloading model weights");
+        const modelBytes = await fetchCached(modelUrl, false);
+
+        setStatus("loading vocab");
+        const vocabJson = await fetchCached(vocabUrl, true);
+
+        let configJson = null;
+        if (configUrl) {
+          setStatus("loading model config");
+          configJson = await fetchCached(configUrl, true);
+        }
+
+        setStatus("initializing model");
+        const engine = await loadModel(
+          new Uint8Array(modelBytes),
+          vocabJson,
+          configJson || undefined
+        );
+
+        overlay.classList.add("hidden");
+
+        const intro = engine.startStream(
+          prompt,
+          maxTokens,
+          temperature,
+          topK,
+          contextWindow
+        );
+        output.textContent = intro;
+        scrollToBottom();
+
+        const tokensPerFrame = 4;
+        let done = false;
+
+        const pump = async () => {
+          if (done) {
+            return;
+          }
+
+          try {
+            for (let i = 0; i < tokensPerFrame; i += 1) {
+              const chunk = await engine.nextChunk();
+              if (chunk === undefined) {
+                done = true;
+                return;
+              }
+              if (chunk.length) {
+                output.textContent += chunk;
+              }
+            }
+          } catch (err) {
+            done = true;
+            output.textContent = `error: ${err?.message || err}`;
+            return;
+          }
+
+          scrollToBottom();
+          requestAnimationFrame(() => {
+            void pump();
+          });
+        };
+
+        requestAnimationFrame(() => {
+          void pump();
+        });
+      };
+
+      run().catch((err) => {
+        overlay.classList.add("hidden");
+        output.textContent = `error: ${err?.message || err}`;
+      });
+    </script>
+  </body>
+</html>

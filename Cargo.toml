@@ -32,41 +32,60 @@ default-run = "train"
 
 
 [features]
-default = ["cuda", "viz"]
+default = ["cli", "cuda", "viz"]
 
 benchmark = ["burn/autotune", "burn/fusion"]
+cli = [
+  "train",
+  "dep:burn-autodiff",
+  "dep:burn-ndarray",
+  "dep:burn-train",
+  "dep:clap",
+]
+train = [
+  "dep:toml",
+  "dep:ureq",
+  "dep:hf-hub",
+  "dep:parquet",
+  "dep:tracing",
+]
 cuda = ["burn/cuda", "burn-cuda"]
+web = ["burn/webgpu", "burn-wgpu/webgpu"]
 viz = [
   "dep:crossbeam-channel",
   "dep:parking_lot",
   "dep:ndarray",
+  "dep:tempfile",
+  "dep:plotters",
+  "dep:plotters-bitmap",
+  "dep:burn-ndarray",
 ]
 
 
 [dependencies]
-toml = "0.9"
+toml = { version = "0.9", optional = true }
 rand = "0.8"
-ureq = { version = "2.9", features = ["tls"] }
-hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
-parquet = "53"
-burn-ndarray = "0.19"
-burn-autodiff = "0.19"
+ureq = { version = "2.9", features = ["tls"], optional = true }
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optional = true }
+parquet = { version = "53", optional = true }
+burn-ndarray = { version = "0.19", optional = true }
+burn-autodiff = { version = "0.19", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 indexmap = "2.5"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"], optional = true }
 anyhow = "1"
 crossbeam-channel = { version = "0.5", optional = true }
 parking_lot = { version = "0.12", optional = true }
 ndarray = { version = "0.16", optional = true }
-tempfile = "3"
-plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "line_series"] }
-plotters-bitmap = "0.3"
+tempfile = { version = "3", optional = true }
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "line_series"], optional = true }
+plotters-bitmap = { version = "0.3", optional = true }
 
 
 [dependencies.burn]
 version = "0.19"
-default-features = true
+default-features = false
 features = [
   # "autotune",
   "fusion",
@@ -75,12 +94,11 @@ features = [
   # "vulkan",
   # "webgpu",
   "wgpu",
-  "cuda",
 ]
 
 [dependencies.burn-wgpu]
 version = "0.19"
-default-features = true
+default-features = false
 features = [
   "fusion",
   "std",
@@ -113,6 +131,7 @@ features = [
 
 [dependencies.burn-train]
 version = "0.19"
+optional = true
 default-features = false
 features = [
   "tui",
@@ -120,6 +139,7 @@ features = [
 
 [dependencies.tracing]
 version = "0.1"
+optional = true
 
 [dependencies.burn-cuda]
 version = "0.19"
@@ -134,6 +154,10 @@ features = [
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1"
 wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
 
 
 [dependencies.web-sys]
@@ -152,6 +176,7 @@ features = [
 criterion = { version = "0.7", features = ["html_reports"] }
 futures-intrusive = { version = "0.5.0" }
 pollster = { version = "0.4.0" }
+tempfile = "3"
 
 
 [profile.dev.package."*"]
@@ -178,14 +203,22 @@ panic = "abort"
 
 [lib]
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "infer"
 path = "src/bin/infer.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "train"
 path = "src/bin/train.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "quantize"
+path = "src/bin/quantize.rs"
+required-features = ["cli"]
 
 [[bench]]
 name = "inference"

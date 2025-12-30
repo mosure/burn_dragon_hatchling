@@ -1,0 +1,51 @@
+name: deploy github pages
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+
+jobs:
+  deploy:
+    runs-on: macos-latest
+
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v3
+
+      - name: setup nightly rust toolchain with caching
+        uses: brndnmtthws/rust-action@v1
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy
+          enable-sccache: "false"
+
+      - name: install wasm32-unknown-unknown
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli
+
+      - name: build wasm artifacts
+        run: cargo build --target wasm32-unknown-unknown --release --no-default-features --features "web"
+
+      - name: generate bindings with wasm-bindgen
+        run: wasm-bindgen --out-dir ./www/out/ --target web ./target/wasm32-unknown-unknown/release/burn_dragon_hatchling.wasm
+
+      - name: copy assets
+        run: mkdir -p ./www/assets && cp -r ./assets/* ./www/assets/
+
+      - name: deploy to github pages
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          folder: ./www
+          branch: www

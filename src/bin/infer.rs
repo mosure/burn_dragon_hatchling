@@ -1,3 +1,4 @@
+
 use std::convert::TryFrom;
 #[cfg(feature = "viz")]
 use std::env;
@@ -7,15 +8,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, ValueEnum};
+use serde::Deserialize;
 
 use burn::module::Module;
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 use burn::tensor::backend::Backend;
 use burn_dragon_hatchling::wgpu::init_runtime;
 use burn_dragon_hatchling::{
-    BDH, BDHConfig, ContextStrategy, ContextStrategyConfig, GenerationConfig, ModelOverrides,
-    TrainingConfig, generate_text, load_training_config, prefill_state, resolve_context_strategy,
-    sample_next_token,
+    BDH, ContextStrategy, ContextStrategyConfig, GenerationConfig, ModelOverrides, TrainingConfig,
+    build_model_config, generate_text, load_training_config, prefill_state,
+    resolve_context_strategy, sample_next_token,
 };
 use burn_wgpu::Wgpu;
 
@@ -31,7 +33,7 @@ use burn_dragon_hatchling::viz::{VideoConfig, VideoLayout, Viz, VizMode, VizTarg
 #[cfg(feature = "viz")]
 use std::sync::Arc;
 
-fn main() {
+pub fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err:#}");
         std::process::exit(1);
@@ -42,7 +44,18 @@ fn run() -> Result<()> {
     let args = Args::parse();
     let mut config_paths = vec![PathBuf::from("config/base.toml")];
     config_paths.extend(args.config.clone());
-    let config = load_training_config(&config_paths)?;
+    let mut config = load_training_config(&config_paths)?;
+    if args.config.is_empty() {
+        let backend_name = backend_name(args.backend);
+        if let Some(config_path) = resolve_run_config_path(args.checkpoint.as_ref(), backend_name) {
+            let contents = fs::read_to_string(&config_path).with_context(|| {
+                format!("failed to read run config {}", config_path.display())
+            })?;
+            let run_config: RunConfigJson = serde_json::from_str(&contents)
+                .with_context(|| format!("failed to parse {}", config_path.display()))?;
+            apply_run_config(&mut config, &run_config);
+        }
+    }
 
     match args.backend {
         BackendArg::Wgpu => infer_backend::<Wgpu<f32>, _>(&config, &args, "wgpu", init_runtime),
@@ -284,49 +297,6 @@ where
     Ok(())
 }
 
-fn build_model_config(overrides: &ModelOverrides, training_block_size: usize) -> BDHConfig {
-    let mut model_config = BDHConfig::default();
-
-    if let Some(n_layer) = overrides.n_layer {
-        model_config.n_layer = n_layer;
-    }
-    if let Some(n_embd) = overrides.n_embd {
-        model_config.n_embd = n_embd;
-    }
-    if let Some(n_head) = overrides.n_head {
-        model_config.n_head = n_head;
-    }
-    if let Some(multiplier) = overrides.mlp_internal_dim_multiplier {
-        model_config.mlp_internal_dim_multiplier = multiplier;
-    }
-    if let Some(dropout) = overrides.dropout {
-        model_config.dropout = dropout;
-    }
-    if let Some(enabled) = overrides.fused_kernels {
-        model_config.fused_kernels.enabled = enabled;
-    }
-    let block = overrides
-        .block_size
-        .unwrap_or(training_block_size)
-        .max(1);
-    model_config.fused_kernels.set_block_sizes(block, block);
-    if let Some(use_alibi) = overrides.use_alibi {
-        model_config.fused_kernels.set_use_alibi(use_alibi);
-        if !use_alibi {
-            model_config
-                .fused_kernels
-                .set_alibi_slopes(vec![0.0; model_config.n_head]);
-        }
-    }
-    if let Some(rotary_embedding) = overrides.rotary_embedding {
-        model_config
-            .fused_kernels
-            .set_rotary_embedding(rotary_embedding);
-    }
-
-    model_config
-}
-
 #[cfg(feature = "viz")]
 fn build_layer_tap<B: Backend>(layer_index: u8, viz_state: LayerVizState<B>) -> LayerTap<B> {
     let head_rows = viz_state
@@ -524,6 +494,97 @@ fn format_checkpoint(base: &Path) -> String {
     path.display().to_string()
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct RunConfigJson {
+    #[serde(default)]
+    block_size: Option<usize>,
+    #[serde(default)]
+    overrides: ModelOverrides,
+}
+
+fn apply_run_config(config: &mut TrainingConfig, run_config: &RunConfigJson) {
+    let block_override = run_config
+        .block_size
+        .or(run_config.overrides.block_size)
+        .map(|value| value.max(1));
+    if let Some(block_size) = block_override {
+        config.training.block_size = block_size;
+    }
+    merge_model_overrides(&mut config.model, &run_config.overrides);
+}
+
+fn merge_model_overrides(base: &mut ModelOverrides, incoming: &ModelOverrides) {
+    if let Some(value) = incoming.n_layer {
+        base.n_layer = Some(value);
+    }
+    if let Some(value) = incoming.n_embd {
+        base.n_embd = Some(value);
+    }
+    if let Some(value) = incoming.n_head {
+        base.n_head = Some(value);
+    }
+    if let Some(value) = incoming.mlp_internal_dim_multiplier {
+        base.mlp_internal_dim_multiplier = Some(value);
+    }
+    if let Some(value) = incoming.dropout {
+        base.dropout = Some(value);
+    }
+    if let Some(value) = incoming.fused_kernels {
+        base.fused_kernels = Some(value);
+    }
+    if let Some(value) = incoming.use_alibi {
+        base.use_alibi = Some(value);
+    }
+    if let Some(value) = incoming.block_size {
+        base.block_size = Some(value);
+    }
+    if let Some(value) = incoming.rotary_embedding {
+        base.rotary_embedding = Some(value);
+    }
+}
+
+fn resolve_run_config_path(
+    checkpoint: Option<&PathBuf>,
+    backend_name: &str,
+) -> Option<PathBuf> {
+    let checkpoint_path = checkpoint
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("runs").join(backend_name).join("checkpoint"));
+    let mut candidates = Vec::new();
+
+    if checkpoint_path.is_dir() {
+        candidates.push(checkpoint_path.join("config.json"));
+        if checkpoint_path
+            .file_name()
+            .is_some_and(|name| name == "checkpoint")
+            && checkpoint_path.parent().is_some()
+        {
+            if let Some(parent) = checkpoint_path.parent() {
+                candidates.push(parent.join("config.json"));
+            }
+        }
+    } else if let Some(parent) = checkpoint_path.parent() {
+        candidates.push(parent.join("config.json"));
+        if parent
+            .file_name()
+            .is_some_and(|name| name == "checkpoint")
+            && parent.parent().is_some()
+        {
+            if let Some(grandparent) = parent.parent() {
+                candidates.push(grandparent.join("config.json"));
+            }
+        }
+    }
+
+    for path in candidates {
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -627,5 +688,12 @@ impl From<VizLayoutArg> for VideoLayout {
             VizLayoutArg::Plasticity => VideoLayout::Plasticity,
             VizLayoutArg::Scalefree => VideoLayout::ScaleFree,
         }
+    }
+}
+
+fn backend_name(backend: BackendArg) -> &'static str {
+    match backend {
+        BackendArg::Wgpu => "wgpu",
+        BackendArg::Cuda => "cuda",
     }
 }

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 
 use burn::data::dataloader::DataLoader;
@@ -41,9 +41,10 @@ use burn::record::{BinFileRecorder, FullPrecisionSettings};
 use burn_dragon_hatchling::wgpu::init_runtime;
 use burn_dragon_hatchling::{
     BDH, BDHConfig, Dataset, DatasetConfig, DatasetSplit, LearningRateScheduleConfig,
-    ModelOverrides, OptimizerConfig, RandomDataLoader, SequenceBatch, TrainingConfig,
-    TrainingHyperparameters, build_dataset, language_model_loss, load_training_config,
+    OptimizerConfig, RandomDataLoader, SequenceBatch, TrainingConfig, TrainingHyperparameters,
+    build_dataset, build_model_config, language_model_loss, load_training_config,
 };
+use serde::Serialize;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Train the Baby Dragon Hatchling model")]
@@ -139,7 +140,7 @@ impl<B: BackendTrait> ValidStep<SequenceBatch<B>, LanguageModelOutput<B>> for BD
     }
 }
 
-fn main() {
+pub fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err:#}");
         std::process::exit(1);
@@ -243,6 +244,7 @@ where
     let scheduler = resolve_lr_scheduler(optimizer_cfg, total_steps, &model_config)?;
 
     let run_dir = PathBuf::from("runs").join(backend_name);
+    write_run_config(config, &run_dir)?;
     let context = TrainEnvironment {
         run_dir: &run_dir,
         backend_name,
@@ -492,49 +494,6 @@ fn prepare_dataset(
     Ok(dataset)
 }
 
-fn build_model_config(overrides: &ModelOverrides, training_block_size: usize) -> BDHConfig {
-    let mut model_config = BDHConfig::default();
-
-    if let Some(n_layer) = overrides.n_layer {
-        model_config.n_layer = n_layer;
-    }
-    if let Some(n_embd) = overrides.n_embd {
-        model_config.n_embd = n_embd;
-    }
-    if let Some(n_head) = overrides.n_head {
-        model_config.n_head = n_head;
-    }
-    if let Some(multiplier) = overrides.mlp_internal_dim_multiplier {
-        model_config.mlp_internal_dim_multiplier = multiplier;
-    }
-    if let Some(dropout) = overrides.dropout {
-        model_config.dropout = dropout;
-    }
-    if let Some(enabled) = overrides.fused_kernels {
-        model_config.fused_kernels.enabled = enabled;
-    }
-    let block = overrides
-        .block_size
-        .unwrap_or(training_block_size)
-        .max(1);
-    model_config.fused_kernels.set_block_sizes(block, block);
-    if let Some(use_alibi) = overrides.use_alibi {
-        model_config.fused_kernels.set_use_alibi(use_alibi);
-        if !use_alibi {
-            model_config
-                .fused_kernels
-                .set_alibi_slopes(vec![0.0; model_config.n_head]);
-        }
-    }
-    if let Some(rotary_embedding) = overrides.rotary_embedding {
-        model_config
-            .fused_kernels
-            .set_rotary_embedding(rotary_embedding);
-    }
-
-    model_config
-}
-
 fn log_theoretical_profile(config: &BDHConfig, batch: usize, block: usize, backend: &str) {
     let batch = batch as u64;
     let time = block as u64;
@@ -559,4 +518,31 @@ fn log_theoretical_profile(config: &BDHConfig, batch: usize, block: usize, backe
         value = attn_value as f64 / 1e9,
         dec = decoder_matmul as f64 / 1e9,
     );
+}
+
+#[derive(Serialize)]
+struct WebConfigOutput {
+    block_size: usize,
+    overrides: burn_dragon_hatchling::ModelOverrides,
+}
+
+fn write_run_config(config: &TrainingConfig, run_dir: &Path) -> Result<()> {
+    fs::create_dir_all(run_dir)
+        .with_context(|| format!("failed to create run directory {}", run_dir.display()))?;
+
+    let block_size = config
+        .model
+        .block_size
+        .unwrap_or(config.training.block_size)
+        .max(1);
+    let output = WebConfigOutput {
+        block_size,
+        overrides: config.model.clone(),
+    };
+    let payload =
+        serde_json::to_string_pretty(&output).context("failed to serialize web config")?;
+    let path = run_dir.join("config.json");
+    fs::write(&path, payload)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
 }

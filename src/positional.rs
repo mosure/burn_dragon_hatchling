@@ -3,9 +3,9 @@ use burn::module::{
     ModuleVisitor,
 };
 use burn::tensor::backend::{AutodiffBackend, Backend};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Deserialize, Default)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RotaryEmbedding {
     Rope,

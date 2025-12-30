@@ -1,12 +1,18 @@
 pub mod byte;
 pub mod char_vocab;
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(feature = "train")]
+use std::path::{Path, PathBuf};
+
+#[cfg(feature = "train")]
 use anyhow::{Result, anyhow};
+#[cfg(feature = "train")]
 use byte::ByteTokenizer;
+#[cfg(feature = "train")]
 use char_vocab::CharVocab;
+#[cfg(feature = "train")]
 use serde::Deserialize;
 
 pub trait Tokenizer: Send + Sync {
@@ -23,6 +29,7 @@ pub trait Tokenizer: Send + Sync {
 
 pub type SharedTokenizer = Arc<dyn Tokenizer>;
 
+#[cfg(feature = "train")]
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct TokenizerConfig {
     #[serde(default)]
@@ -31,6 +38,7 @@ pub struct TokenizerConfig {
     pub kind: TokenizerKind,
 }
 
+#[cfg(feature = "train")]
 impl Default for TokenizerConfig {
     fn default() -> Self {
         Self {
@@ -40,6 +48,7 @@ impl Default for TokenizerConfig {
     }
 }
 
+#[cfg(feature = "train")]
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TokenizerKind {
@@ -47,12 +56,14 @@ pub enum TokenizerKind {
     Byte(ByteTokenizerConfig),
 }
 
+#[cfg(feature = "train")]
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct CharTokenizerConfig {
     #[serde(default = "default_true")]
     pub include_unknown: bool,
 }
 
+#[cfg(feature = "train")]
 impl Default for CharTokenizerConfig {
     fn default() -> Self {
         Self {
@@ -61,12 +72,14 @@ impl Default for CharTokenizerConfig {
     }
 }
 
+#[cfg(feature = "train")]
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ByteTokenizerConfig {
     #[serde(default = "default_true")]
     pub add_special_tokens: bool,
 }
 
+#[cfg(feature = "train")]
 impl Default for ByteTokenizerConfig {
     fn default() -> Self {
         Self {
@@ -75,6 +88,7 @@ impl Default for ByteTokenizerConfig {
     }
 }
 
+#[cfg(feature = "train")]
 impl TokenizerConfig {
     pub fn storage_path(&self, cache_dir: &Path) -> Option<PathBuf> {
         match &self.kind {
@@ -160,6 +174,7 @@ impl TokenizerConfig {
     }
 }
 
+#[cfg(feature = "train")]
 fn default_true() -> bool {
     true
 }

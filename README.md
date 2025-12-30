@@ -56,6 +56,7 @@ Dataset configuration (built-in presets and Hugging Face examples) is documented
 
 | `burn_dragon_hatchling` | `burn` |
 | :--                     | :--    |
+| `0.2`                   | `0.19` |
 | `0.1`                   | `0.18` |
 
 

@@ -1,6 +1,8 @@
 use std::any::Any;
 use std::collections::HashMap;
+#[cfg(feature = "train")]
 use std::fs;
+#[cfg(feature = "train")]
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
@@ -85,6 +87,7 @@ impl CharVocab {
         })
     }
 
+    #[cfg(feature = "train")]
     fn to_record(&self) -> CharVocabRecord {
         CharVocabRecord {
             chars: self.id2ch.clone(),
@@ -107,6 +110,7 @@ impl CharVocab {
         Ok(vocab)
     }
 
+    #[cfg(feature = "train")]
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -119,6 +123,7 @@ impl CharVocab {
         Ok(())
     }
 
+    #[cfg(feature = "train")]
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let data = fs::read_to_string(path)
@@ -126,6 +131,18 @@ impl CharVocab {
         let record: CharVocabRecord = serde_json::from_str(&data)
             .with_context(|| format!("failed to parse vocabulary {}", path.display()))?;
         Self::from_record(record)
+    }
+
+    pub fn from_json_str(data: &str) -> Result<Self> {
+        let record: CharVocabRecord =
+            serde_json::from_str(data).context("failed to parse vocabulary json")?;
+        Self::from_record(record)
+    }
+
+    pub fn from_json_bytes(data: &[u8]) -> Result<Self> {
+        let text =
+            std::str::from_utf8(data).context("vocabulary data was not valid utf-8")?;
+        Self::from_json_str(text)
     }
 
     pub fn encode(&self, s: &str, add_bos: bool, add_eos: bool) -> Vec<u32> {
@@ -259,7 +276,7 @@ impl super::Tokenizer for CharVocab {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "train"))]
 mod tests {
     use super::*;
     use std::io;
