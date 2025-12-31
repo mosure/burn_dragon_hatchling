@@ -1,12 +1,9 @@
-#[cfg(feature = "viz")]
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
 
-use super::attention::AttentionCache;
-
 #[derive(Debug, Clone)]
 pub struct LayerState<B: Backend> {
-    pub attention: AttentionCache<B>,
+    pub rho: Option<Tensor<B, 4>>,
     #[cfg(feature = "viz")]
     pub viz: Option<LayerVizState<B>>,
 }
@@ -30,7 +27,7 @@ impl<B: Backend> ModelState<B> {
         Self {
             layers: (0..num_layers)
                 .map(|_| LayerState {
-                    attention: AttentionCache::new(),
+                    rho: None,
                     #[cfg(feature = "viz")]
                     viz: None,
                 })
@@ -41,16 +38,13 @@ impl<B: Backend> ModelState<B> {
 
     pub fn reset(&mut self) {
         for layer in &mut self.layers {
-            layer.attention.reset();
+            layer.rho = None;
         }
         self.position = 0;
     }
 
     pub fn len(&self) -> usize {
-        self.layers
-            .first()
-            .map(|layer| layer.attention.len())
-            .unwrap_or(0)
+        self.position
     }
 
     pub fn is_empty(&self) -> bool {
@@ -58,10 +52,7 @@ impl<B: Backend> ModelState<B> {
     }
 
     pub fn trim(&mut self, max_len: usize) {
-        for layer in &mut self.layers {
-            layer.attention.retain_last(max_len);
-        }
-        self.position = self.len().min(max_len);
+        let _ = max_len;
     }
 
     #[cfg(feature = "viz")]

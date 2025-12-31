@@ -8,6 +8,8 @@ pub struct TrainingHyperparameters {
     pub batch_size: usize,
     pub max_iters: usize,
     pub log_frequency: usize,
+    #[serde(default)]
+    pub fast_train: bool,
     #[serde(default = "default_context_strategy")]
     pub context_strategy: ContextStrategyConfig,
 }
@@ -42,7 +44,6 @@ pub struct ModelOverrides {
     pub mlp_internal_dim_multiplier: Option<usize>,
     pub dropout: Option<f64>,
     pub fused_kernels: Option<bool>,
-    pub use_alibi: Option<bool>,
     pub block_size: Option<usize>,
     pub rotary_embedding: Option<RotaryEmbedding>,
 }

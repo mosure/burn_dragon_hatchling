@@ -41,6 +41,7 @@ cli = [
   "dep:burn-ndarray",
   "dep:burn-train",
   "dep:clap",
+  "dep:names",
 ]
 train = [
   "dep:toml",
@@ -52,13 +53,7 @@ train = [
 cuda = ["burn/cuda", "burn-cuda"]
 web = ["burn/webgpu", "burn-wgpu/webgpu"]
 viz = [
-  "dep:crossbeam-channel",
-  "dep:parking_lot",
-  "dep:ndarray",
-  "dep:tempfile",
-  "dep:plotters",
-  "dep:plotters-bitmap",
-  "dep:burn-ndarray",
+  # "dep:bevy",
 ]
 
 
@@ -81,6 +76,7 @@ ndarray = { version = "0.16", optional = true }
 tempfile = { version = "3", optional = true }
 plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "line_series"], optional = true }
 plotters-bitmap = { version = "0.3", optional = true }
+names = { version = "0.14", optional = true }
 
 
 [dependencies.burn]

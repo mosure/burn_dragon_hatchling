@@ -8,6 +8,8 @@ use burn_ndarray::NdArray;
 
 type Backend = NdArray<f32>;
 
+const ROW_NORM_EPS: f32 = 1e-6;
+
 fn assert_close(lhs: Tensor<Backend, 4>, rhs: Tensor<Backend, 4>, atol: f32, rtol: f32) {
     let lhs_data = lhs
         .to_data()
@@ -98,6 +100,8 @@ fn fused_attention_matches_reference_when_alibi_disabled() {
     let q_rot = rope(phases.clone(), query.clone());
     let k_rot = q_rot.clone();
     let scores = q_rot.matmul(k_rot.swap_dims(2, 3)).tril(-1);
+    let denom = scores.clone().abs().sum_dim(3).add_scalar(ROW_NORM_EPS);
+    let scores = scores / denom;
     let repeated_value = value.clone().repeat_dim(1, heads);
     let reference = scores.matmul(repeated_value);
 
@@ -147,6 +151,8 @@ fn fused_attention_matches_reference_with_pope() {
     let q_rot = pope(phases.clone(), query.clone());
     let k_rot = q_rot.clone();
     let scores = q_rot.matmul(k_rot.swap_dims(2, 3)).tril(-1);
+    let denom = scores.clone().abs().sum_dim(3).add_scalar(ROW_NORM_EPS);
+    let scores = scores / denom;
     let repeated_value = value.clone().repeat_dim(1, heads);
     let reference = scores.matmul(repeated_value);
 
@@ -174,8 +180,13 @@ fn build_freqs(
         let exponent = match rotary_embedding {
             RotaryEmbedding::Rope => ((idx as f32 / 2.0).floor() * 2.0) / latent as f32,
             RotaryEmbedding::Pope => idx as f32 / latent as f32,
+            RotaryEmbedding::Alibi => 0.0,
         };
-        let value = 1.0 / theta.powf(exponent) / (2.0 * PI);
+        let value = if matches!(rotary_embedding, RotaryEmbedding::Alibi) {
+            0.0
+        } else {
+            1.0 / theta.powf(exponent) / (2.0 * PI)
+        };
         data.push(value);
     }
     Tensor::<Backend, 1>::from_floats(data.as_slice(), device).reshape([1, 1, 1, latent])

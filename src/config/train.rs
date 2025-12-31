@@ -276,10 +276,10 @@ mod tests {
             "n_layer = 6",
             "n_embd = 256",
             "n_head = 4",
-            "mlp_internal_dim_multiplier = 128",
+            "mlp_internal_dim_multiplier = 4",
             "dropout = 0.1",
             "fused_kernels = false",
-            "use_alibi = false",
+            "rotary_embedding = \"alibi\"",
         ]
         .join("\n");
         let base = write_config(dir.path(), "base.toml", &base_contents);
@@ -313,6 +313,7 @@ mod tests {
                 batch_size: 16,
                 max_iters: 2000,
                 log_frequency: 50,
+                fast_train: false,
                 context_strategy: ContextStrategyConfig::Infinite,
             }
         );
@@ -344,11 +345,11 @@ mod tests {
         assert_eq!(config.model.n_layer, Some(6));
         assert_eq!(config.model.n_embd, Some(320));
         assert_eq!(config.model.n_head, Some(4));
-        assert_eq!(config.model.mlp_internal_dim_multiplier, Some(128));
+        assert_eq!(config.model.mlp_internal_dim_multiplier, Some(4));
         assert_eq!(config.model.dropout, Some(0.1));
         assert_eq!(config.model.fused_kernels, Some(true));
         assert_eq!(config.model.block_size, Some(256));
-        assert_eq!(config.model.use_alibi, Some(false));
+        assert_eq!(config.model.rotary_embedding, Some(crate::positional::RotaryEmbedding::Alibi));
     }
 
     #[test]

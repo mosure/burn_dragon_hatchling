@@ -1,7 +1,5 @@
 
 use std::convert::TryFrom;
-#[cfg(feature = "viz")]
-use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -24,14 +22,6 @@ use burn_wgpu::Wgpu;
 #[cfg(feature = "cuda")]
 use burn_cuda::Cuda;
 
-#[cfg(feature = "viz")]
-use burn_dragon_hatchling::model::LayerVizState;
-#[cfg(feature = "viz")]
-use burn_dragon_hatchling::viz::collect::{CollectKnobs, HeadRow, LayerTap, StepTaps, to_frame};
-#[cfg(feature = "viz")]
-use burn_dragon_hatchling::viz::{VideoConfig, VideoLayout, Viz, VizMode, VizTargetConfig};
-#[cfg(feature = "viz")]
-use std::sync::Arc;
 
 pub fn main() {
     if let Err(err) = run() {
@@ -110,7 +100,7 @@ where
     let checkpoint_dir = args
         .checkpoint
         .clone()
-        .unwrap_or_else(|| PathBuf::from("runs").join(backend_name).join("checkpoint"));
+        .unwrap_or_else(|| default_checkpoint_dir(backend_name));
     let (checkpoint_base, epoch) =
         resolve_checkpoint_base(&checkpoint_dir, args.epoch, backend_name)?;
 
@@ -151,25 +141,6 @@ where
         let prompt_tokens: Vec<i64> = prompt_ids.iter().map(|&id| id as i64).collect();
         let prompt_ids_u32: Vec<u32> = prompt_ids.to_vec();
 
-        #[cfg(feature = "viz")]
-        let viz = {
-            let env_enabled = env::var("BDH_VIZ")
-                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if args.viz || env_enabled {
-                let targets = build_viz_targets(args);
-                if targets.is_empty() {
-                    Viz::new(VizMode::Off)
-                } else {
-                    Viz::new(VizMode::Targets(targets))
-                }
-            } else {
-                Viz::new(VizMode::Off)
-            }
-        };
-        #[cfg(feature = "viz")]
-        let mut viz_step_counter = prompt_tokens.len() as u32;
-
         let mut writer = io::stdout();
         let prompt_text = tokenizer.decode(&prompt_ids_u32);
         writer
@@ -190,13 +161,6 @@ where
             state.trim(window);
         }
 
-        #[cfg(feature = "viz")]
-        let collect_knobs = CollectKnobs {
-            k_attn: 32,
-            k_neuron: 16,
-            probes: Vec::new(),
-        };
-
         for _ in 0..generation.max_tokens {
             let (next, logits) = sample_next_token(
                 &model,
@@ -211,15 +175,10 @@ where
             if let Ok(token_u32) = u32::try_from(next) {
                 generated_ids.push(token_u32);
                 let decoded = tokenizer.decode(&generated_ids);
-                #[cfg(feature = "viz")]
-                let mut viz_token_text: Option<String> = None;
+
                 if decoded.len() > last_print_len {
                     let new_text = &decoded[last_print_len..];
                     if !new_text.is_empty() {
-                        #[cfg(feature = "viz")]
-                        {
-                            viz_token_text = Some(new_text.to_string());
-                        }
                         if let Err(err) = writer.write_all(new_text.as_bytes()) {
                             stream_err = Some(anyhow!("failed to write streamed token: {err}"));
                             break;
@@ -231,33 +190,6 @@ where
                         }
                     }
                     last_print_len = decoded.len();
-                }
-
-                #[cfg(feature = "viz")]
-                if viz.enabled() {
-                    let token_text = viz_token_text.unwrap_or_else(|| {
-                        let single = [token_u32];
-                        tokenizer.decode(&single)
-                    });
-                    let layer_states = state.take_viz();
-                    let layer_taps = layer_states
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(idx, opt)| {
-                            opt.map(|viz_state| build_layer_tap::<B>(idx as u8, viz_state))
-                        })
-                        .collect::<Vec<_>>();
-                    if !layer_taps.is_empty() {
-                        let step = StepTaps {
-                            t: viz_step_counter,
-                            token_id: token_u32,
-                            token_text,
-                            layers: layer_taps,
-                        };
-                        let frame = to_frame(step, &collect_knobs);
-                        viz.push(frame);
-                        viz_step_counter = viz_step_counter.saturating_add(1);
-                    }
                 }
             }
 
@@ -297,84 +229,6 @@ where
     Ok(())
 }
 
-#[cfg(feature = "viz")]
-fn build_layer_tap<B: Backend>(layer_index: u8, viz_state: LayerVizState<B>) -> LayerTap<B> {
-    let head_rows = viz_state
-        .attn_rows
-        .into_iter()
-        .enumerate()
-        .map(|(idx, tensor)| HeadRow {
-            w: tensor,
-            head: idx as u8,
-        })
-        .collect::<Vec<_>>();
-
-    let synapses = viz_state.synapses;
-    let dims = synapses.shape().dims::<2>();
-    let syn_rows = dims[0];
-    let syn_cols = dims[1];
-    let syn_data = Arc::new(
-        synapses
-            .to_data()
-            .convert::<f32>()
-            .into_vec::<f32>()
-            .unwrap_or_else(|_| Vec::new()),
-    );
-
-    let rows = syn_rows;
-    let cols = syn_cols;
-    let values = syn_data.clone();
-    let syn_readout = Box::new(move |pairs: &[(u32, u32)]| -> Vec<(u32, u32, f32)> {
-        pairs
-            .iter()
-            .filter_map(|(row, col)| {
-                let r = *row as usize;
-                let c = *col as usize;
-                if r < rows && c < cols {
-                    let idx = r * cols + c;
-                    Some((*row, *col, values[idx]))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }) as Box<dyn Fn(&[(u32, u32)]) -> Vec<(u32, u32, f32)> + Send + Sync>;
-
-    LayerTap {
-        layer: layer_index,
-        attn_rows: head_rows,
-        neurons: viz_state.neurons,
-        syn_readout,
-    }
-}
-
-#[cfg(feature = "viz")]
-fn build_viz_targets(args: &Args) -> Vec<VizTargetConfig> {
-    use std::collections::HashSet;
-
-    let mut targets = Vec::new();
-    let mut seen = HashSet::new();
-    let layouts = if args.viz_layouts.is_empty() {
-        vec![VizLayoutArg::Timeline]
-    } else {
-        args.viz_layouts.clone()
-    };
-
-    for layout in layouts {
-        if !seen.insert(layout) {
-            continue;
-        }
-        let mut config = match layout {
-            VizLayoutArg::Timeline => VideoConfig::new(args.viz_output.clone()),
-            VizLayoutArg::Plasticity => VideoConfig::new(args.viz_plasticity_output.clone()),
-            VizLayoutArg::Scalefree => VideoConfig::new(args.viz_scalefree_output.clone()),
-        };
-        config.layout = layout.into();
-        targets.push(VizTargetConfig::Video(config));
-    }
-
-    targets
-}
 
 fn apply_generation_overrides(generation: &mut GenerationConfig, args: &Args, block_size: usize) {
     if let Some(prompt) = &args.prompt {
@@ -532,9 +386,6 @@ fn merge_model_overrides(base: &mut ModelOverrides, incoming: &ModelOverrides) {
     if let Some(value) = incoming.fused_kernels {
         base.fused_kernels = Some(value);
     }
-    if let Some(value) = incoming.use_alibi {
-        base.use_alibi = Some(value);
-    }
     if let Some(value) = incoming.block_size {
         base.block_size = Some(value);
     }
@@ -549,7 +400,7 @@ fn resolve_run_config_path(
 ) -> Option<PathBuf> {
     let checkpoint_path = checkpoint
         .cloned()
-        .unwrap_or_else(|| PathBuf::from("runs").join(backend_name).join("checkpoint"));
+        .unwrap_or_else(|| default_checkpoint_dir(backend_name));
     let mut candidates = Vec::new();
 
     if checkpoint_path.is_dir() {
@@ -583,6 +434,23 @@ fn resolve_run_config_path(
     }
 
     None
+}
+
+fn default_checkpoint_dir(backend_name: &str) -> PathBuf {
+    resolve_latest_run_dir(backend_name)
+        .map(|dir| dir.join("checkpoint"))
+        .unwrap_or_else(|| PathBuf::from("runs").join(backend_name).join("checkpoint"))
+}
+
+fn resolve_latest_run_dir(backend_name: &str) -> Option<PathBuf> {
+    let run_root = PathBuf::from("runs").join(backend_name);
+    let latest_path = run_root.join("latest");
+    let contents = fs::read_to_string(&latest_path).ok()?;
+    let name = contents.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(run_root.join(name))
 }
 
 #[derive(Parser, Debug)]
@@ -625,39 +493,10 @@ struct Args {
     /// Stream tokens to stdout as they are generated.
     #[arg(long)]
     streaming: bool,
-    #[cfg(feature = "viz")]
-    /// Enable per-token visualization when compiled with `--features viz`.
+    /// whether or not to spawn visualization app, wgpu only
     #[arg(long)]
+    #[cfg(feature = "viz")]
     viz: bool,
-    #[cfg(feature = "viz")]
-    /// Output path for the visualization MP4 when `--viz` or `BDH_VIZ=1` is used.
-    #[arg(long, value_name = "PATH", default_value_os_t = PathBuf::from("runs/viz/output.mp4"))]
-    viz_output: PathBuf,
-    #[cfg(feature = "viz")]
-    /// Output path for the plasticity-focused visualization when enabled via `--viz-layouts`.
-    #[arg(
-        long,
-        value_name = "PATH",
-        default_value_os_t = PathBuf::from("runs/viz/plasticity.mp4")
-    )]
-    viz_plasticity_output: PathBuf,
-    #[cfg(feature = "viz")]
-    /// Output path for the scale-free visualization when enabled via `--viz-layouts`.
-    #[arg(
-        long,
-        value_name = "PATH",
-        default_value_os_t = PathBuf::from("runs/viz/scale_free.mp4")
-    )]
-    viz_scalefree_output: PathBuf,
-    #[cfg(feature = "viz")]
-    /// Comma-separated visualization layouts (`timeline`, `plasticity`, `scalefree`) to render when `--viz` is set.
-    #[arg(
-        long,
-        value_name = "LAYOUTS",
-        value_delimiter = ',',
-        default_value = "timeline,plasticity,scalefree"
-    )]
-    viz_layouts: Vec<VizLayoutArg>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -672,24 +511,6 @@ enum ContextModeArg {
     Sliding,
 }
 
-#[cfg(feature = "viz")]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, ValueEnum)]
-enum VizLayoutArg {
-    Timeline,
-    Plasticity,
-    Scalefree,
-}
-
-#[cfg(feature = "viz")]
-impl From<VizLayoutArg> for VideoLayout {
-    fn from(value: VizLayoutArg) -> Self {
-        match value {
-            VizLayoutArg::Timeline => VideoLayout::Timeline,
-            VizLayoutArg::Plasticity => VideoLayout::Plasticity,
-            VizLayoutArg::Scalefree => VideoLayout::ScaleFree,
-        }
-    }
-}
 
 fn backend_name(backend: BackendArg) -> &'static str {
     match backend {

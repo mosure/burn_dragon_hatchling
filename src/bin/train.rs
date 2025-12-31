@@ -3,9 +3,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use names::Generator;
 
 use burn::data::dataloader::DataLoader;
 use burn::lr_scheduler::{
@@ -77,6 +80,12 @@ enum BackendArg {
     Wgpu,
 }
 
+static FAST_TRAIN: AtomicBool = AtomicBool::new(false);
+
+fn fast_train_enabled() -> bool {
+    FAST_TRAIN.load(Ordering::Relaxed)
+}
+
 #[derive(Clone)]
 struct LanguageModelOutput<B: BackendTrait> {
     loss: Tensor<B, 1>,
@@ -124,7 +133,11 @@ type ValidBackend<B> = <B as AutodiffBackend>::InnerBackend;
 
 impl<B: AutodiffBackend> TrainStep<SequenceBatch<B>, LanguageModelTrainItem<B>> for BDH<B> {
     fn step(&self, batch: SequenceBatch<B>) -> TrainOutput<LanguageModelTrainItem<B>> {
-        let logits = self.forward(batch.inputs);
+        let logits = if fast_train_enabled() {
+            self.forward_fast(batch.inputs)
+        } else {
+            self.forward(batch.inputs)
+        };
         let loss = language_model_loss::<B>(logits, batch.targets);
         let grads = loss.backward();
 
@@ -134,7 +147,11 @@ impl<B: AutodiffBackend> TrainStep<SequenceBatch<B>, LanguageModelTrainItem<B>> 
 
 impl<B: BackendTrait> ValidStep<SequenceBatch<B>, LanguageModelOutput<B>> for BDH<B> {
     fn step(&self, batch: SequenceBatch<B>) -> LanguageModelOutput<B> {
-        let logits = self.forward(batch.inputs);
+        let logits = if fast_train_enabled() {
+            self.forward_fast(batch.inputs)
+        } else {
+            self.forward(batch.inputs)
+        };
         let loss = language_model_loss::<B>(logits, batch.targets);
         LanguageModelOutput::new(loss)
     }
@@ -153,6 +170,7 @@ fn run() -> Result<()> {
     let mut config_paths = vec![PathBuf::from("config/base.toml")];
     config_paths.extend(args.train.config.clone());
     let config = load_training_config(&config_paths)?;
+    FAST_TRAIN.store(config.training.fast_train, Ordering::Relaxed);
 
     if matches!(args.command, Some(Command::BuildVocab)) {
         build_vocab_only(&config)?;
@@ -243,10 +261,14 @@ where
     );
     let scheduler = resolve_lr_scheduler(optimizer_cfg, total_steps, &model_config)?;
 
-    let run_dir = PathBuf::from("runs").join(backend_name);
-    write_run_config(config, &run_dir)?;
+    let run_root = PathBuf::from("runs").join(backend_name);
+    let (run_dir, run_name) = create_run_dir(&run_root)?;
+    write_latest_run(&run_root, &run_name)?;
+    write_run_config(config, &run_dir, &run_name)?;
+    info!("run name: {run_name}");
     let context = TrainEnvironment {
         run_dir: &run_dir,
+        run_name: &run_name,
         backend_name,
         training,
         model_config: &model_config,
@@ -314,6 +336,7 @@ where
     B::Device: Clone,
 {
     run_dir: &'a Path,
+    run_name: &'a str,
     backend_name: &'a str,
     training: &'a TrainingHyperparameters,
     model_config: &'a BDHConfig,
@@ -344,6 +367,8 @@ where
         .metric_valid_numeric(LossMetric::<ValidBackend<B>>::new())
         .metric_train_numeric(LearningRateMetric::new())
         .summary();
+
+    info!("run name: {}", env.run_name);
 
     let learner = builder.build(model, optimizer, scheduler);
 
@@ -520,13 +545,44 @@ fn log_theoretical_profile(config: &BDHConfig, batch: usize, block: usize, backe
     );
 }
 
+fn create_run_dir(run_root: &Path) -> Result<(PathBuf, String)> {
+    let mut generator = Generator::default();
+
+    for _ in 0..64 {
+        let name = generator
+            .next()
+            .unwrap_or_else(|| "nameless-hatchling".to_string());
+        let candidate = run_root.join(&name);
+        if !candidate.exists() {
+            return Ok((candidate, name));
+        }
+    }
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| anyhow!("failed to read system time: {err}"))?
+        .as_secs();
+    let name = format!("run-{suffix}");
+    Ok((run_root.join(&name), name))
+}
+
+fn write_latest_run(run_root: &Path, run_name: &str) -> Result<()> {
+    fs::create_dir_all(run_root)
+        .with_context(|| format!("failed to create run directory {}", run_root.display()))?;
+    let path = run_root.join("latest");
+    fs::write(&path, run_name)
+        .with_context(|| format!("failed to write latest run {}", path.display()))?;
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct WebConfigOutput {
+    run_name: String,
     block_size: usize,
     overrides: burn_dragon_hatchling::ModelOverrides,
 }
 
-fn write_run_config(config: &TrainingConfig, run_dir: &Path) -> Result<()> {
+fn write_run_config(config: &TrainingConfig, run_dir: &Path, run_name: &str) -> Result<()> {
     fs::create_dir_all(run_dir)
         .with_context(|| format!("failed to create run directory {}", run_dir.display()))?;
 
@@ -536,6 +592,7 @@ fn write_run_config(config: &TrainingConfig, run_dir: &Path) -> Result<()> {
         .unwrap_or(config.training.block_size)
         .max(1);
     let output = WebConfigOutput {
+        run_name: run_name.to_string(),
         block_size,
         overrides: config.model.clone(),
     };

@@ -27,14 +27,6 @@ pub fn build_model_config(overrides: &ModelOverrides, training_block_size: usize
         .unwrap_or(training_block_size)
         .max(1);
     model_config.fused_kernels.set_block_sizes(block, block);
-    if let Some(use_alibi) = overrides.use_alibi {
-        model_config.fused_kernels.set_use_alibi(use_alibi);
-        if !use_alibi {
-            model_config
-                .fused_kernels
-                .set_alibi_slopes(vec![0.0; model_config.n_head]);
-        }
-    }
     if let Some(rotary_embedding) = overrides.rotary_embedding {
         model_config
             .fused_kernels

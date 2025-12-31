@@ -23,16 +23,16 @@ struct WebModelConfig {
     #[serde(default)]
     block_size: Option<usize>,
     #[serde(default)]
+    max_tokens: Option<i32>,
+    #[serde(default)]
     overrides: ModelOverrides,
 }
 
 struct StreamState {
     state: ModelState<WebBackend>,
     last_logits: Option<Tensor<WebBackend, 1>>,
-    generated_ids: Vec<u32>,
-    last_print_len: usize,
     generated: usize,
-    max_tokens: usize,
+    max_tokens: Option<usize>,
     temperature: f32,
     top_k: Option<usize>,
     strategy: ContextStrategy,
@@ -119,11 +119,16 @@ impl WasmInference {
     pub fn start_stream(
         &mut self,
         prompt: String,
-        max_tokens: u32,
+        max_tokens: i32,
         temperature: f32,
         top_k: Option<u32>,
         context_window: Option<u32>,
     ) -> Result<String, JsValue> {
+        let max_tokens = if max_tokens < 0 {
+            None
+        } else {
+            Some(max_tokens as usize)
+        };
         let strategy_cfg = match context_window {
             Some(window) => ContextStrategyConfig::Sliding {
                 window: window as usize,
@@ -156,10 +161,8 @@ impl WasmInference {
         self.stream = Some(StreamState {
             state,
             last_logits: Some(last_logits),
-            generated_ids: Vec::new(),
-            last_print_len: 0,
             generated: 0,
-            max_tokens: max_tokens as usize,
+            max_tokens,
             temperature,
             top_k: top_k.map(|value| value as usize),
             strategy,
@@ -175,7 +178,10 @@ impl WasmInference {
             None => return Err(JsValue::from_str("stream not initialized")),
         };
 
-        while stream.generated < stream.max_tokens {
+        while stream
+            .max_tokens
+            .map_or(true, |max_tokens| stream.generated < max_tokens)
+        {
             let last_logits = stream
                 .last_logits
                 .take()
@@ -194,21 +200,21 @@ impl WasmInference {
             stream.generated = stream.generated.saturating_add(1);
 
             if let Ok(token_u32) = u32::try_from(next) {
-                stream.generated_ids.push(token_u32);
-                let decoded = self.tokenizer.decode(&stream.generated_ids);
-                if decoded.len() > stream.last_print_len {
-                    let new_text = decoded[stream.last_print_len..].to_string();
-                    stream.last_print_len = decoded.len();
-                    if let ContextStrategy::Sliding { window } = stream.strategy
-                        && window > 0
-                        && stream.state.position > window
-                    {
-                        stream.state.trim(window);
-                    }
-                    if !new_text.is_empty() {
-                        self.stream = Some(stream);
-                        return Ok(Some(new_text));
-                    }
+                if self.tokenizer.eos_id() == Some(token_u32) {
+                    self.stream = None;
+                    return Ok(None);
+                }
+
+                let new_text = self.tokenizer.decode(&[token_u32]);
+                if let ContextStrategy::Sliding { window } = stream.strategy
+                    && window > 0
+                    && stream.state.position > window
+                {
+                    stream.state.trim(window);
+                }
+                if !new_text.is_empty() {
+                    self.stream = Some(stream);
+                    return Ok(Some(new_text));
                 }
             }
 

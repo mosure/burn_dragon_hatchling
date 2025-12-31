@@ -24,11 +24,18 @@ pub fn fused_state_aligned<B: Backend>(
         .float()
         .reshape([1, 1, time, 1]);
 
-    let raw = positions.clone() * freqs;
-    let phases = (raw.clone() - raw.floor()) * (2.0 * PI);
     let (q_rot, k_rot) = match rotary_embedding {
-        RotaryEmbedding::Rope => apply_rope::<B>(phases, query.clone()),
-        RotaryEmbedding::Pope => apply_pope::<B>(phases, query.clone()),
+        RotaryEmbedding::Rope => {
+            let raw = positions.clone() * freqs;
+            let phases = (raw.clone() - raw.floor()) * (2.0 * PI);
+            apply_rope::<B>(phases, query.clone())
+        }
+        RotaryEmbedding::Pope => {
+            let raw = positions.clone() * freqs;
+            let phases = (raw.clone() - raw.floor()) * (2.0 * PI);
+            apply_pope::<B>(phases, query.clone())
+        }
+        RotaryEmbedding::Alibi => (query.clone(), query.clone()),
     };
 
     let value = value.repeat_dim(1, heads);

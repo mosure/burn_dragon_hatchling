@@ -31,6 +31,8 @@
         margin: 0;
         color: var(--text);
         font-family: "Space Mono", "JetBrains Mono", monospace;
+        overflow: hidden;
+        overscroll-behavior: none;
       }
 
       body::before {
@@ -49,13 +51,42 @@
         mix-blend-mode: screen;
       }
 
+      #viewport {
+        position: fixed;
+        inset: 0;
+        overflow: hidden;
+      }
+
       #output {
-        min-height: 100vh;
+        position: absolute;
+        inset-inline: 0;
+        top: 0;
         padding: clamp(24px, 5vw, 56px);
         font-size: clamp(15px, 1.4vw, 18px);
         line-height: 1.6;
         white-space: pre-wrap;
         word-break: break-word;
+        will-change: transform;
+      }
+
+      #fade-top {
+        position: absolute;
+        inset-inline: 0;
+        top: 0;
+        height: clamp(48px, 10vh, 96px);
+        background: linear-gradient(
+          to bottom,
+          rgba(3, 3, 4, 0.95) 0%,
+          rgba(3, 3, 4, 0.0) 100%
+        );
+        opacity: 0;
+        transition: opacity 0.2s ease;
+        pointer-events: none;
+        z-index: 2;
+      }
+
+      #fade-top.active {
+        opacity: 1;
       }
 
       #overlay {
@@ -113,7 +144,10 @@
         <div class="status" id="status">booting inference runtime</div>
       </div>
     </div>
-    <div id="output"></div>
+    <div id="viewport">
+      <div id="output"></div>
+      <div id="fade-top"></div>
+    </div>
 
     <script type="module">
       import init, { loadModel } from "./out/burn_dragon_hatchling.js";
@@ -121,26 +155,43 @@
       const overlay = document.getElementById("overlay");
       const status = document.getElementById("status");
       const output = document.getElementById("output");
+      const fadeTop = document.getElementById("fade-top");
 
       const params = new URLSearchParams(window.location.search);
       const modelUrl = params.get("model") || "./assets/model.bin";
       const vocabUrl = params.get("vocab") || "./assets/vocab.json";
       const configUrl = params.get("config") || "./assets/config.json";
-      // Config JSON: { "block_size": 256, "overrides": { "n_layer": 6, ... } }
+      // Config JSON: { "block_size": 256, "max_tokens": -1, "overrides": { "n_layer": 6, ... } }
       const prompt =
         params.get("prompt") ||
         "dragon hatchlings dream in sparse pulses\n";
-      const maxTokens = Number(params.get("max_tokens") || 512);
+      const maxTokensParam = params.get("max_tokens") || -1;
       const temperature = Number(params.get("temp") || 0.9);
       const topKParam = params.get("top_k");
       const topK = topKParam ? Number(topKParam) : undefined;
       const windowParam = params.get("window");
       const contextWindow = windowParam ? Number(windowParam) : undefined;
 
-      const cacheName = "bdh-cache-v2";
+      const cacheName = "bdh-cache-v4";
+      const maxBufferChars = 200000;
+      const trimBufferChars = 150000;
+      const scrollLiftRatio = 0.6;
+      const bottomTriggerPx = 12;
+      const scrollAnimMs = 180;
+      let outputBuffer = "";
+      let scrollOffset = 0;
+      let animStart = 0;
+      let animFrom = 0;
+      let animTo = 0;
+      let animating = false;
 
       const setStatus = (text) => {
         status.textContent = text;
+      };
+
+      const parseNumber = (value, fallback) => {
+        const num = Number(value);
+        return Number.isFinite(num) ? num : fallback;
       };
 
       const fetchCached = async (url, asText) => {
@@ -170,9 +221,84 @@
         return asText ? response.text() : response.arrayBuffer();
       };
 
-      const scrollToBottom = () => {
-        window.scrollTo(0, document.body.scrollHeight);
+      const appendOutput = (chunk) => {
+        outputBuffer += chunk;
+        let trimmed = false;
+        if (outputBuffer.length > maxBufferChars) {
+          outputBuffer = outputBuffer.slice(outputBuffer.length - trimBufferChars);
+          trimmed = true;
+        }
+        output.textContent = outputBuffer;
+        return trimmed;
       };
+
+      const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+
+      const applyScroll = () => {
+        if (scrollOffset < 0) {
+          scrollOffset = 0;
+        }
+        output.style.transform = `translateY(${-scrollOffset}px)`;
+        if (scrollOffset > 2) {
+          fadeTop.classList.add("active");
+        } else {
+          fadeTop.classList.remove("active");
+        }
+      };
+
+      const stepScroll = (now) => {
+        if (!animating) {
+          return;
+        }
+        const elapsed = now - animStart;
+        const t = Math.min(1, elapsed / scrollAnimMs);
+        const eased = easeOutCubic(t);
+        scrollOffset = animFrom + (animTo - animFrom) * eased;
+        applyScroll();
+        if (t < 1) {
+          requestAnimationFrame(stepScroll);
+        } else {
+          animating = false;
+        }
+      };
+
+      const animateTo = (target) => {
+        if (Math.abs(target - scrollOffset) < 1) {
+          return;
+        }
+        animFrom = scrollOffset;
+        animTo = target;
+        animStart = performance.now();
+        if (!animating) {
+          animating = true;
+          requestAnimationFrame(stepScroll);
+        }
+      };
+
+      const adjustScroll = (force) => {
+        const contentHeight = output.scrollHeight;
+        const viewportHeight = window.innerHeight;
+        const liftPx = viewportHeight * scrollLiftRatio;
+        const maxOffset = Math.max(0, contentHeight - (viewportHeight - liftPx));
+
+        if (force) {
+          scrollOffset = maxOffset;
+          animating = false;
+          applyScroll();
+          return;
+        }
+
+        const gap = scrollOffset + viewportHeight - contentHeight;
+        if (gap > bottomTriggerPx) {
+          return;
+        }
+
+        animateTo(maxOffset);
+      };
+
+      window.addEventListener("resize", () => adjustScroll(true), {
+        passive: true,
+      });
 
       const run = async () => {
         setStatus("loading wasm runtime");
@@ -185,9 +311,15 @@
         const vocabJson = await fetchCached(vocabUrl, true);
 
         let configJson = null;
+        let configData = null;
         if (configUrl) {
           setStatus("loading model config");
           configJson = await fetchCached(configUrl, true);
+          try {
+            configData = JSON.parse(configJson);
+          } catch (err) {
+            throw new Error(`invalid config json: ${err?.message || err}`);
+          }
         }
 
         setStatus("initializing model");
@@ -199,6 +331,11 @@
 
         overlay.classList.add("hidden");
 
+        const maxTokens =
+          maxTokensParam !== null
+            ? parseNumber(maxTokensParam, 512)
+            : parseNumber(configData?.max_tokens, 512);
+
         const intro = engine.startStream(
           prompt,
           maxTokens,
@@ -206,8 +343,9 @@
           topK,
           contextWindow
         );
-        output.textContent = intro;
-        scrollToBottom();
+        outputBuffer = intro;
+        output.textContent = outputBuffer;
+        adjustScroll(true);
 
         const tokensPerFrame = 4;
         let done = false;
@@ -217,6 +355,7 @@
             return;
           }
 
+          let trimmed = false;
           try {
             for (let i = 0; i < tokensPerFrame; i += 1) {
               const chunk = await engine.nextChunk();
@@ -225,7 +364,7 @@
                 return;
               }
               if (chunk.length) {
-                output.textContent += chunk;
+                trimmed = appendOutput(chunk) || trimmed;
               }
             }
           } catch (err) {
@@ -234,7 +373,7 @@
             return;
           }
 
-          scrollToBottom();
+          adjustScroll(trimmed);
           requestAnimationFrame(() => {
             void pump();
           });

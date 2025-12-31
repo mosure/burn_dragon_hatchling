@@ -117,7 +117,8 @@ impl<B: Backend> Attention<B> {
         kernel: &FusedKernelConfig,
     ) -> Self {
         let freqs = Self::build_freqs(latent, kernel.rope_theta, kernel.rotary_embedding, device);
-        let (use_alibi, alibi_slopes) = if kernel.enabled && kernel.use_alibi {
+        let use_alibi = matches!(kernel.rotary_embedding, RotaryEmbedding::Alibi);
+        let (use_alibi, alibi_slopes) = if use_alibi {
             let slopes = kernel
                 .alibi_slopes
                 .clone()
@@ -153,11 +154,35 @@ impl<B: Backend> Attention<B> {
         let q_rot = self.rotate(query, 0);
         let k_rot = q_rot.clone();
 
-        let scores = q_rot.matmul(k_rot.swap_dims(2, 3)).tril(-1);
+        let mut scores = q_rot.clone().matmul(k_rot.swap_dims(2, 3)).tril(-1);
+        if self.use_alibi {
+            let device = q_rot.device();
+            let slopes = self.alibi_slopes.clone().reshape([1, self.n_head, 1, 1]);
+            let time = q_rot.shape().dims::<4>()[2];
+            let pos_row = Tensor::<B, 1, Int>::arange(0..time as i64, &device)
+                .float()
+                .reshape([1, 1, time, 1]);
+            let pos_new = Tensor::<B, 1, Int>::arange(0..time as i64, &device)
+                .float()
+                .reshape([1, 1, 1, time]);
+            let alibi = slopes * (pos_new - pos_row).tril(-1);
+            scores = scores + alibi;
+        }
         let scores = Self::row_normalize(scores);
         let value = value.repeat_dim(1, self.n_head);
 
         scores.matmul(value)
+    }
+
+    pub(crate) fn rotate_positions(&self, values: Tensor<B, 4>, start: usize) -> Tensor<B, 4> {
+        self.rotate(values, start)
+    }
+
+    pub(crate) fn alibi_decay(&self) -> Option<Tensor<B, 1>> {
+        if !self.use_alibi {
+            return None;
+        }
+        Some(self.alibi_slopes.clone().neg().exp())
     }
 
     pub fn forward_cached(
@@ -305,6 +330,9 @@ impl<B: Backend> Attention<B> {
     }
 
     fn rotate(&self, values: Tensor<B, 4>, start: usize) -> Tensor<B, 4> {
+        if self.rotary_embedding == RotaryEmbedding::Alibi {
+            return values;
+        }
         let time = values.shape().dims::<4>()[2];
         let device = values.device();
         let positions = Tensor::<B, 1, Int>::arange(start as i64..(start + time) as i64, &device)
@@ -316,6 +344,7 @@ impl<B: Backend> Attention<B> {
         match self.rotary_embedding {
             RotaryEmbedding::Rope => self.rope(phases, values),
             RotaryEmbedding::Pope => self.pope(phases, values),
+            RotaryEmbedding::Alibi => values,
         }
     }
 
@@ -327,13 +356,78 @@ impl<B: Backend> Attention<B> {
     ) -> Tensor<B, 4> {
         let mut data = Vec::with_capacity(latent);
         for idx in 0..latent {
-            let exponent = match rotary_embedding {
-                RotaryEmbedding::Rope => ((idx as f32 / 2.0).floor() * 2.0) / latent as f32,
-                RotaryEmbedding::Pope => idx as f32 / latent as f32,
+            let value = match rotary_embedding {
+                RotaryEmbedding::Rope => {
+                    let exponent = ((idx as f32 / 2.0).floor() * 2.0) / latent as f32;
+                    1.0 / theta.powf(exponent) / (2.0 * PI)
+                }
+                RotaryEmbedding::Pope => {
+                    let exponent = idx as f32 / latent as f32;
+                    1.0 / theta.powf(exponent) / (2.0 * PI)
+                }
+                RotaryEmbedding::Alibi => 0.0,
             };
-            let value = 1.0 / theta.powf(exponent) / (2.0 * PI);
             data.push(value);
         }
         Tensor::<B, 1>::from_floats(data.as_slice(), device).reshape([1, 1, 1, latent])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::tensor::TensorData;
+    use burn_ndarray::NdArray;
+
+    type TestBackend = NdArray<f32>;
+
+    #[test]
+    fn alibi_decay_matches_exp_neg_slope() {
+        let device = <TestBackend as Backend>::Device::default();
+        let mut kernel = FusedKernelConfig::default();
+        kernel.set_rotary_embedding(RotaryEmbedding::Alibi);
+        kernel.set_alibi_slopes(vec![0.5, 1.0]);
+
+        let attention = Attention::<TestBackend>::new(1, 2, &device, &kernel);
+        let decay = attention.alibi_decay().expect("alibi decay");
+        let values = decay
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("decay values");
+
+        let expected = [(-0.5_f32).exp(), (-1.0_f32).exp()];
+        for (value, exp) in values.iter().zip(expected.iter()) {
+            assert!((value - exp).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn alibi_bias_applies_in_forward() {
+        let device = <TestBackend as Backend>::Device::default();
+        let mut kernel = FusedKernelConfig::default();
+        kernel.set_rotary_embedding(RotaryEmbedding::Alibi);
+        kernel.set_alibi_slopes(vec![0.5]);
+
+        let attention = Attention::<TestBackend>::new(1, 1, &device, &kernel);
+        let query = Tensor::<TestBackend, 4>::from_data(
+            TensorData::new(vec![1.0_f32, 1.0_f32], [1, 1, 2, 1]),
+            &device,
+        );
+        let value = Tensor::<TestBackend, 4>::from_data(
+            TensorData::new(vec![1.0_f32, 3.0_f32], [1, 1, 2, 1]),
+            &device,
+        );
+
+        let output = attention.forward(query, value);
+        let data = output
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("output values");
+
+        assert_eq!(data.len(), 2);
+        assert!(data[0].abs() < 1e-6);
+        assert!((data[1] - 1.0).abs() < 1e-4);
     }
 }

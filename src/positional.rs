@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub enum RotaryEmbedding {
     Rope,
     #[default]
+    Alibi,
     Pope,
 }
 
@@ -18,6 +19,7 @@ impl RotaryEmbedding {
         match self {
             Self::Rope => "rope",
             Self::Pope => "pope",
+            Self::Alibi => "alibi",
         }
     }
 }
