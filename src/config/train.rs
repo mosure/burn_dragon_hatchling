@@ -334,7 +334,7 @@ mod tests {
             config.dataset.source,
             DatasetSourceConfig::Shakespeare { url: None }
         );
-        assert_eq!(config.generation.max_tokens, 64);
+        assert_eq!(config.generation.max_tokens, Some(64));
         assert_eq!(
             config.training.context_strategy,
             ContextStrategyConfig::Infinite

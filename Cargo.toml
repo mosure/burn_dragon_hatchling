@@ -55,13 +55,11 @@ web = ["burn/webgpu", "burn-wgpu/webgpu"]
 viz = [
   "dep:bevy",
   "dep:bevy_burn",
-  "dep:bevy_pancam",
 ]
 
 
 [dependencies]
 bevy_burn = { version = "0.4", optional = true }
-bevy_pancam = { version = "0.19", optional = true }
 toml = { version = "0.9", optional = true }
 rand = "0.8"
 ureq = { version = "2.9", features = ["tls"], optional = true }

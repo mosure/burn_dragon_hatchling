@@ -19,7 +19,8 @@ pub struct TrainingHyperparameters {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct GenerationConfig {
     pub prompt: String,
-    pub max_tokens: usize,
+    #[serde(default)]
+    pub max_tokens: Option<i64>,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
     #[serde(default)]
@@ -44,6 +45,7 @@ pub struct ModelOverrides {
     pub n_embd: Option<usize>,
     pub n_head: Option<usize>,
     pub mlp_internal_dim_multiplier: Option<usize>,
+    pub relu_threshold: Option<f32>,
     pub dropout: Option<f64>,
     pub fused_kernels: Option<bool>,
     pub block_size: Option<usize>,

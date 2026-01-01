@@ -224,7 +224,9 @@ where
             state.trim(window);
         }
 
-        for _ in 0..generation.max_tokens {
+        let max_tokens = normalize_max_tokens(generation.max_tokens);
+        let mut generated = 0usize;
+        while max_tokens.map_or(true, |max| generated < max) {
             let (next, logits) = sample_next_token(
                 &model,
                 &mut state,
@@ -234,6 +236,7 @@ where
                 &device,
             )?;
             last_logits = logits;
+            generated = generated.saturating_add(1);
 
             if let Ok(token_u32) = u32::try_from(next) {
                 generated_ids.push(token_u32);
@@ -374,7 +377,11 @@ fn apply_generation_overrides(generation: &mut GenerationConfig, args: &Args, bl
         generation.prompt = prompt.clone();
     }
     if let Some(max_tokens) = args.max_tokens {
-        generation.max_tokens = max_tokens;
+        generation.max_tokens = if max_tokens < 0 {
+            None
+        } else {
+            Some(max_tokens)
+        };
     }
     if let Some(temperature) = args.temperature {
         generation.temperature = temperature;
@@ -515,6 +522,9 @@ fn merge_model_overrides(base: &mut ModelOverrides, incoming: &ModelOverrides) {
     if let Some(value) = incoming.mlp_internal_dim_multiplier {
         base.mlp_internal_dim_multiplier = Some(value);
     }
+    if let Some(value) = incoming.relu_threshold {
+        base.relu_threshold = Some(value);
+    }
     if let Some(value) = incoming.dropout {
         base.dropout = Some(value);
     }
@@ -619,7 +629,7 @@ struct Args {
     prompt: Option<String>,
     /// Override the number of tokens to generate.
     #[arg(long, value_name = "N")]
-    max_tokens: Option<usize>,
+    max_tokens: Option<i64>,
     /// Override the sampling temperature.
     #[arg(long, value_name = "T")]
     temperature: Option<f32>,
@@ -658,5 +668,12 @@ fn backend_name(backend: BackendArg) -> &'static str {
     match backend {
         BackendArg::Wgpu => "wgpu",
         BackendArg::Cuda => "cuda",
+    }
+}
+
+fn normalize_max_tokens(max_tokens: Option<i64>) -> Option<usize> {
+    match max_tokens {
+        Some(value) if value >= 0 => Some(value as usize),
+        _ => None,
     }
 }

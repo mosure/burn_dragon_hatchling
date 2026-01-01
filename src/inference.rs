@@ -16,6 +16,9 @@ pub fn build_model_config(overrides: &ModelOverrides, training_block_size: usize
     if let Some(multiplier) = overrides.mlp_internal_dim_multiplier {
         model_config.mlp_internal_dim_multiplier = multiplier;
     }
+    if let Some(relu_threshold) = overrides.relu_threshold {
+        model_config.fused_kernels.relu_threshold = relu_threshold;
+    }
     if let Some(dropout) = overrides.dropout {
         model_config.dropout = dropout;
     }

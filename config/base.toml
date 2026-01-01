@@ -54,7 +54,6 @@ num_iters = 6000
 
 [generation]
 prompt = "To be or "
-max_tokens = 2048
 temperature = 1.0
 top_k = 3
 
@@ -63,6 +62,8 @@ n_layer = 4
 n_embd = 256
 n_head = 4
 mlp_internal_dim_multiplier = 4
+# Paper default: standard ReLU threshold (0.0).
+relu_threshold = 0.0
 dropout = 0.1
 fused_kernels = true
 # block_size overrides fused-kernel tiling; if omitted, training.block_size is used.

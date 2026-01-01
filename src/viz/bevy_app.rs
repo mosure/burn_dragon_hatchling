@@ -5,7 +5,6 @@ use bevy::ecs::hierarchy::ChildSpawnerCommands;
 use bevy::image::ImageSampler;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
-use bevy_pancam::{PanCam, PanCamPlugin};
 use bevy_burn::{
     BevyBurnBridgePlugin, BevyBurnHandle, BindingDirection, BurnDevice, TransferKind,
 };
@@ -13,7 +12,7 @@ use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 use burn_wgpu::WgpuDevice;
 
-use super::frame::VizConfig;
+use super::frame::{VizConfig, VizFrame};
 use super::transport::VizReceiver;
 
 #[derive(Clone, Copy, Debug)]
@@ -25,7 +24,6 @@ pub struct VizDimensions {
 
 #[derive(Resource, Clone, Copy, Debug)]
 struct VizLayout {
-    layers: usize,
     history: usize,
     latent_total: usize,
 }
@@ -37,10 +35,30 @@ struct ExitReceiver {
 
 #[derive(Component, Clone, Copy)]
 enum PanelKind {
-    OverviewActivity,
-    OverviewWrites,
-    UnitsActivity,
     UnitsWrites,
+    UnitsY,
+    UnitsXY,
+    UnitsRho,
+}
+
+impl PanelKind {
+    fn label(&self) -> &'static str {
+        match self {
+            PanelKind::UnitsWrites => "writes",
+            PanelKind::UnitsY => "y",
+            PanelKind::UnitsXY => "xy",
+            PanelKind::UnitsRho => "rho",
+        }
+    }
+
+    fn select_tensor<'a, B: Backend>(&self, frame: &'a VizFrame<B>) -> &'a Tensor<B, 3> {
+        match self {
+            PanelKind::UnitsWrites => &frame.units_x,
+            PanelKind::UnitsY => &frame.units_y,
+            PanelKind::UnitsXY => &frame.units_xy,
+            PanelKind::UnitsRho => &frame.units_rho,
+        }
+    }
 }
 
 pub fn build_app<B: Backend<Device = WgpuDevice>>(
@@ -65,18 +83,15 @@ where
         }),
         ..default()
     }));
-    app.add_plugins(PanCamPlugin);
     app.insert_resource(ClearColor(Color::BLACK));
     app.add_plugins(BevyBurnBridgePlugin::<B>::default());
 
     let history = config.history.max(1);
-    let layers = dims.layers.max(1);
     let latent_total = dims
         .heads
         .saturating_mul(dims.latent_per_head)
         .max(1);
     app.insert_resource(VizLayout {
-        layers,
         history,
         latent_total,
     });
@@ -135,7 +150,7 @@ fn setup<B: Backend<Device = WgpuDevice>>(
         return;
     };
 
-    commands.spawn((Camera2d, PanCam::default()));
+    commands.spawn(Camera2d);
 
     commands
         .spawn((
@@ -155,26 +170,7 @@ fn setup<B: Backend<Device = WgpuDevice>>(
         .with_children(|root| {
             spawn_panel::<B>(
                 root,
-                "overview_activity",
-                PanelKind::OverviewActivity,
-                layout.history,
-                layout.layers,
-                device,
-                &mut images,
-            );
-            spawn_panel::<B>(
-                root,
-                "overview_writes",
-                PanelKind::OverviewWrites,
-                layout.history,
-                layout.layers,
-                device,
-                &mut images,
-            );
-            spawn_panel::<B>(
-                root,
-                "units_activity",
-                PanelKind::UnitsActivity,
+                PanelKind::UnitsWrites,
                 layout.history,
                 layout.latent_total,
                 device,
@@ -182,8 +178,23 @@ fn setup<B: Backend<Device = WgpuDevice>>(
             );
             spawn_panel::<B>(
                 root,
-                "units_writes",
-                PanelKind::UnitsWrites,
+                PanelKind::UnitsY,
+                layout.history,
+                layout.latent_total,
+                device,
+                &mut images,
+            );
+            spawn_panel::<B>(
+                root,
+                PanelKind::UnitsXY,
+                layout.history,
+                layout.latent_total,
+                device,
+                &mut images,
+            );
+            spawn_panel::<B>(
+                root,
+                PanelKind::UnitsRho,
                 layout.history,
                 layout.latent_total,
                 device,
@@ -194,7 +205,6 @@ fn setup<B: Backend<Device = WgpuDevice>>(
 
 fn spawn_panel<B: Backend<Device = WgpuDevice>>(
     parent: &mut ChildSpawnerCommands,
-    label: &str,
     kind: PanelKind,
     width: usize,
     height: usize,
@@ -218,7 +228,7 @@ fn spawn_panel<B: Backend<Device = WgpuDevice>>(
         ))
         .with_children(|panel| {
             panel.spawn((
-                Text::new(label),
+                Text::new(kind.label()),
                 TextFont {
                     font: Handle::default(),
                     font_size: 12.0,
@@ -229,7 +239,6 @@ fn spawn_panel<B: Backend<Device = WgpuDevice>>(
             panel.spawn((
                 Node {
                     width: percent(100.0),
-                    height: percent(100.0),
                     flex_grow: 1.0,
                     ..default()
                 },
@@ -286,12 +295,7 @@ fn apply_latest_frame<B: Backend>(
         return;
     };
     for (kind, mut handle) in &mut q {
-        match kind {
-            PanelKind::OverviewActivity => handle.tensor = frame.overview_activity.clone(),
-            PanelKind::OverviewWrites => handle.tensor = frame.overview_writes.clone(),
-            PanelKind::UnitsActivity => handle.tensor = frame.units_activity.clone(),
-            PanelKind::UnitsWrites => handle.tensor = frame.units_writes.clone(),
-        }
+        handle.tensor = kind.select_tensor(&frame).clone();
         handle.upload = true;
     }
 }
@@ -305,12 +309,7 @@ fn apply_latest_frame<B: Backend>(
         return;
     };
     for (kind, mut handle) in &mut q {
-        match kind {
-            PanelKind::OverviewActivity => handle.tensor = frame.overview_activity.clone(),
-            PanelKind::OverviewWrites => handle.tensor = frame.overview_writes.clone(),
-            PanelKind::UnitsActivity => handle.tensor = frame.units_activity.clone(),
-            PanelKind::UnitsWrites => handle.tensor = frame.units_writes.clone(),
-        }
+        handle.tensor = kind.select_tensor(&frame).clone();
         handle.upload = true;
     }
 }
@@ -363,19 +362,20 @@ mod tests {
             xfer: TransferKind::Cpu,
         };
 
-        app.world_mut().spawn((
-            PanelKind::OverviewActivity,
-            make_handle(2, 3),
-        ));
-        app.world_mut().spawn((PanelKind::OverviewWrites, make_handle(2, 3)));
-        app.world_mut().spawn((PanelKind::UnitsActivity, make_handle(4, 3)));
-        app.world_mut().spawn((PanelKind::UnitsWrites, make_handle(4, 3)));
+        app.world_mut()
+            .spawn((PanelKind::UnitsWrites, make_handle(4, 3)));
+        app.world_mut()
+            .spawn((PanelKind::UnitsY, make_handle(4, 3)));
+        app.world_mut()
+            .spawn((PanelKind::UnitsXY, make_handle(4, 3)));
+        app.world_mut()
+            .spawn((PanelKind::UnitsRho, make_handle(4, 3)));
 
         let frame = VizFrame::<Backend> {
-            overview_activity: Tensor::<Backend, 3>::zeros([2, 3, 4], &device),
-            overview_writes: Tensor::<Backend, 3>::zeros([2, 3, 4], &device),
-            units_activity: Tensor::<Backend, 3>::zeros([4, 3, 4], &device),
-            units_writes: Tensor::<Backend, 3>::zeros([4, 3, 4], &device),
+            units_x: Tensor::<Backend, 3>::zeros([4, 3, 4], &device),
+            units_y: Tensor::<Backend, 3>::zeros([4, 3, 4], &device),
+            units_xy: Tensor::<Backend, 3>::zeros([4, 3, 4], &device),
+            units_rho: Tensor::<Backend, 3>::zeros([4, 3, 4], &device),
             cursor: 0,
             token_index: 0,
         };
@@ -390,10 +390,10 @@ mod tests {
             assert!(handle.upload);
             let dims = handle.tensor.shape().dims::<3>();
             match kind {
-                PanelKind::OverviewActivity | PanelKind::OverviewWrites => {
-                    assert_eq!(dims, [2, 3, 4]);
-                }
-                PanelKind::UnitsActivity | PanelKind::UnitsWrites => {
+                PanelKind::UnitsWrites
+                | PanelKind::UnitsY
+                | PanelKind::UnitsXY
+                | PanelKind::UnitsRho => {
                     assert_eq!(dims, [4, 3, 4]);
                 }
             }

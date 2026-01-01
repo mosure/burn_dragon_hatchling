@@ -18,7 +18,9 @@ pub struct ModelState<B: Backend> {
 #[derive(Debug, Clone)]
 pub struct LayerVizState<B: Backend> {
     pub x_last: Tensor<B, 2>,
+    pub y_last: Tensor<B, 2>,
     pub xy_last: Tensor<B, 2>,
+    pub rho_last: Tensor<B, 2>,
 }
 
 impl<B: Backend> ModelState<B> {

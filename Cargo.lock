@@ -1161,15 +1161,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef8e4b7e61dfe7719bb03c884dc270cd46a82efb40f93e9933b990c5c190c59"
 
 [[package]]
-name = "bevy_pancam"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d7d3e3895517b3af586c9629059536104500a4a6a2cdceac5ed6d4945d1a189"
-dependencies = [
- "bevy",
-]
-
-[[package]]
 name = "bevy_pbr"
 version = "0.17.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2273,7 +2264,6 @@ dependencies = [
  "anyhow",
  "bevy",
  "bevy_burn",
- "bevy_pancam",
  "burn",
  "burn-autodiff",
  "burn-cuda",

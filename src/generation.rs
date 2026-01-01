@@ -17,7 +17,7 @@ pub enum ContextStrategy {
 
 #[derive(Clone, Copy, Debug)]
 pub struct GenerationSettings {
-    pub max_new_tokens: usize,
+    pub max_new_tokens: Option<usize>,
     pub temperature: f32,
     pub top_k: Option<usize>,
     pub strategy: ContextStrategy,
@@ -171,6 +171,7 @@ pub fn generate_tokens<B: Backend>(
 
     let mut full_tokens = prompt_tokens;
     let (mut state, mut last_logits) = prefill_state(model, &full_tokens, device)?;
+    let mut generated = 0usize;
 
     if let ContextStrategy::Sliding { window } = strategy
         && window > 0
@@ -179,11 +180,12 @@ pub fn generate_tokens<B: Backend>(
         state.trim(window);
     }
 
-    for _ in 0..max_new_tokens {
+    while max_new_tokens.map_or(true, |max| generated < max) {
         let (next, logits) =
             sample_next_token(model, &mut state, last_logits, temperature, top_k, device)?;
         full_tokens.push(next);
         last_logits = logits;
+        generated = generated.saturating_add(1);
 
         if let Some(callback) = &mut on_token {
             callback(next);
@@ -216,8 +218,9 @@ pub fn generate_text<B: Backend>(
     }
 
     let prompt_tokens: Vec<i64> = prompt_ids.iter().map(|&id| id as i64).collect();
+    let max_new_tokens = normalize_max_tokens(generation.max_tokens);
     let settings = GenerationSettings {
-        max_new_tokens: generation.max_tokens,
+        max_new_tokens,
         temperature: generation.temperature,
         top_k: generation.top_k,
         strategy,
@@ -230,6 +233,13 @@ pub fn generate_text<B: Backend>(
         .collect();
 
     Ok(tokenizer.decode(&decoded_ids))
+}
+
+fn normalize_max_tokens(max_tokens: Option<i64>) -> Option<usize> {
+    match max_tokens {
+        Some(value) if value >= 0 => Some(value as usize),
+        _ => None,
+    }
 }
 
 pub fn resolve_context_strategy(

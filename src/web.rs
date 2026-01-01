@@ -53,6 +53,7 @@ pub struct WasmInference {
     tokenizer: SharedTokenizer,
     device: WebDevice,
     block_size: usize,
+    default_max_tokens: Option<usize>,
     stream: Option<StreamState>,
     #[cfg(feature = "viz")]
     viz: Option<WebVizRuntime>,
@@ -87,6 +88,7 @@ pub async fn load_model(
             .or(overrides.block_size)
             .unwrap_or(256)
             .max(1);
+        let default_max_tokens = normalize_max_tokens(config.max_tokens);
         let tokenizer = Arc::new(CharVocab::from_json_str(&vocab_json)?) as SharedTokenizer;
 
         let mut model_config = build_model_config(&overrides, block_size);
@@ -147,6 +149,7 @@ pub async fn load_model(
             tokenizer,
             device,
             block_size,
+            default_max_tokens,
             stream: None,
             #[cfg(feature = "viz")]
             viz: viz_runtime,
@@ -164,15 +167,14 @@ impl WasmInference {
     pub fn start_stream(
         &mut self,
         prompt: String,
-        max_tokens: i32,
+        max_tokens: Option<i32>,
         temperature: f32,
         top_k: Option<u32>,
         context_window: Option<u32>,
     ) -> Result<String, JsValue> {
-        let max_tokens = if max_tokens < 0 {
-            None
-        } else {
-            Some(max_tokens as usize)
+        let max_tokens = match max_tokens {
+            Some(value) => normalize_max_tokens(Some(value)),
+            None => self.default_max_tokens,
         };
         let strategy_cfg = match context_window {
             Some(window) => ContextStrategyConfig::Sliding {
@@ -288,5 +290,12 @@ impl WasmInference {
     #[wasm_bindgen(js_name = "clearStream")]
     pub fn clear_stream(&mut self) {
         self.stream = None;
+    }
+}
+
+fn normalize_max_tokens(max_tokens: Option<i32>) -> Option<usize> {
+    match max_tokens {
+        Some(value) if value >= 0 => Some(value as usize),
+        _ => None,
     }
 }

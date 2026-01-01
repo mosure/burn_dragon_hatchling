@@ -4,7 +4,11 @@ use burn::tensor::{Tensor, TensorData};
 use crate::model::LayerVizState;
 
 use super::frame::{VizConfig, VizFrame};
-use super::palette::{COLOR_ACTIVITY, COLOR_SEPARATOR, COLOR_WRITES};
+use super::palette::{
+    COLOR_ACTIVITY, COLOR_INTERACTION, COLOR_MEMORY, COLOR_SEPARATOR, COLOR_WRITES,
+};
+
+const ACTIVE_EPS: f32 = 1e-3;
 
 pub struct VizEncoder<B: Backend> {
     config: VizConfig,
@@ -12,14 +16,15 @@ pub struct VizEncoder<B: Backend> {
     heads: usize,
     latent_per_head: usize,
     latent_total: usize,
-    overview_activity: Tensor<B, 3>,
-    overview_writes: Tensor<B, 3>,
-    units_activity: Tensor<B, 3>,
-    units_writes: Tensor<B, 3>,
-    color_activity: Tensor<B, 3>,
-    color_writes: Tensor<B, 3>,
+    units_x: Tensor<B, 3>,
+    units_y: Tensor<B, 3>,
+    units_xy: Tensor<B, 3>,
+    units_rho: Tensor<B, 3>,
+    color_x: Tensor<B, 3>,
+    color_y: Tensor<B, 3>,
+    color_xy: Tensor<B, 3>,
+    color_rho: Tensor<B, 3>,
     separator_rgba: Option<Tensor<B, 3>>,
-    zero_row: Tensor<B, 3>,
     zero_units: Tensor<B, 3>,
 }
 
@@ -34,16 +39,17 @@ impl<B: Backend> VizEncoder<B> {
         let history = config.history.max(1);
         let latent_total = heads.saturating_mul(latent_per_head).max(1);
 
-        let overview_activity = Tensor::<B, 3>::zeros([layers.max(1), history, 4], device);
-        let overview_writes = Tensor::<B, 3>::zeros([layers.max(1), history, 4], device);
-        let units_activity = Tensor::<B, 3>::zeros([latent_total, history, 4], device);
-        let units_writes = Tensor::<B, 3>::zeros([latent_total, history, 4], device);
+        let units_x = Tensor::<B, 3>::zeros([latent_total, history, 4], device);
+        let units_y = Tensor::<B, 3>::zeros([latent_total, history, 4], device);
+        let units_xy = Tensor::<B, 3>::zeros([latent_total, history, 4], device);
+        let units_rho = Tensor::<B, 3>::zeros([latent_total, history, 4], device);
 
-        let color_activity = color_tensor::<B>(COLOR_ACTIVITY, device);
-        let color_writes = color_tensor::<B>(COLOR_WRITES, device);
+        let color_x = color_tensor::<B>(COLOR_WRITES, device);
+        let color_y = color_tensor::<B>(COLOR_ACTIVITY, device);
+        let color_xy = color_tensor::<B>(COLOR_INTERACTION, device);
+        let color_rho = color_tensor::<B>(COLOR_MEMORY, device);
 
         let separator_rgba = build_separator::<B>(latent_total, latent_per_head, device);
-        let zero_row = Tensor::<B, 3>::zeros([1, 1, 4], device);
         let zero_units = Tensor::<B, 3>::zeros([latent_total, 1, 4], device);
 
         Self {
@@ -52,14 +58,15 @@ impl<B: Backend> VizEncoder<B> {
             heads,
             latent_per_head,
             latent_total,
-            overview_activity,
-            overview_writes,
-            units_activity,
-            units_writes,
-            color_activity,
-            color_writes,
+            units_x,
+            units_y,
+            units_xy,
+            units_rho,
+            color_x,
+            color_y,
+            color_xy,
+            color_rho,
             separator_rgba,
-            zero_row,
             zero_units,
         }
     }
@@ -79,92 +86,62 @@ impl<B: Backend> VizEncoder<B> {
         let cursor = token_index % history;
         let layer_count = self.layers.min(layers.len()).max(1);
 
-        let mut activity_rows: Vec<Tensor<B, 3>> = Vec::with_capacity(layer_count);
-        let mut write_rows: Vec<Tensor<B, 3>> = Vec::with_capacity(layer_count);
-
-        for layer_idx in 0..layer_count {
-            if let Some(state) = layers[layer_idx].as_ref() {
-                let write_frac = state
-                    .x_last
-                    .clone()
-                    .greater_elem(0.0)
-                    .float()
-                    .mean();
-                let activity_frac = state
-                    .xy_last
-                    .clone()
-                    .greater_elem(0.0)
-                    .float()
-                    .mean();
-
-                write_rows.push(self.encode_scalar(write_frac, self.config.gain_x, &self.color_writes));
-                activity_rows.push(self.encode_scalar(
-                    activity_frac,
-                    self.config.gain_xy,
-                    &self.color_activity,
-                ));
-            } else {
-                write_rows.push(self.zero_row.clone());
-                activity_rows.push(self.zero_row.clone());
-            }
-        }
-
-        let activity_column = Tensor::cat(activity_rows, 0);
-        let writes_column = Tensor::cat(write_rows, 0);
-
-        self.overview_activity = self.overview_activity.clone().slice_assign(
-            [0..layer_count, cursor..cursor + 1, 0..4],
-            activity_column,
-        );
-        self.overview_writes = self.overview_writes.clone().slice_assign(
-            [0..layer_count, cursor..cursor + 1, 0..4],
-            writes_column,
-        );
-
         let focus = self.config.layer_focus.min(layer_count.saturating_sub(1));
-        let (x_last, xy_last) = layers
+        let (x_last, y_last, xy_last, rho_last) = layers
             .get(focus)
             .and_then(|layer| layer.as_ref())
-            .map(|layer| (layer.x_last.clone(), layer.xy_last.clone()))
+            .map(|layer| {
+                (
+                    layer.x_last.clone(),
+                    layer.y_last.clone(),
+                    layer.xy_last.clone(),
+                    layer.rho_last.clone(),
+                )
+            })
             .unwrap_or_else(|| {
                 (
+                    Tensor::<B, 2>::zeros([self.heads, self.latent_per_head], &device),
+                    Tensor::<B, 2>::zeros([self.heads, self.latent_per_head], &device),
                     Tensor::<B, 2>::zeros([self.heads, self.latent_per_head], &device),
                     Tensor::<B, 2>::zeros([self.heads, self.latent_per_head], &device),
                 )
             });
 
         let x_flat = x_last.reshape([self.latent_total]);
+        let y_flat = y_last.reshape([self.latent_total]);
         let xy_flat = xy_last.reshape([self.latent_total]);
+        let rho_flat = rho_last.reshape([self.latent_total]);
 
-        let units_writes_col = self.encode_units(x_flat, self.config.gain_x, &self.color_writes);
-        let units_activity_col =
-            self.encode_units(xy_flat, self.config.gain_xy, &self.color_activity);
+        let units_x_col = self.encode_units(x_flat, self.config.gain_x, &self.color_x);
+        let units_y_col = self.encode_units(y_flat, self.config.gain_xy, &self.color_y);
+        let units_xy_col = self.encode_units(xy_flat, self.config.gain_xy, &self.color_xy);
+        let units_rho_col = self.encode_units(rho_flat, self.config.gain_xy, &self.color_rho);
 
-        self.units_writes = self.units_writes.clone().slice_assign(
+        self.units_x = self.units_x.clone().slice_assign(
             [0..self.latent_total, cursor..cursor + 1, 0..4],
-            units_writes_col,
+            units_x_col,
         );
-        self.units_activity = self.units_activity.clone().slice_assign(
+        self.units_y = self.units_y.clone().slice_assign(
             [0..self.latent_total, cursor..cursor + 1, 0..4],
-            units_activity_col,
+            units_y_col,
+        );
+        self.units_xy = self.units_xy.clone().slice_assign(
+            [0..self.latent_total, cursor..cursor + 1, 0..4],
+            units_xy_col,
+        );
+        self.units_rho = self.units_rho.clone().slice_assign(
+            [0..self.latent_total, cursor..cursor + 1, 0..4],
+            units_rho_col,
         );
 
         VizFrame {
-            overview_activity: self.overview_activity.clone(),
-            overview_writes: self.overview_writes.clone(),
-            units_activity: self.units_activity.clone(),
-            units_writes: self.units_writes.clone(),
+            units_x: self.units_x.clone(),
+            units_y: self.units_y.clone(),
+            units_xy: self.units_xy.clone(),
+            units_rho: self.units_rho.clone(),
             cursor,
             token_index,
         }
-    }
-
-    fn encode_scalar(&self, value: Tensor<B, 1>, gain: f32, color: &Tensor<B, 3>) -> Tensor<B, 3> {
-        let mag = value.clone().mul_scalar(gain).clamp(0.0, 1.0);
-        let mask = value.greater_elem(0.0).float();
-        let intensity = mask * (mag.mul_scalar(0.75).add_scalar(0.25));
-        let intensity = intensity.reshape([1, 1, 1]);
-        intensity * color.clone()
     }
 
     fn encode_units(&self, values: Tensor<B, 1>, gain: f32, color: &Tensor<B, 3>) -> Tensor<B, 3> {
@@ -173,7 +150,7 @@ impl<B: Backend> VizEncoder<B> {
         }
         let values = values.reshape([self.latent_total, 1]);
         let mag = values.clone().mul_scalar(gain).clamp(0.0, 1.0);
-        let mask = values.greater_elem(0.0).float();
+        let mask = values.greater_elem(ACTIVE_EPS).float();
         let intensity = mask * (mag.mul_scalar(0.75).add_scalar(0.25));
         let intensity = intensity.reshape([self.latent_total, 1, 1]);
         let mut column = intensity * color.clone();
@@ -252,7 +229,9 @@ mod tests {
             let dims = layer.x_last.shape().dims::<2>();
             assert_eq!(dims[0], config.n_head);
             assert_eq!(dims[1], config.latent_per_head());
+            assert_eq!(layer.y_last.shape().dims::<2>(), dims);
             assert_eq!(layer.xy_last.shape().dims::<2>(), dims);
+            assert_eq!(layer.rho_last.shape().dims::<2>(), dims);
         }
     }
 
@@ -274,46 +253,66 @@ mod tests {
                 TensorData::new(vec![1.0, 0.0, 0.0, 0.0], [2, 2]),
                 &device,
             ),
+            y_last: Tensor::<Backend, 2>::from_data(
+                TensorData::new(vec![0.0, 1.0, 0.0, 0.0], [2, 2]),
+                &device,
+            ),
             xy_last: Tensor::<Backend, 2>::from_data(
                 TensorData::new(vec![0.5, 0.0, 0.0, 0.0], [2, 2]),
+                &device,
+            ),
+            rho_last: Tensor::<Backend, 2>::from_data(
+                TensorData::new(vec![0.2, 0.0, 0.0, 0.0], [2, 2]),
                 &device,
             ),
         };
         let layer1 = LayerVizState {
             x_last: Tensor::<Backend, 2>::zeros([2, 2], &device),
+            y_last: Tensor::<Backend, 2>::zeros([2, 2], &device),
             xy_last: Tensor::<Backend, 2>::zeros([2, 2], &device),
+            rho_last: Tensor::<Backend, 2>::zeros([2, 2], &device),
         };
 
         let frame = encoder.step(&[Some(layer0), Some(layer1)], 0);
 
-        assert_eq!(frame.overview_activity.shape().dims::<3>(), [2, 4, 4]);
-        assert_eq!(frame.overview_writes.shape().dims::<3>(), [2, 4, 4]);
-        assert_eq!(frame.units_activity.shape().dims::<3>(), [4, 4, 4]);
-        assert_eq!(frame.units_writes.shape().dims::<3>(), [4, 4, 4]);
+        assert_eq!(frame.units_x.shape().dims::<3>(), [4, 4, 4]);
+        assert_eq!(frame.units_y.shape().dims::<3>(), [4, 4, 4]);
+        assert_eq!(frame.units_xy.shape().dims::<3>(), [4, 4, 4]);
+        assert_eq!(frame.units_rho.shape().dims::<3>(), [4, 4, 4]);
         assert_eq!(frame.cursor, 0);
 
-        let overview = frame
-            .overview_activity
+        let units_x = frame
+            .units_x
             .to_data()
             .convert::<f32>()
             .into_vec::<f32>()
-            .expect("overview vec");
-        let layer_stride = 4 * 4;
-        let layer0_sum: f32 = overview[0..4].iter().sum();
-        let layer1_sum: f32 = overview[layer_stride..layer_stride + 4].iter().sum();
-        assert!(layer0_sum > 0.0);
-        assert_eq!(layer1_sum, 0.0);
-
-        let units = frame
-            .units_activity
+            .expect("units x vec");
+        let units_y = frame
+            .units_y
             .to_data()
             .convert::<f32>()
             .into_vec::<f32>()
-            .expect("units vec");
+            .expect("units y vec");
+        let units_xy = frame
+            .units_xy
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("units xy vec");
+        let units_rho = frame
+            .units_rho
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("units rho vec");
         let unit_stride = 4 * 4;
-        let unit0_sum: f32 = units[0..4].iter().sum();
-        let unit1_sum: f32 = units[unit_stride..unit_stride + 4].iter().sum();
-        assert!(unit0_sum > 0.0);
-        assert_eq!(unit1_sum, 0.0);
+        let unit0_x_sum: f32 = units_x[0..4].iter().sum();
+        let unit1_y_sum: f32 = units_y[unit_stride..unit_stride + 4].iter().sum();
+        let unit0_xy_sum: f32 = units_xy[0..4].iter().sum();
+        let unit0_rho_sum: f32 = units_rho[0..4].iter().sum();
+        assert!(unit0_x_sum > 0.0);
+        assert!(unit1_y_sum > 0.0);
+        assert!(unit0_xy_sum > 0.0);
+        assert!(unit0_rho_sum > 0.0);
     }
 }

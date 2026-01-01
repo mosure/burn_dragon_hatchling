@@ -375,7 +375,7 @@ impl<B: Backend> BDH<B> {
             };
 
             #[cfg(feature = "viz")]
-            let xy_sparse = x_sparse.clone() * y_sparse;
+            let xy_sparse = x_sparse.clone() * y_sparse.clone();
             #[cfg(not(feature = "viz"))]
             let xy_sparse = x_sparse * y_sparse;
             let xy_sparse = self.dropout.forward(xy_sparse);
@@ -392,14 +392,45 @@ impl<B: Backend> BDH<B> {
                     .reshape([batch, heads, latent])
                     .slice_dim(0, 0..1)
                     .reshape([heads, latent]);
+                let y_last = y_sparse
+                    .clone()
+                    .slice_dim(2, last..time)
+                    .reshape([batch, heads, latent])
+                    .slice_dim(0, 0..1)
+                    .reshape([heads, latent]);
                 let xy_last = xy_sparse
                     .clone()
                     .slice_dim(2, last..time)
                     .reshape([batch, heads, latent])
                     .slice_dim(0, 0..1)
                     .reshape([heads, latent]);
+                let device = x_last.device();
+                let rho_last = match layer_state.rho.as_ref() {
+                    Some(rho) => {
+                        let dims = rho.shape().dims::<4>();
+                        if dims == [batch, heads, latent, self.n_embd] {
+                            let rho_energy = rho
+                                .clone()
+                                .abs()
+                                .sum_dim(3)
+                                .div_scalar(self.n_embd as f32)
+                                .reshape([batch, heads, latent])
+                                .sum_dim(0)
+                                .div_scalar(batch as f32);
+                            rho_energy.reshape([heads, latent])
+                        } else {
+                            Tensor::<B, 2>::zeros([heads, latent], &device)
+                        }
+                    }
+                    None => Tensor::<B, 2>::zeros([heads, latent], &device),
+                };
 
-                layer_state.viz = Some(LayerVizState { x_last, xy_last });
+                layer_state.viz = Some(LayerVizState {
+                    x_last,
+                    y_last,
+                    xy_last,
+                    rho_last,
+                });
             }
 
             let mixed_flat = mixed.reshape([batch * time, heads * latent]);

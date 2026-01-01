@@ -24,10 +24,10 @@ impl Default for VizConfig {
 
 #[derive(Clone, Debug)]
 pub struct VizFrame<B: Backend> {
-    pub overview_activity: Tensor<B, 3>,
-    pub overview_writes: Tensor<B, 3>,
-    pub units_activity: Tensor<B, 3>,
-    pub units_writes: Tensor<B, 3>,
+    pub units_x: Tensor<B, 3>,
+    pub units_y: Tensor<B, 3>,
+    pub units_xy: Tensor<B, 3>,
+    pub units_rho: Tensor<B, 3>,
     pub cursor: usize,
     pub token_index: usize,
 }
