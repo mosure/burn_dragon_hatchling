@@ -528,8 +528,9 @@ fn update_pan_zoom_bounds(
     state.max_scale = max_scale;
 
     if !state.initialized {
-        state.scale = min_scale;
-        state.offset = default_offset(viewport, texture.size * state.scale);
+        let init_scale = scale_x.clamp(min_scale, max_scale);
+        state.scale = init_scale;
+        state.offset = default_offset_top(viewport, texture.size * state.scale);
         state.initialized = true;
         return;
     }
@@ -680,11 +681,8 @@ fn clamp_offset(offset: Vec2, viewport: Vec2, texture: Vec2, scale: f32) -> Vec2
     out
 }
 
-fn default_offset(viewport: Vec2, scaled: Vec2) -> Vec2 {
-    Vec2::new(
-        (viewport.x - scaled.x) * 0.5,
-        (viewport.y - scaled.y) * 0.5,
-    )
+fn default_offset_top(viewport: Vec2, scaled: Vec2) -> Vec2 {
+    Vec2::new((viewport.x - scaled.x) * 0.5, 0.0)
 }
 
 #[cfg(all(test, feature = "viz", feature = "cli"))]

@@ -1,7 +1,7 @@
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 
-pub const LAYER_GAP: usize = 3;
+pub const LAYER_GAP: usize = 20;
 
 #[derive(Clone, Debug)]
 pub struct VizConfig {
