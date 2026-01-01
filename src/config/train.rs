@@ -311,6 +311,7 @@ mod tests {
             TrainingHyperparameters {
                 block_size: 256,
                 batch_size: 16,
+                epochs: None,
                 max_iters: 2000,
                 log_frequency: 50,
                 fast_train: false,

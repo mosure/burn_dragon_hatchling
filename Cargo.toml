@@ -1,7 +1,7 @@
 [package]
 name = "burn_dragon_hatchling"
 description = "burn (baby) dragon hatchling inference and training"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["mosure <mitchell@mosure.me>"]
 license = "MIT OR Apache-2.0"
@@ -32,7 +32,7 @@ default-run = "train"
 
 
 [features]
-default = ["cli", "cuda", "viz"]
+default = ["cli", "cuda"]
 
 benchmark = ["burn/autotune", "burn/fusion"]
 cli = [
@@ -53,11 +53,15 @@ train = [
 cuda = ["burn/cuda", "burn-cuda"]
 web = ["burn/webgpu", "burn-wgpu/webgpu"]
 viz = [
-  # "dep:bevy",
+  "dep:bevy",
+  "dep:bevy_burn",
+  "dep:bevy_pancam",
 ]
 
 
 [dependencies]
+bevy_burn = { version = "0.4", optional = true }
+bevy_pancam = { version = "0.19", optional = true }
 toml = { version = "0.9", optional = true }
 rand = "0.8"
 ureq = { version = "2.9", features = ["tls"], optional = true }
@@ -77,6 +81,40 @@ tempfile = { version = "3", optional = true }
 plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "line_series"], optional = true }
 plotters-bitmap = { version = "0.3", optional = true }
 names = { version = "0.14", optional = true }
+
+
+[dependencies.bevy]
+version = "0.17"
+default-features = false
+optional = true
+features = [
+  "bevy_asset",
+  "bevy_camera",
+  "bevy_core_pipeline",
+  "bevy_gizmos",
+  "bevy_gltf",
+  "bevy_image",
+  "bevy_log",
+  "bevy_light",
+  "bevy_mesh",
+  "bevy_pbr",
+  "bevy_render",
+  "bevy_post_process",
+  "bevy_sprite",
+  "bevy_text",
+  "bevy_ui",
+  "bevy_ui_render",
+  "bevy_window",
+  "bevy_winit",
+  "default_font",
+  "jpeg",
+  "png",
+  "std",
+  "tonemapping_luts",
+  "webgpu",
+  "x11",
+  "zstd_rust",
+]
 
 
 [dependencies.burn]

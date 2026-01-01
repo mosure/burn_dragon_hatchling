@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 
 use std::convert::TryFrom;
 use std::fs;
@@ -22,6 +23,16 @@ use burn_wgpu::Wgpu;
 #[cfg(feature = "cuda")]
 use burn_cuda::Cuda;
 
+#[cfg(feature = "viz")]
+use burn_dragon_hatchling::viz::{self, VizConfig, VizDimensions, VizEncoder};
+#[cfg(feature = "viz")]
+use std::sync::mpsc;
+
+#[cfg(feature = "viz")]
+struct VizRuntime<B: Backend> {
+    encoder: VizEncoder<B>,
+    sender: viz::VizSender<B>,
+}
 
 pub fn main() {
     if let Err(err) = run() {
@@ -47,11 +58,32 @@ fn run() -> Result<()> {
         }
     }
 
+    #[cfg(feature = "viz")]
+    let use_viz = args.viz;
+    #[cfg(not(feature = "viz"))]
+    let use_viz = false;
+
     match args.backend {
-        BackendArg::Wgpu => infer_backend::<Wgpu<f32>, _>(&config, &args, "wgpu", init_runtime),
+        BackendArg::Wgpu => {
+            #[cfg(feature = "viz")]
+            if use_viz {
+                return infer_backend_with_viz::<Wgpu<f32>, _>(
+                    &config,
+                    &args,
+                    "wgpu",
+                    init_runtime,
+                );
+            }
+            infer_backend::<Wgpu<f32>, _>(&config, &args, "wgpu", init_runtime)
+        }
         BackendArg::Cuda => {
             #[cfg(feature = "cuda")]
             {
+                if use_viz {
+                    return Err(anyhow!(
+                        "viz overlay requires the wgpu backend; run with --backend wgpu"
+                    ));
+                }
                 infer_backend::<Cuda<f32>, _>(&config, &args, "cuda", |_| {})
             }
             #[cfg(not(feature = "cuda"))]
@@ -76,6 +108,36 @@ where
     Init: Fn(&B::Device),
 {
     let device = B::Device::default();
+    #[cfg(feature = "viz")]
+    {
+        infer_backend_on_device::<B, Init>(
+            config,
+            args,
+            backend_name,
+            device,
+            init_backend,
+            None,
+        )
+    }
+    #[cfg(not(feature = "viz"))]
+    {
+        infer_backend_on_device::<B, Init>(config, args, backend_name, device, init_backend)
+    }
+}
+
+fn infer_backend_on_device<B, Init>(
+    config: &TrainingConfig,
+    args: &Args,
+    backend_name: &str,
+    device: B::Device,
+    init_backend: Init,
+    #[cfg(feature = "viz")] mut viz_runtime: Option<VizRuntime<B>>,
+) -> Result<()>
+where
+    B: Backend + 'static,
+    B::Device: Clone,
+    Init: Fn(&B::Device),
+{
     B::seed(&device, 1337);
     init_backend(&device);
 
@@ -101,8 +163,7 @@ where
         .checkpoint
         .clone()
         .unwrap_or_else(|| default_checkpoint_dir(backend_name));
-    let (checkpoint_base, epoch) =
-        resolve_checkpoint_base(&checkpoint_dir, args.epoch, backend_name)?;
+    let (checkpoint_base, epoch) = resolve_checkpoint_base(&checkpoint_dir, args.epoch)?;
 
     let mut model_config = build_model_config(&config.model, config.training.block_size);
     model_config.vocab_size = tokenizer.len();
@@ -126,7 +187,9 @@ where
         format_checkpoint(&checkpoint_base)
     );
 
-    if args.streaming {
+    let use_streaming = args.streaming;
+
+    if use_streaming {
         let strategy =
             resolve_context_strategy(&generation.context_strategy, config.training.block_size);
         eprintln!("{status_msg}");
@@ -193,6 +256,16 @@ where
                 }
             }
 
+            #[cfg(feature = "viz")]
+            if let Some(viz) = viz_runtime.as_mut() {
+                let token_index = state.position.saturating_sub(1);
+                if viz.encoder.should_capture(token_index) {
+                    let layers = state.take_viz();
+                    let frame = viz.encoder.step(&layers, token_index);
+                    viz.sender.try_send(frame);
+                }
+            }
+
             if stream_err.is_some() {
                 break;
             }
@@ -229,6 +302,72 @@ where
     Ok(())
 }
 
+#[cfg(feature = "viz")]
+fn infer_backend_with_viz<B, Init>(
+    config: &TrainingConfig,
+    args: &Args,
+    backend_name: &str,
+    init_backend: Init,
+) -> Result<()>
+where
+    B: Backend<Device = burn_wgpu::WgpuDevice> + 'static,
+    B::Device: Default + Clone + Send + Sync + 'static,
+    Init: Fn(&B::Device) + Copy + Send + 'static,
+    (): bevy_burn::gpu_burn_to_bevy::BurnBevyPrepare<B>,
+{
+    let model_config = build_model_config(&config.model, config.training.block_size);
+    let dims = VizDimensions {
+        layers: model_config.n_layer,
+        heads: model_config.n_head,
+        latent_per_head: model_config.latent_per_head(),
+    };
+    let viz_config = VizConfig::default();
+
+    let (exit_tx, exit_rx) = mpsc::channel();
+    let overlay = viz::start_overlay_native::<B>(viz_config.clone(), dims, Some(exit_rx));
+    let (viz_handle, mut app) = overlay.split();
+    let device = viz_handle.device().clone();
+    let sender = viz_handle.sender();
+
+    let backend_name = backend_name.to_string();
+    let config = config.clone();
+    let args = args.clone();
+    let infer_thread = std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let viz_runtime = VizRuntime {
+                encoder: VizEncoder::new(
+                    viz_config,
+                    dims.layers,
+                    dims.heads,
+                    dims.latent_per_head,
+                    &device,
+                ),
+                sender,
+            };
+            infer_backend_on_device::<B, Init>(
+                &config,
+                &args,
+                backend_name.as_str(),
+                device,
+                init_backend,
+                Some(viz_runtime),
+            )
+        }));
+
+        let _ = exit_tx.send(());
+        match result {
+            Ok(outcome) => outcome,
+            Err(_) => Err(anyhow!("inference thread panicked")),
+        }
+    });
+
+    app.run();
+    let result = infer_thread
+        .join()
+        .map_err(|_| anyhow!("inference thread crashed"))??;
+    Ok(result)
+}
+
 
 fn apply_generation_overrides(generation: &mut GenerationConfig, args: &Args, block_size: usize) {
     if let Some(prompt) = &args.prompt {
@@ -253,11 +392,7 @@ fn apply_generation_overrides(generation: &mut GenerationConfig, args: &Args, bl
     }
 }
 
-fn resolve_checkpoint_base(
-    path: &Path,
-    epoch: Option<usize>,
-    backend_name: &str,
-) -> Result<(PathBuf, usize)> {
+fn resolve_checkpoint_base(path: &Path, epoch: Option<usize>) -> Result<(PathBuf, usize)> {
     if path.is_dir() {
         let target_epoch = epoch.unwrap_or(find_latest_epoch(path)?);
         let base = path.join(format!("model-{target_epoch}"));
@@ -285,7 +420,7 @@ fn resolve_checkpoint_base(
                 let parent = base
                     .parent()
                     .map(Path::to_path_buf)
-                    .unwrap_or_else(|| PathBuf::from("runs").join(backend_name).join("checkpoint"));
+                    .unwrap_or_else(|| PathBuf::from("runs").join("checkpoint"));
                 base = parent.join(format!("model-{explicit}"));
             }
             explicit
@@ -439,11 +574,18 @@ fn resolve_run_config_path(
 fn default_checkpoint_dir(backend_name: &str) -> PathBuf {
     resolve_latest_run_dir(backend_name)
         .map(|dir| dir.join("checkpoint"))
-        .unwrap_or_else(|| PathBuf::from("runs").join(backend_name).join("checkpoint"))
+        .unwrap_or_else(|| PathBuf::from("runs").join("checkpoint"))
 }
 
 fn resolve_latest_run_dir(backend_name: &str) -> Option<PathBuf> {
-    let run_root = PathBuf::from("runs").join(backend_name);
+    let run_root = PathBuf::from("runs");
+    resolve_latest_run_dir_from(&run_root).or_else(|| {
+        let device_root = run_root.join(backend_name);
+        resolve_latest_run_dir_from(&device_root)
+    })
+}
+
+fn resolve_latest_run_dir_from(run_root: &Path) -> Option<PathBuf> {
     let latest_path = run_root.join("latest");
     let contents = fs::read_to_string(&latest_path).ok()?;
     let name = contents.trim();
@@ -453,7 +595,7 @@ fn resolve_latest_run_dir(backend_name: &str) -> Option<PathBuf> {
     Some(run_root.join(name))
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     author,
     version,

@@ -6,6 +6,8 @@ use crate::positional::RotaryEmbedding;
 pub struct TrainingHyperparameters {
     pub block_size: usize,
     pub batch_size: usize,
+    #[serde(default)]
+    pub epochs: Option<usize>,
     pub max_iters: usize,
     pub log_frequency: usize,
     #[serde(default)]

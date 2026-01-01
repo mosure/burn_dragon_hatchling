@@ -34,8 +34,11 @@ vocab_path = "vocab.json"
 
 [training]
 block_size = 512
-batch_size = 32
+batch_size = 24
 max_iters = 3000
+# epochs = 3
+# When set, training uses full epochs and derives max_iters and lr_schedule.num_iters
+# from steps_per_epoch * epochs (training.max_iters is ignored).
 log_frequency = 100
 fast_train = false
 

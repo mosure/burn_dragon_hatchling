@@ -171,6 +171,8 @@
       const topK = topKParam ? Number(topKParam) : undefined;
       const windowParam = params.get("window");
       const contextWindow = windowParam ? Number(windowParam) : undefined;
+      const vizParam = params.get("viz");
+      const startViz = vizParam === "1" || vizParam === "true";
 
       const cacheName = "bdh-cache-v4";
       const maxBufferChars = 200000;
@@ -326,7 +328,8 @@
         const engine = await loadModel(
           new Uint8Array(modelBytes),
           vocabJson,
-          configJson || undefined
+          configJson || undefined,
+          startViz
         );
 
         overlay.classList.add("hidden");

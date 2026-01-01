@@ -146,7 +146,7 @@ impl<B: Backend> BDH<B> {
                 activation::relu(y_latent)
             };
 
-            let xy_sparse = x_sparse * y_sparse;
+            let xy_sparse = x_sparse.clone() * y_sparse;
             let xy_sparse = self.dropout.forward(xy_sparse);
 
             let mixed = xy_sparse.clone().swap_dims(1, 2);
@@ -374,6 +374,9 @@ impl<B: Backend> BDH<B> {
                 activation::relu(y_latent)
             };
 
+            #[cfg(feature = "viz")]
+            let xy_sparse = x_sparse.clone() * y_sparse;
+            #[cfg(not(feature = "viz"))]
             let xy_sparse = x_sparse * y_sparse;
             let xy_sparse = self.dropout.forward(xy_sparse);
 
@@ -382,25 +385,21 @@ impl<B: Backend> BDH<B> {
 
             #[cfg(feature = "viz")]
             if time > 0 {
-                let neurons = mixed
+                let last = time - 1;
+                let x_last = x_sparse
                     .clone()
-                    .slice_dim(1, (time - 1)..time)
-                    .reshape([batch, heads * latent])
+                    .slice_dim(2, last..time)
+                    .reshape([batch, heads, latent])
                     .slice_dim(0, 0..1)
-                    .reshape([heads * latent]);
-
-                let synapses = xy_sparse
+                    .reshape([heads, latent]);
+                let xy_last = xy_sparse
                     .clone()
-                    .slice_dim(2, (time - 1)..time)
+                    .slice_dim(2, last..time)
                     .reshape([batch, heads, latent])
                     .slice_dim(0, 0..1)
                     .reshape([heads, latent]);
 
-                layer_state.viz = Some(LayerVizState {
-                    attn_rows: Vec::new(),
-                    neurons,
-                    synapses,
-                });
+                layer_state.viz = Some(LayerVizState { x_last, xy_last });
             }
 
             let mixed_flat = mixed.reshape([batch * time, heads * latent]);

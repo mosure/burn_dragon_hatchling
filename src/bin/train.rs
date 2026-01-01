@@ -224,11 +224,14 @@ where
     model_config.vocab_size = tokenizer.len();
 
     let steps_per_epoch = dataset.steps_per_epoch(DatasetSplit::Train);
-    let total_steps = training.max_iters.max(1);
-    let total_epochs = usize::max(1, total_steps.div_ceil(steps_per_epoch));
+    let schedule = resolve_train_schedule(training, steps_per_epoch)?;
+    let steps_per_epoch = schedule.steps_per_epoch;
+    let total_epochs = schedule.total_epochs;
+    let total_steps = schedule.total_steps;
 
     info!(
-        "train schedule: steps_per_epoch={steps_per_epoch}, total_steps={total_steps}, epochs={total_epochs}"
+        "train schedule: steps_per_epoch={steps_per_epoch}, total_steps={total_steps}, epochs={total_epochs}, source={}",
+        schedule.source.as_str()
     );
     let train_loader: Arc<dyn DataLoader<B, SequenceBatch<B>>> =
         Arc::new(RandomDataLoader::<B>::new(
@@ -259,9 +262,14 @@ where
             .with_weight_decay(optimizer_cfg.weight_decay)
             .init::<B, BDH<B>>(),
     );
-    let scheduler = resolve_lr_scheduler(optimizer_cfg, total_steps, &model_config)?;
+    let scheduler_iters = match schedule.source {
+        ScheduleSource::Epochs => Some(total_steps),
+        ScheduleSource::MaxIters => None,
+    };
+    let scheduler =
+        resolve_lr_scheduler(optimizer_cfg, total_steps, scheduler_iters, &model_config)?;
 
-    let run_root = PathBuf::from("runs").join(backend_name);
+    let run_root = PathBuf::from("runs");
     let (run_dir, run_name) = create_run_dir(&run_root)?;
     write_latest_run(&run_root, &run_name)?;
     write_run_config(config, &run_dir, &run_name)?;
@@ -330,6 +338,29 @@ enum ResolvedLrScheduler {
     Noam(NoamLrScheduler),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScheduleSource {
+    Epochs,
+    MaxIters,
+}
+
+impl ScheduleSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            ScheduleSource::Epochs => "epochs",
+            ScheduleSource::MaxIters => "max_iters",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrainSchedule {
+    steps_per_epoch: usize,
+    total_steps: usize,
+    total_epochs: usize,
+    source: ScheduleSource,
+}
+
 struct TrainEnvironment<'a, B>
 where
     B: AutodiffBackend + Clone + 'static,
@@ -390,6 +421,7 @@ where
 fn resolve_lr_scheduler(
     optimizer_cfg: &OptimizerConfig,
     total_steps: usize,
+    override_num_iters: Option<usize>,
     model_config: &BDHConfig,
 ) -> Result<ResolvedLrScheduler> {
     let base_lr = optimizer_cfg.learning_rate;
@@ -408,7 +440,9 @@ fn resolve_lr_scheduler(
             let init_lr = initial_lr.unwrap_or(base_lr);
             let scheduler = CosineAnnealingLrSchedulerConfig::new(
                 init_lr,
-                num_iters.unwrap_or(fallback_iters).max(1),
+                override_num_iters
+                    .unwrap_or_else(|| num_iters.unwrap_or(fallback_iters))
+                    .max(1),
             )
             .with_min_lr(min_lr.unwrap_or(0.0))
             .init()
@@ -424,7 +458,9 @@ fn resolve_lr_scheduler(
             let scheduler = LinearLrSchedulerConfig::new(
                 init_lr,
                 *final_lr,
-                num_iters.unwrap_or(fallback_iters).max(1),
+                override_num_iters
+                    .unwrap_or_else(|| num_iters.unwrap_or(fallback_iters))
+                    .max(1),
             )
             .init()
             .map_err(|err| anyhow!("failed to initialize linear lr scheduler: {err}"))?;
@@ -467,6 +503,83 @@ fn resolve_lr_scheduler(
     };
 
     Ok(schedule)
+}
+
+fn resolve_train_schedule(
+    training: &TrainingHyperparameters,
+    steps_per_epoch: usize,
+) -> Result<TrainSchedule> {
+    let steps_per_epoch = steps_per_epoch.max(1);
+    match training.epochs {
+        Some(epochs) => {
+            let total_epochs = epochs.max(1);
+            let total_steps = steps_per_epoch
+                .checked_mul(total_epochs)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "training.epochs overflow: steps_per_epoch={steps_per_epoch}, epochs={total_epochs}"
+                    )
+                })?
+                .max(1);
+            Ok(TrainSchedule {
+                steps_per_epoch,
+                total_steps,
+                total_epochs,
+                source: ScheduleSource::Epochs,
+            })
+        }
+        None => {
+            let total_steps = training.max_iters.max(1);
+            let total_epochs = usize::max(1, total_steps.div_ceil(steps_per_epoch));
+            Ok(TrainSchedule {
+                steps_per_epoch,
+                total_steps,
+                total_epochs,
+                source: ScheduleSource::MaxIters,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn_dragon_hatchling::ContextStrategyConfig;
+
+    fn make_training(max_iters: usize, epochs: Option<usize>) -> TrainingHyperparameters {
+        TrainingHyperparameters {
+            block_size: 16,
+            batch_size: 2,
+            epochs,
+            max_iters,
+            log_frequency: 10,
+            fast_train: false,
+            context_strategy: ContextStrategyConfig::Infinite,
+        }
+    }
+
+    #[test]
+    fn epochs_schedule_overrides_max_iters() {
+        let training = make_training(5, Some(3));
+        let schedule = resolve_train_schedule(&training, 4).expect("schedule");
+
+        assert_eq!(schedule.source, ScheduleSource::Epochs);
+        assert_eq!(schedule.steps_per_epoch, 4);
+        assert_eq!(schedule.total_epochs, 3);
+        assert_eq!(schedule.total_steps, 12);
+        assert_eq!(schedule.total_steps % schedule.steps_per_epoch, 0);
+    }
+
+    #[test]
+    fn max_iters_schedule_uses_step_limit() {
+        let training = make_training(12, None);
+        let schedule = resolve_train_schedule(&training, 5).expect("schedule");
+
+        assert_eq!(schedule.source, ScheduleSource::MaxIters);
+        assert_eq!(schedule.steps_per_epoch, 5);
+        assert_eq!(schedule.total_steps, 12);
+        assert_eq!(schedule.total_epochs, 3);
+    }
 }
 
 fn build_vocab_only(config: &TrainingConfig) -> Result<()> {

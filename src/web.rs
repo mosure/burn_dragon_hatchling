@@ -15,6 +15,9 @@ use crate::generation::{
 use crate::tokenizer::SharedTokenizer;
 use crate::tokenizer::char_vocab::CharVocab;
 use crate::{BDH, ContextStrategyConfig, ModelOverrides, ModelState, build_model_config};
+
+#[cfg(feature = "viz")]
+use crate::viz::{self, VizConfig, VizDimensions, VizEncoder};
 type WebBackend = burn_wgpu::WebGpu<f32>;
 type WebDevice = <WebBackend as Backend>::Device;
 
@@ -38,6 +41,12 @@ struct StreamState {
     strategy: ContextStrategy,
 }
 
+#[cfg(feature = "viz")]
+struct WebVizRuntime {
+    encoder: VizEncoder<WebBackend>,
+    sender: viz::VizSender<WebBackend>,
+}
+
 #[wasm_bindgen]
 pub struct WasmInference {
     model: BDH<WebBackend>,
@@ -45,6 +54,8 @@ pub struct WasmInference {
     device: WebDevice,
     block_size: usize,
     stream: Option<StreamState>,
+    #[cfg(feature = "viz")]
+    viz: Option<WebVizRuntime>,
 }
 
 #[wasm_bindgen(js_name = "loadModel")]
@@ -52,11 +63,13 @@ pub async fn load_model(
     model_bytes: Vec<u8>,
     vocab_json: String,
     config_json: Option<String>,
+    start_viz: Option<bool>,
 ) -> Result<WasmInference, JsValue> {
     async fn load_inner(
         model_bytes: Vec<u8>,
         vocab_json: String,
         config_json: Option<String>,
+        start_viz: Option<bool>,
     ) -> Result<WasmInference> {
         console_error_panic_hook::set_once();
 
@@ -78,6 +91,12 @@ pub async fn load_model(
 
         let mut model_config = build_model_config(&overrides, block_size);
         model_config.vocab_size = tokenizer.len();
+        #[cfg(feature = "viz")]
+        let dims = VizDimensions {
+            layers: model_config.n_layer,
+            heads: model_config.n_head,
+            latent_per_head: model_config.latent_per_head(),
+        };
 
         let device = WebDevice::default();
         burn_wgpu::init_setup_async::<graphics::WebGpu>(&device, RuntimeOptions::default()).await;
@@ -99,16 +118,42 @@ pub async fn load_model(
             };
         let model = BDH::<WebBackend>::new(model_config, &device).load_record(record);
 
+        #[cfg(feature = "viz")]
+        let viz_runtime = if start_viz.unwrap_or(false) {
+            let viz_config = VizConfig::default();
+            let overlay = viz::start_overlay_wasm::<WebBackend>(viz_config.clone(), dims);
+            let (handle, mut app) = overlay.split();
+            let sender = handle.sender();
+            let _ = app.run();
+            Some(WebVizRuntime {
+                encoder: VizEncoder::new(
+                    viz_config,
+                    dims.layers,
+                    dims.heads,
+                    dims.latent_per_head,
+                    &device,
+                ),
+                sender,
+            })
+        } else {
+            None
+        };
+
+        #[cfg(not(feature = "viz"))]
+        let _ = start_viz;
+
         Ok(WasmInference {
             model,
             tokenizer,
             device,
             block_size,
             stream: None,
+            #[cfg(feature = "viz")]
+            viz: viz_runtime,
         })
     }
 
-    load_inner(model_bytes, vocab_json, config_json)
+    load_inner(model_bytes, vocab_json, config_json, start_viz)
         .await
         .map_err(|err| JsValue::from_str(&err.to_string()))
 }
@@ -198,6 +243,16 @@ impl WasmInference {
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
             stream.last_logits = Some(logits);
             stream.generated = stream.generated.saturating_add(1);
+
+            #[cfg(feature = "viz")]
+            if let Some(viz) = self.viz.as_mut() {
+                let token_index = stream.state.position.saturating_sub(1);
+                if viz.encoder.should_capture(token_index) {
+                    let layers = stream.state.take_viz();
+                    let frame = viz.encoder.step(&layers, token_index);
+                    viz.sender.try_send(frame);
+                }
+            }
 
             if let Ok(token_u32) = u32::try_from(next) {
                 if self.tokenizer.eos_id() == Some(token_u32) {

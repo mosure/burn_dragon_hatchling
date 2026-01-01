@@ -17,9 +17,8 @@ pub struct ModelState<B: Backend> {
 #[cfg(feature = "viz")]
 #[derive(Debug, Clone)]
 pub struct LayerVizState<B: Backend> {
-    pub attn_rows: Vec<Tensor<B, 1>>,
-    pub neurons: Tensor<B, 1>,
-    pub synapses: Tensor<B, 2>,
+    pub x_last: Tensor<B, 2>,
+    pub xy_last: Tensor<B, 2>,
 }
 
 impl<B: Backend> ModelState<B> {

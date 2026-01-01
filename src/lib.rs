@@ -9,6 +9,8 @@ pub mod kernel;
 pub mod model;
 pub mod positional;
 pub mod tokenizer;
+#[cfg(feature = "viz")]
+pub mod viz;
 #[cfg(feature = "cli")]
 pub mod wgpu;
 #[cfg(all(target_arch = "wasm32", feature = "web"))]
