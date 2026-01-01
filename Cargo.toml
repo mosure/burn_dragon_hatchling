@@ -41,6 +41,7 @@ cli = [
   "dep:burn-ndarray",
   "dep:burn-train",
   "dep:clap",
+  "dep:ctrlc",
   "dep:names",
 ]
 train = [
@@ -60,6 +61,7 @@ viz = [
 
 [dependencies]
 bevy_burn = { version = "0.4", optional = true }
+ctrlc = { version = "3.4", optional = true }
 toml = { version = "0.9", optional = true }
 rand = "0.8"
 ureq = { version = "2.9", features = ["tls"], optional = true }

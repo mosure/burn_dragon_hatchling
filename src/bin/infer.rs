@@ -27,11 +27,17 @@ use burn_cuda::Cuda;
 use burn_dragon_hatchling::viz::{self, VizConfig, VizDimensions, VizEncoder};
 #[cfg(feature = "viz")]
 use std::sync::mpsc;
+#[cfg(feature = "viz")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[cfg(feature = "viz")]
 struct VizRuntime<B: Backend> {
     encoder: VizEncoder<B>,
     sender: viz::VizSender<B>,
+    stop: Arc<AtomicBool>,
 }
 
 pub fn main() {
@@ -227,6 +233,13 @@ where
         let max_tokens = normalize_max_tokens(generation.max_tokens);
         let mut generated = 0usize;
         while max_tokens.map_or(true, |max| generated < max) {
+            #[cfg(feature = "viz")]
+            if let Some(viz) = viz_runtime.as_ref() {
+                if viz.stop.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+
             let (next, logits) = sample_next_token(
                 &model,
                 &mut state,
@@ -271,6 +284,13 @@ where
 
             if stream_err.is_some() {
                 break;
+            }
+
+            #[cfg(feature = "viz")]
+            if let Some(viz) = viz_runtime.as_ref() {
+                if viz.stop.load(Ordering::Relaxed) {
+                    break;
+                }
             }
 
             if let ContextStrategy::Sliding { window } = strategy
@@ -328,13 +348,25 @@ where
 
     let (exit_tx, exit_rx) = mpsc::channel();
     let overlay = viz::start_overlay_native::<B>(viz_config.clone(), dims, Some(exit_rx));
+    let stop_flag = overlay.handle().stop_flag();
     let (viz_handle, mut app) = overlay.split();
     let device = viz_handle.device().clone();
     let sender = viz_handle.sender();
 
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let ctrlc_stop = stop_flag.clone();
+        let ctrlc_exit = exit_tx.clone();
+        let _ = ctrlc::set_handler(move || {
+            ctrlc_stop.store(true, Ordering::Relaxed);
+            let _ = ctrlc_exit.send(());
+        });
+    }
+
     let backend_name = backend_name.to_string();
     let config = config.clone();
     let args = args.clone();
+    let stop_for_thread = stop_flag.clone();
     let infer_thread = std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let viz_runtime = VizRuntime {
@@ -346,6 +378,7 @@ where
                     &device,
                 ),
                 sender,
+                stop: stop_for_thread,
             };
             infer_backend_on_device::<B, Init>(
                 &config,

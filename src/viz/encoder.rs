@@ -3,7 +3,7 @@ use burn::tensor::{Tensor, TensorData};
 
 use crate::model::LayerVizState;
 
-use super::frame::{VizConfig, VizFrame};
+use super::frame::{LAYER_GAP, VizConfig, VizFrame};
 use super::palette::{
     COLOR_ACTIVITY, COLOR_INTERACTION, COLOR_MEMORY, COLOR_SEPARATOR, COLOR_WRITES,
 };
@@ -16,6 +16,7 @@ pub struct VizEncoder<B: Backend> {
     heads: usize,
     latent_per_head: usize,
     latent_total: usize,
+    layer_gap: usize,
     units_x: Tensor<B, 3>,
     units_y: Tensor<B, 3>,
     units_xy: Tensor<B, 3>,
@@ -26,6 +27,7 @@ pub struct VizEncoder<B: Backend> {
     color_rho: Tensor<B, 3>,
     separator_rgba: Option<Tensor<B, 3>>,
     zero_units: Tensor<B, 3>,
+    zero_gap: Option<Tensor<B, 3>>,
 }
 
 impl<B: Backend> VizEncoder<B> {
@@ -38,11 +40,17 @@ impl<B: Backend> VizEncoder<B> {
     ) -> Self {
         let history = config.history.max(1);
         let latent_total = heads.saturating_mul(latent_per_head).max(1);
+        let layers = layers.max(1);
+        let layer_gap = LAYER_GAP;
+        let units_height = latent_total
+            .saturating_mul(layers)
+            .saturating_add(layer_gap.saturating_mul(layers.saturating_sub(1)))
+            .max(1);
 
-        let units_x = Tensor::<B, 3>::zeros([latent_total, history, 4], device);
-        let units_y = Tensor::<B, 3>::zeros([latent_total, history, 4], device);
-        let units_xy = Tensor::<B, 3>::zeros([latent_total, history, 4], device);
-        let units_rho = Tensor::<B, 3>::zeros([latent_total, history, 4], device);
+        let units_x = Tensor::<B, 3>::zeros([units_height, history, 4], device);
+        let units_y = Tensor::<B, 3>::zeros([units_height, history, 4], device);
+        let units_xy = Tensor::<B, 3>::zeros([units_height, history, 4], device);
+        let units_rho = Tensor::<B, 3>::zeros([units_height, history, 4], device);
 
         let color_x = color_tensor::<B>(COLOR_WRITES, device);
         let color_y = color_tensor::<B>(COLOR_ACTIVITY, device);
@@ -51,6 +59,11 @@ impl<B: Backend> VizEncoder<B> {
 
         let separator_rgba = build_separator::<B>(latent_total, latent_per_head, device);
         let zero_units = Tensor::<B, 3>::zeros([latent_total, 1, 4], device);
+        let zero_gap = if layer_gap > 0 {
+            Some(Tensor::<B, 3>::zeros([layer_gap, 1, 4], device))
+        } else {
+            None
+        };
 
         Self {
             config,
@@ -58,6 +71,7 @@ impl<B: Backend> VizEncoder<B> {
             heads,
             latent_per_head,
             latent_total,
+            layer_gap,
             units_x,
             units_y,
             units_xy,
@@ -68,6 +82,7 @@ impl<B: Backend> VizEncoder<B> {
             color_rho,
             separator_rgba,
             zero_units,
+            zero_gap,
         }
     }
 
@@ -86,53 +101,80 @@ impl<B: Backend> VizEncoder<B> {
         let cursor = token_index % history;
         let layer_count = self.layers.min(layers.len()).max(1);
 
-        let focus = self.config.layer_focus.min(layer_count.saturating_sub(1));
-        let (x_last, y_last, xy_last, rho_last) = layers
-            .get(focus)
-            .and_then(|layer| layer.as_ref())
-            .map(|layer| {
-                (
-                    layer.x_last.clone(),
-                    layer.y_last.clone(),
-                    layer.xy_last.clone(),
-                    layer.rho_last.clone(),
-                )
-            })
-            .unwrap_or_else(|| {
-                (
-                    Tensor::<B, 2>::zeros([self.heads, self.latent_per_head], &device),
-                    Tensor::<B, 2>::zeros([self.heads, self.latent_per_head], &device),
-                    Tensor::<B, 2>::zeros([self.heads, self.latent_per_head], &device),
-                    Tensor::<B, 2>::zeros([self.heads, self.latent_per_head], &device),
-                )
-            });
+        for layer_idx in 0..layer_count {
+            let offset = layer_idx
+                .saturating_mul(self.latent_total.saturating_add(self.layer_gap));
+            if let Some(gap) = &self.zero_gap {
+                if layer_idx > 0 {
+                    let gap_start = offset.saturating_sub(self.layer_gap);
+                    let gap_end = offset;
+                    self.units_x = self.units_x.clone().slice_assign(
+                        [gap_start..gap_end, cursor..cursor + 1, 0..4],
+                        gap.clone(),
+                    );
+                    self.units_y = self.units_y.clone().slice_assign(
+                        [gap_start..gap_end, cursor..cursor + 1, 0..4],
+                        gap.clone(),
+                    );
+                    self.units_xy = self.units_xy.clone().slice_assign(
+                        [gap_start..gap_end, cursor..cursor + 1, 0..4],
+                        gap.clone(),
+                    );
+                    self.units_rho = self.units_rho.clone().slice_assign(
+                        [gap_start..gap_end, cursor..cursor + 1, 0..4],
+                        gap.clone(),
+                    );
+                }
+            }
 
-        let x_flat = x_last.reshape([self.latent_total]);
-        let y_flat = y_last.reshape([self.latent_total]);
-        let xy_flat = xy_last.reshape([self.latent_total]);
-        let rho_flat = rho_last.reshape([self.latent_total]);
+            let (x_last, y_last, xy_last, rho_last) = layers
+                .get(layer_idx)
+                .and_then(|layer| layer.as_ref())
+                .map(|layer| {
+                    (
+                        layer.x_last.clone(),
+                        layer.y_last.clone(),
+                        layer.xy_last.clone(),
+                        layer.rho_last.clone(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        Tensor::<B, 2>::zeros([self.heads, self.latent_per_head], &device),
+                        Tensor::<B, 2>::zeros([self.heads, self.latent_per_head], &device),
+                        Tensor::<B, 2>::zeros([self.heads, self.latent_per_head], &device),
+                        Tensor::<B, 2>::zeros([self.heads, self.latent_per_head], &device),
+                    )
+                });
 
-        let units_x_col = self.encode_units(x_flat, self.config.gain_x, &self.color_x);
-        let units_y_col = self.encode_units(y_flat, self.config.gain_xy, &self.color_y);
-        let units_xy_col = self.encode_units(xy_flat, self.config.gain_xy, &self.color_xy);
-        let units_rho_col = self.encode_units(rho_flat, self.config.gain_xy, &self.color_rho);
+            let x_flat = x_last.reshape([self.latent_total]);
+            let y_flat = y_last.reshape([self.latent_total]);
+            let xy_flat = xy_last.reshape([self.latent_total]);
+            let rho_flat = rho_last.reshape([self.latent_total]);
 
-        self.units_x = self.units_x.clone().slice_assign(
-            [0..self.latent_total, cursor..cursor + 1, 0..4],
-            units_x_col,
-        );
-        self.units_y = self.units_y.clone().slice_assign(
-            [0..self.latent_total, cursor..cursor + 1, 0..4],
-            units_y_col,
-        );
-        self.units_xy = self.units_xy.clone().slice_assign(
-            [0..self.latent_total, cursor..cursor + 1, 0..4],
-            units_xy_col,
-        );
-        self.units_rho = self.units_rho.clone().slice_assign(
-            [0..self.latent_total, cursor..cursor + 1, 0..4],
-            units_rho_col,
-        );
+            let units_x_col = self.encode_units(x_flat, self.config.gain_x, &self.color_x);
+            let units_y_col = self.encode_units(y_flat, self.config.gain_xy, &self.color_y);
+            let units_xy_col = self.encode_units(xy_flat, self.config.gain_xy, &self.color_xy);
+            let units_rho_col = self.encode_units(rho_flat, self.config.gain_xy, &self.color_rho);
+
+            let range = offset..offset + self.latent_total;
+            self.units_x = self.units_x.clone().slice_assign(
+                [range.clone(), cursor..cursor + 1, 0..4],
+                units_x_col,
+            );
+            self.units_y = self.units_y.clone().slice_assign(
+                [range.clone(), cursor..cursor + 1, 0..4],
+                units_y_col,
+            );
+            self.units_xy = self.units_xy.clone().slice_assign(
+                [range.clone(), cursor..cursor + 1, 0..4],
+                units_xy_col,
+            );
+            self.units_rho = self.units_rho.clone().slice_assign(
+                [range, cursor..cursor + 1, 0..4],
+                units_rho_col,
+            );
+        }
 
         VizFrame {
             units_x: self.units_x.clone(),
@@ -275,10 +317,10 @@ mod tests {
 
         let frame = encoder.step(&[Some(layer0), Some(layer1)], 0);
 
-        assert_eq!(frame.units_x.shape().dims::<3>(), [4, 4, 4]);
-        assert_eq!(frame.units_y.shape().dims::<3>(), [4, 4, 4]);
-        assert_eq!(frame.units_xy.shape().dims::<3>(), [4, 4, 4]);
-        assert_eq!(frame.units_rho.shape().dims::<3>(), [4, 4, 4]);
+        assert_eq!(frame.units_x.shape().dims::<3>(), [11, 4, 4]);
+        assert_eq!(frame.units_y.shape().dims::<3>(), [11, 4, 4]);
+        assert_eq!(frame.units_xy.shape().dims::<3>(), [11, 4, 4]);
+        assert_eq!(frame.units_rho.shape().dims::<3>(), [11, 4, 4]);
         assert_eq!(frame.cursor, 0);
 
         let units_x = frame

@@ -2274,6 +2274,7 @@ dependencies = [
  "console_error_panic_hook",
  "criterion",
  "crossbeam-channel",
+ "ctrlc",
  "cubecl",
  "cubecl-runtime",
  "futures-intrusive",
