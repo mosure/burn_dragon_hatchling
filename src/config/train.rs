@@ -46,6 +46,12 @@ pub enum DatasetSourceConfig {
         #[serde(default)]
         max_records: Option<usize>,
     },
+    PoetryFoundation {
+        #[serde(default)]
+        revision: Option<String>,
+        #[serde(default)]
+        max_records: Option<usize>,
+    },
 }
 
 impl Default for DatasetSourceConfig {
@@ -82,6 +88,7 @@ pub enum HuggingFaceRecordFormat {
     Jsonl,
     Text,
     Parquet,
+    Csv,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

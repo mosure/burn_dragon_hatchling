@@ -180,7 +180,7 @@ pub fn generate_tokens<B: Backend>(
         state.trim(window);
     }
 
-    while max_new_tokens.map_or(true, |max| generated < max) {
+    while max_new_tokens.is_none_or(|max| generated < max) {
         let (next, logits) =
             sample_next_token(model, &mut state, last_logits, temperature, top_k, device)?;
         full_tokens.push(next);

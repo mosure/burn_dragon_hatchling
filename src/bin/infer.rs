@@ -232,7 +232,7 @@ where
 
         let max_tokens = normalize_max_tokens(generation.max_tokens);
         let mut generated = 0usize;
-        while max_tokens.map_or(true, |max| generated < max) {
+        while max_tokens.is_none_or(|max| generated < max) {
             #[cfg(feature = "viz")]
             if let Some(viz) = viz_runtime.as_ref() {
                 if viz.stop.load(Ordering::Relaxed) {
@@ -586,32 +586,22 @@ fn resolve_run_config_path(
         if checkpoint_path
             .file_name()
             .is_some_and(|name| name == "checkpoint")
-            && checkpoint_path.parent().is_some()
+            && let Some(parent) = checkpoint_path.parent()
         {
-            if let Some(parent) = checkpoint_path.parent() {
-                candidates.push(parent.join("config.json"));
-            }
+            candidates.push(parent.join("config.json"));
         }
     } else if let Some(parent) = checkpoint_path.parent() {
         candidates.push(parent.join("config.json"));
         if parent
             .file_name()
             .is_some_and(|name| name == "checkpoint")
-            && parent.parent().is_some()
+            && let Some(grandparent) = parent.parent()
         {
-            if let Some(grandparent) = parent.parent() {
-                candidates.push(grandparent.join("config.json"));
-            }
+            candidates.push(grandparent.join("config.json"));
         }
     }
 
-    for path in candidates {
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-
-    None
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 fn default_checkpoint_dir(backend_name: &str) -> PathBuf {
