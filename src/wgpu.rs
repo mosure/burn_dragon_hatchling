@@ -13,6 +13,10 @@ pub type WgpuDevice = <Wgpu<f32> as BackendTrait>::Device;
 /// * `BDH_WGPU_TASKS_MAX` - maximum aggregated tasks per GPU submit (usize).
 /// * `BDH_WGPU_MEMORY` - `subslices` (default) or `exclusive`.
 pub fn init_runtime(device: &WgpuDevice) {
+    if matches!(device, WgpuDevice::Existing(_)) {
+        return;
+    }
+
     match backend_override() {
         BackendOverride::Auto => {
             burn_wgpu::init_setup::<graphics::AutoGraphicsApi>(device, runtime_options());

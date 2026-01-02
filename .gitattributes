@@ -6,3 +6,5 @@
 
 *.ply binary
 *.splat binary
+
+*.lock -diff

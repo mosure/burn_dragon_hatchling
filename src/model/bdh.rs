@@ -12,7 +12,7 @@ use super::attention::Attention;
 use super::config::{BDHConfig, FusedKernelConfig};
 #[cfg(feature = "viz")]
 use super::state::LayerVizState;
-use super::state::ModelState;
+use super::state::{LayerState, ModelState};
 
 const LAYER_NORM_EPS: f32 = 1e-5;
 
@@ -89,11 +89,23 @@ impl<B: Backend> BDH<B> {
     }
 
     pub fn forward(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        let mut state = self.embed.forward(tokens).unsqueeze_dim::<4>(1);
-        state = self.layer_norm(state);
+        let mut state = self.init_state();
+        self.forward_with_state(tokens, &mut state)
+    }
 
-        let encoder = self.encoder.val().unsqueeze_dim::<4>(0);
-        let encoder_v = self.encoder_v.val().unsqueeze_dim::<4>(0);
+    pub fn forward_fast(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+        let embedded = self.embed.forward(tokens);
+        let [batch, time, embd] = embedded.shape().dims::<3>();
+        let mut current = embedded.reshape([batch, 1, time, embd]);
+        current = self.layer_norm(current);
+
+        let encoder_raw = self.encoder.val();
+        let [heads, embd_enc, latent] = encoder_raw.shape().dims::<3>();
+        let encoder = encoder_raw.reshape([1, heads, embd_enc, latent]);
+
+        let encoder_v_raw = self.encoder_v.val();
+        let [heads_v, embd_v, latent_v] = encoder_v_raw.shape().dims::<3>();
+        let encoder_v = encoder_v_raw.reshape([1, heads_v, embd_v, latent_v]);
         let decoder = self.decoder.val();
         let fused = self.kernel.enabled;
         let latent_pattern: &BlockPattern1d = &self.kernel.block_sparse.latent;
@@ -101,21 +113,21 @@ impl<B: Backend> BDH<B> {
         for _ in 0..self.n_layer {
             let x_sparse = if fused {
                 relu_lowrank::fused_forward(
-                    state.clone(),
+                    current.clone(),
                     encoder.clone(),
                     None,
                     self.kernel.relu_threshold,
                     latent_pattern,
                 )
             } else {
-                let mut x_latent = state.clone().matmul(encoder.clone());
+                let mut x_latent = current.clone().matmul(encoder.clone());
                 if self.kernel.relu_threshold != 0.0 {
                     x_latent = x_latent.sub_scalar(self.kernel.relu_threshold);
                 }
                 activation::relu(x_latent)
             };
 
-            let attn = self.attention.forward(x_sparse.clone(), state.clone());
+            let attn = self.attention.forward(x_sparse.clone(), current.clone());
             let attn = self.layer_norm(attn);
 
             let y_sparse = if fused {
@@ -133,23 +145,23 @@ impl<B: Backend> BDH<B> {
                 }
                 activation::relu(y_latent)
             };
-            let xy_sparse = x_sparse * y_sparse;
+
+            let xy_sparse = x_sparse.clone() * y_sparse;
             let xy_sparse = self.dropout.forward(xy_sparse);
 
             let mixed = xy_sparse.clone().swap_dims(1, 2);
             let [batch, time, heads, latent] = mixed.shape().dims();
+
             let mixed_flat = mixed.reshape([batch * time, heads * latent]);
 
             let mlp_flat = mixed_flat.matmul(decoder.clone());
-            let mlp_out = mlp_flat
-                .reshape([batch, time, self.n_embd])
-                .unsqueeze_dim::<4>(1);
+            let mlp_out = mlp_flat.reshape([batch, 1, time, self.n_embd]);
             let mlp_out = self.layer_norm(mlp_out);
-            state = self.layer_norm(state + mlp_out);
+            current = self.layer_norm(current + mlp_out);
         }
 
-        let [batch, _, time, dim] = state.shape().dims();
-        state
+        let [batch, _, time, dim] = current.shape().dims();
+        current
             .reshape([batch * time, dim])
             .matmul(self.lm_head.val())
             .reshape([batch, time, self.vocab_size])
@@ -243,6 +255,57 @@ impl<B: Backend> BDH<B> {
         ModelState::new(self.n_layer)
     }
 
+    fn recurrent_attention(
+        &self,
+        query: Tensor<B, 4>,
+        value: Tensor<B, 4>,
+        layer_state: &mut LayerState<B>,
+        position: usize,
+    ) -> Tensor<B, 4> {
+        let query = self.attention.rotate_positions(query, position);
+        let [batch, heads, time, latent] = query.shape().dims();
+        let n_embd = value.shape().dims::<4>()[3];
+        let device = value.device();
+        let decay = self
+            .attention
+            .alibi_decay()
+            .map(|tensor| tensor.reshape([1, heads, 1, 1]));
+
+        let mut rho = match layer_state.rho.take() {
+            Some(existing) => {
+                let dims = existing.shape().dims::<4>();
+                if dims == [batch, heads, latent, n_embd] {
+                    existing
+                } else {
+                    Tensor::<B, 4>::zeros([batch, heads, latent, n_embd], &device)
+                }
+            }
+            None => Tensor::<B, 4>::zeros([batch, heads, latent, n_embd], &device),
+        };
+
+        let mut outputs: Vec<Tensor<B, 4>> = Vec::with_capacity(time);
+
+        for t in 0..time {
+            let x_t = query.clone().slice_dim(2, t..t + 1);
+            let v_t = value.clone().slice_dim(2, t..t + 1).repeat_dim(1, heads);
+            let x_t_latent = x_t.swap_dims(2, 3);
+
+            let attn_t = (rho.clone() * x_t_latent.clone())
+                .sum_dim(2)
+                .reshape([batch, heads, 1, n_embd]);
+            outputs.push(attn_t);
+
+            rho = rho + x_t_latent * v_t;
+            if let Some(decay) = &decay {
+                rho = rho * decay.clone();
+            }
+        }
+
+        layer_state.rho = Some(rho);
+
+        Tensor::cat(outputs, 2)
+    }
+
     pub fn forward_with_state(
         &self,
         tokens: Tensor<B, 2, Int>,
@@ -253,14 +316,22 @@ impl<B: Backend> BDH<B> {
             self.n_layer,
             "model state layers mismatch"
         );
-        let mut current = self.embed.forward(tokens).unsqueeze_dim::<4>(1);
+        let embedded = self.embed.forward(tokens);
+        let [batch, time, embd] = embedded.shape().dims::<3>();
+        let mut current = embedded.reshape([batch, 1, time, embd]);
         current = self.layer_norm(current);
 
-        let encoder = self.encoder.val().unsqueeze_dim::<4>(0);
-        let encoder_v = self.encoder_v.val().unsqueeze_dim::<4>(0);
+        let encoder_raw = self.encoder.val();
+        let [heads, embd_enc, latent] = encoder_raw.shape().dims::<3>();
+        let encoder = encoder_raw.reshape([1, heads, embd_enc, latent]);
+
+        let encoder_v_raw = self.encoder_v.val();
+        let [heads_v, embd_v, latent_v] = encoder_v_raw.shape().dims::<3>();
+        let encoder_v = encoder_v_raw.reshape([1, heads_v, embd_v, latent_v]);
         let decoder = self.decoder.val();
         let fused = self.kernel.enabled;
         let latent_pattern: &BlockPattern1d = &self.kernel.block_sparse.latent;
+        let start_pos = state.position;
 
         for layer_state in &mut state.layers {
             let x_sparse = if fused {
@@ -279,10 +350,11 @@ impl<B: Backend> BDH<B> {
                 activation::relu(x_latent)
             };
 
-            let attn = self.attention.forward_cached(
+            let attn = self.recurrent_attention(
                 x_sparse.clone(),
                 current.clone(),
-                &mut layer_state.attention,
+                layer_state,
+                start_pos,
             );
             let attn = self.layer_norm(attn);
 
@@ -302,6 +374,9 @@ impl<B: Backend> BDH<B> {
                 activation::relu(y_latent)
             };
 
+            #[cfg(feature = "viz")]
+            let xy_sparse = x_sparse.clone() * y_sparse.clone();
+            #[cfg(not(feature = "viz"))]
             let xy_sparse = x_sparse * y_sparse;
             let xy_sparse = self.dropout.forward(xy_sparse);
 
@@ -310,58 +385,64 @@ impl<B: Backend> BDH<B> {
 
             #[cfg(feature = "viz")]
             if time > 0 {
-                let attn_rows = layer_state
-                    .attention
-                    .last_attention()
-                    .map(|tensor| {
-                        let dims = tensor.shape().dims::<3>();
-                        let context = dims[2];
-                        (0..dims[1])
-                            .map(|head_idx| {
-                                tensor
-                                    .clone()
-                                    .slice_dim(0, 0..1)
-                                    .slice_dim(1, head_idx..head_idx + 1)
-                                    .reshape([context])
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-
-                let neurons = mixed
+                let last = time - 1;
+                let x_last = x_sparse
                     .clone()
-                    .slice_dim(1, (time - 1)..time)
-                    .reshape([batch, heads * latent])
-                    .slice_dim(0, 0..1)
-                    .reshape([heads * latent]);
-
-                let synapses = xy_sparse
-                    .clone()
-                    .slice_dim(2, (time - 1)..time)
+                    .slice_dim(2, last..time)
                     .reshape([batch, heads, latent])
                     .slice_dim(0, 0..1)
                     .reshape([heads, latent]);
+                let y_last = y_sparse
+                    .clone()
+                    .slice_dim(2, last..time)
+                    .reshape([batch, heads, latent])
+                    .slice_dim(0, 0..1)
+                    .reshape([heads, latent]);
+                let xy_last = xy_sparse
+                    .clone()
+                    .slice_dim(2, last..time)
+                    .reshape([batch, heads, latent])
+                    .slice_dim(0, 0..1)
+                    .reshape([heads, latent]);
+                let device = x_last.device();
+                let rho_last = match layer_state.rho.as_ref() {
+                    Some(rho) => {
+                        let dims = rho.shape().dims::<4>();
+                        if dims == [batch, heads, latent, self.n_embd] {
+                            let rho_energy = rho
+                                .clone()
+                                .abs()
+                                .sum_dim(3)
+                                .div_scalar(self.n_embd as f32)
+                                .reshape([batch, heads, latent])
+                                .sum_dim(0)
+                                .div_scalar(batch as f32);
+                            rho_energy.reshape([heads, latent])
+                        } else {
+                            Tensor::<B, 2>::zeros([heads, latent], &device)
+                        }
+                    }
+                    None => Tensor::<B, 2>::zeros([heads, latent], &device),
+                };
 
                 layer_state.viz = Some(LayerVizState {
-                    attn_rows,
-                    neurons,
-                    synapses,
+                    x_last,
+                    y_last,
+                    xy_last,
+                    rho_last,
                 });
             }
 
             let mixed_flat = mixed.reshape([batch * time, heads * latent]);
 
             let mlp_flat = mixed_flat.matmul(decoder.clone());
-            let mlp_out = mlp_flat
-                .reshape([batch, time, self.n_embd])
-                .unsqueeze_dim::<4>(1);
+            let mlp_out = mlp_flat.reshape([batch, 1, time, self.n_embd]);
             let mlp_out = self.layer_norm(mlp_out);
             current = self.layer_norm(current + mlp_out);
         }
 
-        state.position = state.len();
-
         let [batch, _, time, dim] = current.shape().dims();
+        state.position = state.position.saturating_add(time);
         current
             .reshape([batch * time, dim])
             .matmul(self.lm_head.val())

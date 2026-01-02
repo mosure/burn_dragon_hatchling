@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>burn_dragon_hatchling</title>
+    <style>
+      @font-face {
+        font-family: "Nanum Gothic Coding Bold";
+        src: url("./assets/font/NanumGothicCoding-Bold.tff") format("truetype");
+        font-weight: 700;
+        font-style: normal;
+        font-display: swap;
+      }
+
+      :root {
+        color-scheme: dark;
+        --bg-0: #030304;
+        --bg-1: #0b1014;
+        --bg-2: #12161b;
+        --text: #e7e9ec;
+        --muted: #9aa3ad;
+        --accent: #6ef5d2;
+        --accent-2: #5fd0ff;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        color: var(--text);
+        font-family: "Nanum Gothic Coding Bold", "JetBrains Mono", monospace;
+        overflow: hidden;
+        overscroll-behavior: none;
+      }
+
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        background-image:
+          repeating-linear-gradient(
+            135deg,
+            rgba(255, 255, 255, 0.02) 0px,
+            rgba(255, 255, 255, 0.02) 1px,
+            transparent 1px,
+            transparent 4px
+          );
+        pointer-events: none;
+        mix-blend-mode: screen;
+      }
+
+      #viewport {
+        position: fixed;
+        inset: 0;
+        overflow: hidden;
+      }
+
+      #bevy {
+        position: absolute;
+        right: 16px;
+        bottom: 16px;
+        width: 40vw;
+        height: 40vh;
+        max-width: 720px;
+        max-height: 480px;
+        z-index: 20;
+        opacity: 1;
+        pointer-events: auto;
+        background: #050507;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
+      }
+
+      #output {
+        position: absolute;
+        inset-inline: 0;
+        top: 0;
+        padding: clamp(24px, 5vw, 56px);
+        font-size: clamp(15px, 1.4vw, 18px);
+        line-height: 1.6;
+        white-space: pre-wrap;
+        word-break: break-word;
+        will-change: transform;
+      }
+
+      #fade-top {
+        position: absolute;
+        inset-inline: 0;
+        top: 0;
+        height: clamp(48px, 10vh, 96px);
+        background: linear-gradient(
+          to bottom,
+          rgba(3, 3, 4, 0.95) 0%,
+          rgba(3, 3, 4, 0.0) 100%
+        );
+        opacity: 0;
+        transition: opacity 0.2s ease;
+        pointer-events: none;
+        z-index: 2;
+      }
+
+      #fade-top.active {
+        opacity: 1;
+      }
+
+      #overlay {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        background: rgba(3, 3, 4, 0.88);
+        backdrop-filter: blur(6px);
+        z-index: 10;
+        transition: opacity 0.4s ease;
+      }
+
+      #overlay.hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      .loader {
+        display: grid;
+        gap: 16px;
+        text-align: center;
+        color: var(--muted);
+        letter-spacing: 0.02em;
+      }
+
+      .spinner {
+        width: 56px;
+        height: 56px;
+        border-radius: 50%;
+        border: 3px solid rgba(110, 245, 210, 0.18);
+        border-top-color: var(--accent);
+        border-right-color: var(--accent-2);
+        animation: spin 1.1s linear infinite;
+        margin: 0 auto;
+        box-shadow: 0 0 24px rgba(110, 245, 210, 0.22);
+      }
+
+      .status {
+        font-size: 14px;
+        text-transform: uppercase;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="overlay">
+      <div class="loader">
+        <div class="spinner"></div>
+        <div class="status" id="status">booting inference runtime</div>
+      </div>
+    </div>
+    <div id="viewport">
+      <div id="output"></div>
+      <div id="fade-top"></div>
+    </div>
+    <canvas id="bevy"></canvas>
+
+    <script type="module">
+      import init, { loadModel } from "./out/burn_dragon_hatchling.js";
+
+      const overlay = document.getElementById("overlay");
+      const status = document.getElementById("status");
+      const output = document.getElementById("output");
+      const fadeTop = document.getElementById("fade-top");
+
+      const params = new URLSearchParams(window.location.search);
+      const modelName = params.get("model_name") || "tiny_shakespeare";
+      const modelBase = `./assets/model/${modelName}`;
+      const modelUrl = params.get("model") || `${modelBase}/model.bin`;
+      const vocabUrl = params.get("vocab") || `${modelBase}/vocab.json`;
+      const configUrl = params.get("config") || `${modelBase}/config.json`;
+      // Config JSON: { "block_size": 256, "max_tokens": -1, "overrides": { "n_layer": 6, ... } }
+      const prompt =
+        params.get("prompt") ||
+        "dragon hatchlings dream in sparse pulses\n";
+      const maxTokensParam = params.get("max_tokens") || -1;
+      const temperature = Number(params.get("temp") || 0.9);
+      const topKParam = params.get("top_k");
+      const topK = topKParam ? Number(topKParam) : undefined;
+      const windowParam = params.get("window");
+      const contextWindow = windowParam ? Number(windowParam) : undefined;
+      const vizParam = params.get("viz") || "1";
+      const startViz = vizParam === "1" || vizParam === "true";
+      const bevyCanvas = document.getElementById("bevy");
+      if (bevyCanvas && !startViz) {
+        bevyCanvas.style.opacity = "0";
+        bevyCanvas.style.pointerEvents = "none";
+      }
+
+      const cacheName = "bdh-cache-v5";
+      const maxBufferChars = 200000;
+      const trimBufferChars = 150000;
+      const scrollLiftRatio = 0.6;
+      const bottomTriggerPx = 12;
+      const scrollAnimMs = 180;
+      let outputBuffer = "";
+      let scrollOffset = 0;
+      let animStart = 0;
+      let animFrom = 0;
+      let animTo = 0;
+      let animating = false;
+
+      const setStatus = (text) => {
+        status.textContent = text;
+      };
+
+      const parseNumber = (value, fallback) => {
+        const num = Number(value);
+        return Number.isFinite(num) ? num : fallback;
+      };
+
+      const fetchCached = async (url, asText) => {
+        if (!url) {
+          return null;
+        }
+
+        if ("caches" in window) {
+          const cache = await caches.open(cacheName);
+          const cached = await cache.match(url);
+          if (cached) {
+            return asText ? cached.text() : cached.arrayBuffer();
+          }
+
+          const response = await fetch(url, { cache: "no-store" });
+          if (!response.ok) {
+            throw new Error(`failed to fetch ${url}: ${response.status}`);
+          }
+          cache.put(url, response.clone());
+          return asText ? response.text() : response.arrayBuffer();
+        }
+
+        const response = await fetch(url, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`failed to fetch ${url}: ${response.status}`);
+        }
+        return asText ? response.text() : response.arrayBuffer();
+      };
+
+      const appendOutput = (chunk) => {
+        outputBuffer += chunk;
+        let trimmed = false;
+        if (outputBuffer.length > maxBufferChars) {
+          outputBuffer = outputBuffer.slice(outputBuffer.length - trimBufferChars);
+          trimmed = true;
+        }
+        output.textContent = outputBuffer;
+        return trimmed;
+      };
+
+      const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+
+      const applyScroll = () => {
+        if (scrollOffset < 0) {
+          scrollOffset = 0;
+        }
+        output.style.transform = `translateY(${-scrollOffset}px)`;
+        if (scrollOffset > 2) {
+          fadeTop.classList.add("active");
+        } else {
+          fadeTop.classList.remove("active");
+        }
+      };
+
+      const stepScroll = (now) => {
+        if (!animating) {
+          return;
+        }
+        const elapsed = now - animStart;
+        const t = Math.min(1, elapsed / scrollAnimMs);
+        const eased = easeOutCubic(t);
+        scrollOffset = animFrom + (animTo - animFrom) * eased;
+        applyScroll();
+        if (t < 1) {
+          requestAnimationFrame(stepScroll);
+        } else {
+          animating = false;
+        }
+      };
+
+      const animateTo = (target) => {
+        if (Math.abs(target - scrollOffset) < 1) {
+          return;
+        }
+        animFrom = scrollOffset;
+        animTo = target;
+        animStart = performance.now();
+        if (!animating) {
+          animating = true;
+          requestAnimationFrame(stepScroll);
+        }
+      };
+
+      const adjustScroll = (force) => {
+        const contentHeight = output.scrollHeight;
+        const viewportHeight = window.innerHeight;
+        const liftPx = viewportHeight * scrollLiftRatio;
+        const maxOffset = Math.max(0, contentHeight - (viewportHeight - liftPx));
+
+        if (force) {
+          scrollOffset = maxOffset;
+          animating = false;
+          applyScroll();
+          return;
+        }
+
+        const gap = scrollOffset + viewportHeight - contentHeight;
+        if (gap > bottomTriggerPx) {
+          return;
+        }
+
+        animateTo(maxOffset);
+      };
+
+      window.addEventListener("resize", () => adjustScroll(true), {
+        passive: true,
+      });
+
+      const run = async () => {
+        setStatus("loading wasm runtime");
+        await init();
+
+        setStatus("downloading model weights");
+        const modelBytes = await fetchCached(modelUrl, false);
+
+        setStatus("loading vocab");
+        const vocabJson = await fetchCached(vocabUrl, true);
+
+        let configJson = null;
+        let configData = null;
+        if (configUrl) {
+          setStatus("loading model config");
+          configJson = await fetchCached(configUrl, true);
+          try {
+            configData = JSON.parse(configJson);
+          } catch (err) {
+            throw new Error(`invalid config json: ${err?.message || err}`);
+          }
+        }
+
+        setStatus("initializing model");
+        const engine = await loadModel(
+          new Uint8Array(modelBytes),
+          vocabJson,
+          configJson || undefined,
+          startViz
+        );
+
+        overlay.classList.add("hidden");
+
+        const maxTokens =
+          maxTokensParam !== null
+            ? parseNumber(maxTokensParam, 512)
+            : parseNumber(configData?.max_tokens, 512);
+
+        const intro = engine.startStream(
+          prompt,
+          maxTokens,
+          temperature,
+          topK,
+          contextWindow
+        );
+        outputBuffer = intro;
+        output.textContent = outputBuffer;
+        adjustScroll(true);
+
+        const tokensPerFrame = 4;
+        let done = false;
+
+        const pump = async () => {
+          if (done) {
+            return;
+          }
+
+          let trimmed = false;
+          try {
+            for (let i = 0; i < tokensPerFrame; i += 1) {
+              const chunk = await engine.nextChunk();
+              if (chunk === undefined) {
+                done = true;
+                return;
+              }
+              if (chunk.length) {
+                trimmed = appendOutput(chunk) || trimmed;
+              }
+            }
+          } catch (err) {
+            done = true;
+            output.textContent = `error: ${err?.message || err}`;
+            return;
+          }
+
+          adjustScroll(trimmed);
+          requestAnimationFrame(() => {
+            void pump();
+          });
+        };
+
+        requestAnimationFrame(() => {
+          void pump();
+        });
+      };
+
+      run().catch((err) => {
+        overlay.classList.add("hidden");
+        output.textContent = `error: ${err?.message || err}`;
+      });
+    </script>
+  </body>
+</html>

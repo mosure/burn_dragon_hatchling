@@ -3,9 +3,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use names::Generator;
 
 use burn::data::dataloader::DataLoader;
 use burn::lr_scheduler::{
@@ -41,9 +44,10 @@ use burn::record::{BinFileRecorder, FullPrecisionSettings};
 use burn_dragon_hatchling::wgpu::init_runtime;
 use burn_dragon_hatchling::{
     BDH, BDHConfig, Dataset, DatasetConfig, DatasetSplit, LearningRateScheduleConfig,
-    ModelOverrides, OptimizerConfig, RandomDataLoader, SequenceBatch, TrainingConfig,
-    TrainingHyperparameters, build_dataset, language_model_loss, load_training_config,
+    OptimizerConfig, RandomDataLoader, SequenceBatch, TrainingConfig, TrainingHyperparameters,
+    build_dataset, build_model_config, language_model_loss, load_training_config,
 };
+use serde::Serialize;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Train the Baby Dragon Hatchling model")]
@@ -74,6 +78,12 @@ enum Command {
 enum BackendArg {
     Cuda,
     Wgpu,
+}
+
+static FAST_TRAIN: AtomicBool = AtomicBool::new(false);
+
+fn fast_train_enabled() -> bool {
+    FAST_TRAIN.load(Ordering::Relaxed)
 }
 
 #[derive(Clone)]
@@ -123,7 +133,11 @@ type ValidBackend<B> = <B as AutodiffBackend>::InnerBackend;
 
 impl<B: AutodiffBackend> TrainStep<SequenceBatch<B>, LanguageModelTrainItem<B>> for BDH<B> {
     fn step(&self, batch: SequenceBatch<B>) -> TrainOutput<LanguageModelTrainItem<B>> {
-        let logits = self.forward(batch.inputs);
+        let logits = if fast_train_enabled() {
+            self.forward_fast(batch.inputs)
+        } else {
+            self.forward(batch.inputs)
+        };
         let loss = language_model_loss::<B>(logits, batch.targets);
         let grads = loss.backward();
 
@@ -133,13 +147,17 @@ impl<B: AutodiffBackend> TrainStep<SequenceBatch<B>, LanguageModelTrainItem<B>> 
 
 impl<B: BackendTrait> ValidStep<SequenceBatch<B>, LanguageModelOutput<B>> for BDH<B> {
     fn step(&self, batch: SequenceBatch<B>) -> LanguageModelOutput<B> {
-        let logits = self.forward(batch.inputs);
+        let logits = if fast_train_enabled() {
+            self.forward_fast(batch.inputs)
+        } else {
+            self.forward(batch.inputs)
+        };
         let loss = language_model_loss::<B>(logits, batch.targets);
         LanguageModelOutput::new(loss)
     }
 }
 
-fn main() {
+pub fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err:#}");
         std::process::exit(1);
@@ -152,6 +170,7 @@ fn run() -> Result<()> {
     let mut config_paths = vec![PathBuf::from("config/base.toml")];
     config_paths.extend(args.train.config.clone());
     let config = load_training_config(&config_paths)?;
+    FAST_TRAIN.store(config.training.fast_train, Ordering::Relaxed);
 
     if matches!(args.command, Some(Command::BuildVocab)) {
         build_vocab_only(&config)?;
@@ -200,16 +219,19 @@ where
     let training = &config.training;
     let optimizer_cfg = &config.optimizer;
 
-    let mut model_config = build_model_config(&config.model);
+    let mut model_config = build_model_config(&config.model, training.block_size);
     let tokenizer = dataset.tokenizer();
     model_config.vocab_size = tokenizer.len();
 
     let steps_per_epoch = dataset.steps_per_epoch(DatasetSplit::Train);
-    let total_steps = training.max_iters.max(1);
-    let total_epochs = usize::max(1, total_steps.div_ceil(steps_per_epoch));
+    let schedule = resolve_train_schedule(training, steps_per_epoch)?;
+    let steps_per_epoch = schedule.steps_per_epoch;
+    let total_epochs = schedule.total_epochs;
+    let total_steps = schedule.total_steps;
 
     info!(
-        "train schedule: steps_per_epoch={steps_per_epoch}, total_steps={total_steps}, epochs={total_epochs}"
+        "train schedule: steps_per_epoch={steps_per_epoch}, total_steps={total_steps}, epochs={total_epochs}, source={}",
+        schedule.source.as_str()
     );
     let train_loader: Arc<dyn DataLoader<B, SequenceBatch<B>>> =
         Arc::new(RandomDataLoader::<B>::new(
@@ -240,11 +262,21 @@ where
             .with_weight_decay(optimizer_cfg.weight_decay)
             .init::<B, BDH<B>>(),
     );
-    let scheduler = resolve_lr_scheduler(optimizer_cfg, total_steps, &model_config)?;
+    let scheduler_iters = match schedule.source {
+        ScheduleSource::Epochs => Some(total_steps),
+        ScheduleSource::MaxIters => None,
+    };
+    let scheduler =
+        resolve_lr_scheduler(optimizer_cfg, total_steps, scheduler_iters, &model_config)?;
 
-    let run_dir = PathBuf::from("runs").join(backend_name);
+    let run_root = PathBuf::from("runs");
+    let (run_dir, run_name) = create_run_dir(&run_root)?;
+    write_latest_run(&run_root, &run_name)?;
+    write_run_config(config, &run_dir, &run_name)?;
+    info!("run name: {run_name}");
     let context = TrainEnvironment {
         run_dir: &run_dir,
+        run_name: &run_name,
         backend_name,
         training,
         model_config: &model_config,
@@ -306,12 +338,36 @@ enum ResolvedLrScheduler {
     Noam(NoamLrScheduler),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScheduleSource {
+    Epochs,
+    MaxIters,
+}
+
+impl ScheduleSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            ScheduleSource::Epochs => "epochs",
+            ScheduleSource::MaxIters => "max_iters",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrainSchedule {
+    steps_per_epoch: usize,
+    total_steps: usize,
+    total_epochs: usize,
+    source: ScheduleSource,
+}
+
 struct TrainEnvironment<'a, B>
 where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
 {
     run_dir: &'a Path,
+    run_name: &'a str,
     backend_name: &'a str,
     training: &'a TrainingHyperparameters,
     model_config: &'a BDHConfig,
@@ -343,6 +399,8 @@ where
         .metric_train_numeric(LearningRateMetric::new())
         .summary();
 
+    info!("run name: {}", env.run_name);
+
     let learner = builder.build(model, optimizer, scheduler);
 
     let TrainingResult { model, .. } = learner.fit(
@@ -363,6 +421,7 @@ where
 fn resolve_lr_scheduler(
     optimizer_cfg: &OptimizerConfig,
     total_steps: usize,
+    override_num_iters: Option<usize>,
     model_config: &BDHConfig,
 ) -> Result<ResolvedLrScheduler> {
     let base_lr = optimizer_cfg.learning_rate;
@@ -381,7 +440,9 @@ fn resolve_lr_scheduler(
             let init_lr = initial_lr.unwrap_or(base_lr);
             let scheduler = CosineAnnealingLrSchedulerConfig::new(
                 init_lr,
-                num_iters.unwrap_or(fallback_iters).max(1),
+                override_num_iters
+                    .unwrap_or_else(|| num_iters.unwrap_or(fallback_iters))
+                    .max(1),
             )
             .with_min_lr(min_lr.unwrap_or(0.0))
             .init()
@@ -397,7 +458,9 @@ fn resolve_lr_scheduler(
             let scheduler = LinearLrSchedulerConfig::new(
                 init_lr,
                 *final_lr,
-                num_iters.unwrap_or(fallback_iters).max(1),
+                override_num_iters
+                    .unwrap_or_else(|| num_iters.unwrap_or(fallback_iters))
+                    .max(1),
             )
             .init()
             .map_err(|err| anyhow!("failed to initialize linear lr scheduler: {err}"))?;
@@ -440,6 +503,83 @@ fn resolve_lr_scheduler(
     };
 
     Ok(schedule)
+}
+
+fn resolve_train_schedule(
+    training: &TrainingHyperparameters,
+    steps_per_epoch: usize,
+) -> Result<TrainSchedule> {
+    let steps_per_epoch = steps_per_epoch.max(1);
+    match training.epochs {
+        Some(epochs) => {
+            let total_epochs = epochs.max(1);
+            let total_steps = steps_per_epoch
+                .checked_mul(total_epochs)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "training.epochs overflow: steps_per_epoch={steps_per_epoch}, epochs={total_epochs}"
+                    )
+                })?
+                .max(1);
+            Ok(TrainSchedule {
+                steps_per_epoch,
+                total_steps,
+                total_epochs,
+                source: ScheduleSource::Epochs,
+            })
+        }
+        None => {
+            let total_steps = training.max_iters.max(1);
+            let total_epochs = usize::max(1, total_steps.div_ceil(steps_per_epoch));
+            Ok(TrainSchedule {
+                steps_per_epoch,
+                total_steps,
+                total_epochs,
+                source: ScheduleSource::MaxIters,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn_dragon_hatchling::ContextStrategyConfig;
+
+    fn make_training(max_iters: usize, epochs: Option<usize>) -> TrainingHyperparameters {
+        TrainingHyperparameters {
+            block_size: 16,
+            batch_size: 2,
+            epochs,
+            max_iters,
+            log_frequency: 10,
+            fast_train: false,
+            context_strategy: ContextStrategyConfig::Infinite,
+        }
+    }
+
+    #[test]
+    fn epochs_schedule_overrides_max_iters() {
+        let training = make_training(5, Some(3));
+        let schedule = resolve_train_schedule(&training, 4).expect("schedule");
+
+        assert_eq!(schedule.source, ScheduleSource::Epochs);
+        assert_eq!(schedule.steps_per_epoch, 4);
+        assert_eq!(schedule.total_epochs, 3);
+        assert_eq!(schedule.total_steps, 12);
+        assert_eq!(schedule.total_steps % schedule.steps_per_epoch, 0);
+    }
+
+    #[test]
+    fn max_iters_schedule_uses_step_limit() {
+        let training = make_training(12, None);
+        let schedule = resolve_train_schedule(&training, 5).expect("schedule");
+
+        assert_eq!(schedule.source, ScheduleSource::MaxIters);
+        assert_eq!(schedule.steps_per_epoch, 5);
+        assert_eq!(schedule.total_steps, 12);
+        assert_eq!(schedule.total_epochs, 3);
+    }
 }
 
 fn build_vocab_only(config: &TrainingConfig) -> Result<()> {
@@ -492,42 +632,6 @@ fn prepare_dataset(
     Ok(dataset)
 }
 
-fn build_model_config(overrides: &ModelOverrides) -> BDHConfig {
-    let mut model_config = BDHConfig::default();
-
-    if let Some(n_layer) = overrides.n_layer {
-        model_config.n_layer = n_layer;
-    }
-    if let Some(n_embd) = overrides.n_embd {
-        model_config.n_embd = n_embd;
-    }
-    if let Some(n_head) = overrides.n_head {
-        model_config.n_head = n_head;
-    }
-    if let Some(multiplier) = overrides.mlp_internal_dim_multiplier {
-        model_config.mlp_internal_dim_multiplier = multiplier;
-    }
-    if let Some(dropout) = overrides.dropout {
-        model_config.dropout = dropout;
-    }
-    if let Some(enabled) = overrides.fused_kernels {
-        model_config.fused_kernels.enabled = enabled;
-    }
-    if let Some(block) = overrides.block_size {
-        model_config.fused_kernels.set_block_sizes(block, block);
-    }
-    if let Some(use_alibi) = overrides.use_alibi {
-        model_config.fused_kernels.set_use_alibi(use_alibi);
-        if !use_alibi {
-            model_config
-                .fused_kernels
-                .set_alibi_slopes(vec![0.0; model_config.n_head]);
-        }
-    }
-
-    model_config
-}
-
 fn log_theoretical_profile(config: &BDHConfig, batch: usize, block: usize, backend: &str) {
     let batch = batch as u64;
     let time = block as u64;
@@ -552,4 +656,63 @@ fn log_theoretical_profile(config: &BDHConfig, batch: usize, block: usize, backe
         value = attn_value as f64 / 1e9,
         dec = decoder_matmul as f64 / 1e9,
     );
+}
+
+fn create_run_dir(run_root: &Path) -> Result<(PathBuf, String)> {
+    let mut generator = Generator::default();
+
+    for _ in 0..64 {
+        let name = generator
+            .next()
+            .unwrap_or_else(|| "nameless-hatchling".to_string());
+        let candidate = run_root.join(&name);
+        if !candidate.exists() {
+            return Ok((candidate, name));
+        }
+    }
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| anyhow!("failed to read system time: {err}"))?
+        .as_secs();
+    let name = format!("run-{suffix}");
+    Ok((run_root.join(&name), name))
+}
+
+fn write_latest_run(run_root: &Path, run_name: &str) -> Result<()> {
+    fs::create_dir_all(run_root)
+        .with_context(|| format!("failed to create run directory {}", run_root.display()))?;
+    let path = run_root.join("latest");
+    fs::write(&path, run_name)
+        .with_context(|| format!("failed to write latest run {}", path.display()))?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct WebConfigOutput {
+    run_name: String,
+    block_size: usize,
+    overrides: burn_dragon_hatchling::ModelOverrides,
+}
+
+fn write_run_config(config: &TrainingConfig, run_dir: &Path, run_name: &str) -> Result<()> {
+    fs::create_dir_all(run_dir)
+        .with_context(|| format!("failed to create run directory {}", run_dir.display()))?;
+
+    let block_size = config
+        .model
+        .block_size
+        .unwrap_or(config.training.block_size)
+        .max(1);
+    let output = WebConfigOutput {
+        run_name: run_name.to_string(),
+        block_size,
+        overrides: config.model.clone(),
+    };
+    let payload =
+        serde_json::to_string_pretty(&output).context("failed to serialize web config")?;
+    let path = run_dir.join("config.json");
+    fs::write(&path, payload)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
 }

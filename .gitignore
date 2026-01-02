@@ -12,6 +12,7 @@ out/
 screenshots/
 headless_output/
 www/assets/
+www/out/
 
 assets/images/
 assets/models/

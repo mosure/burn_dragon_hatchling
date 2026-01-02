@@ -4,6 +4,7 @@ use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 
 use burn::tensor::backend::Backend;
+use csv::ReaderBuilder;
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Cache, Repo, RepoType};
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -273,6 +274,7 @@ fn collect_records(
     match cfg.format {
         HuggingFaceRecordFormat::Jsonl => collect_jsonl_records(path, cfg, max_records, records),
         HuggingFaceRecordFormat::Text => collect_text_records(path, cfg, max_records, records),
+        HuggingFaceRecordFormat::Csv => collect_csv_records(path, cfg, max_records, records),
         HuggingFaceRecordFormat::Parquet => {
             collect_parquet_records(path, cfg, max_records, records)
         }
@@ -337,6 +339,64 @@ fn collect_text_records(
         let mut fields = HashMap::new();
         fields.insert(field_name.as_str(), text);
         match render_hf_record(cfg, fields)? {
+            Some(rendered) => records.push(rendered),
+            None => continue,
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_csv_records(
+    path: &Path,
+    cfg: &HuggingFaceDatasetConfig,
+    max_records: Option<usize>,
+    records: &mut Vec<String>,
+) -> io::Result<()> {
+    let file = fs::File::open(path)?;
+    let mut reader = ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_reader(file);
+
+    let headers = reader.headers().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to read CSV headers from {}: {err}", path.display()),
+        )
+    })?;
+
+    let mut index_map = HashMap::new();
+    for field in &cfg.text_fields {
+        let idx = headers.iter().position(|header| header == field).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing field `{}` in csv file {}", field, path.display()),
+            )
+        })?;
+        index_map.insert(field.as_str(), idx);
+    }
+
+    for record in reader.records() {
+        if max_records.is_some_and(|limit| records.len() >= limit) {
+            break;
+        }
+        let record = record.map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to read CSV record from {}: {err}", path.display()),
+            )
+        })?;
+        if record.is_empty() {
+            continue;
+        }
+        let mut field_values = HashMap::new();
+        for field in &cfg.text_fields {
+            let idx = *index_map.get(field.as_str()).expect("field index missing");
+            let value = record.get(idx).unwrap_or("").to_string();
+            field_values.insert(field.as_str(), value);
+        }
+        match render_hf_record(cfg, field_values)? {
             Some(rendered) => records.push(rendered),
             None => continue,
         }

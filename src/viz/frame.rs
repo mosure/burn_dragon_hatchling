@@ -1,40 +1,57 @@
-use serde::{Deserialize, Serialize};
+use burn::tensor::backend::Backend;
+use burn::tensor::Tensor;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AttnEdge {
-    pub from: u32,
-    pub to: u32,
-    pub head: u8,
-    pub w: f32,
+pub const LAYER_GAP: usize = 20;
+pub const VIZ_MAX_RES: usize = 8192;
+
+pub fn clamp_history(history: usize) -> usize {
+    history.max(1).min(VIZ_MAX_RES)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HotNeuron {
-    pub id_or_cluster: u32,
-    pub act: f32,
+pub fn clamp_layers(layers: usize, latent_total: usize) -> usize {
+    let layers = layers.max(1);
+    let latent_total = latent_total.max(1);
+    let step = latent_total.saturating_add(LAYER_GAP).max(1);
+    let max_layers = VIZ_MAX_RES.saturating_add(LAYER_GAP) / step;
+    layers.min(max_layers.max(1))
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SynEdge {
-    pub i: u32,
-    pub j: u32,
-    pub delta: f32,
-    pub value: f32,
+pub fn units_height(layers: usize, latent_total: usize) -> usize {
+    let layers = layers.max(1);
+    let latent_total = latent_total.max(1);
+    latent_total
+        .saturating_mul(layers)
+        .saturating_add(LAYER_GAP.saturating_mul(layers.saturating_sub(1)))
+        .max(1)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LayerFrame {
-    pub layer: u8,
-    pub attn_edges: Vec<AttnEdge>,
-    pub hot_neurons: Vec<HotNeuron>,
-    pub syn_edges: Vec<SynEdge>,
-    pub attn_entropy: f32,
+#[derive(Clone, Debug)]
+pub struct VizConfig {
+    pub history: usize,
+    pub layer_focus: usize,
+    pub stride_tokens: usize,
+    pub gain_x: f32,
+    pub gain_xy: f32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TokenFrame {
-    pub t: u32,
-    pub token_id: u32,
-    pub token_text: String,
-    pub layers: Vec<LayerFrame>,
+impl Default for VizConfig {
+    fn default() -> Self {
+        Self {
+            history: 256,
+            layer_focus: 0,
+            stride_tokens: 1,
+            gain_x: 1.0,
+            gain_xy: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct VizFrame<B: Backend> {
+    pub units_x: Tensor<B, 3>,
+    pub units_y: Tensor<B, 3>,
+    pub units_xy: Tensor<B, 3>,
+    pub units_rho: Tensor<B, 3>,
+    pub cursor: usize,
+    pub token_index: usize,
 }

@@ -1,9 +1,9 @@
 [training]
-batch_size = 4
+batch_size = 64
 
 [model]
-n_layer = 8
-n_embd = 512
-n_head = 8
+n_layer = 4
+n_embd = 128
+n_head = 4
 mlp_internal_dim_multiplier = 4
 dropout = 0.1

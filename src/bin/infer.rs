@@ -1,21 +1,22 @@
+#![recursion_limit = "256"]
+
 use std::convert::TryFrom;
-#[cfg(feature = "viz")]
-use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, ValueEnum};
+use serde::Deserialize;
 
 use burn::module::Module;
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 use burn::tensor::backend::Backend;
 use burn_dragon_hatchling::wgpu::init_runtime;
 use burn_dragon_hatchling::{
-    BDH, BDHConfig, ContextStrategy, ContextStrategyConfig, GenerationConfig, ModelOverrides,
-    TrainingConfig, generate_text, load_training_config, prefill_state, resolve_context_strategy,
-    sample_next_token,
+    BDH, ContextStrategy, ContextStrategyConfig, GenerationConfig, ModelOverrides, TrainingConfig,
+    build_model_config, generate_text, load_training_config, prefill_state,
+    resolve_context_strategy, sample_next_token,
 };
 use burn_wgpu::Wgpu;
 
@@ -23,15 +24,23 @@ use burn_wgpu::Wgpu;
 use burn_cuda::Cuda;
 
 #[cfg(feature = "viz")]
-use burn_dragon_hatchling::model::LayerVizState;
+use burn_dragon_hatchling::viz::{self, VizConfig, VizDimensions, VizEncoder};
 #[cfg(feature = "viz")]
-use burn_dragon_hatchling::viz::collect::{CollectKnobs, HeadRow, LayerTap, StepTaps, to_frame};
+use std::sync::mpsc;
 #[cfg(feature = "viz")]
-use burn_dragon_hatchling::viz::{VideoConfig, VideoLayout, Viz, VizMode, VizTargetConfig};
-#[cfg(feature = "viz")]
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
-fn main() {
+#[cfg(feature = "viz")]
+struct VizRuntime<B: Backend> {
+    encoder: VizEncoder<B>,
+    sender: viz::VizSender<B>,
+    stop: Arc<AtomicBool>,
+}
+
+pub fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err:#}");
         std::process::exit(1);
@@ -42,13 +51,45 @@ fn run() -> Result<()> {
     let args = Args::parse();
     let mut config_paths = vec![PathBuf::from("config/base.toml")];
     config_paths.extend(args.config.clone());
-    let config = load_training_config(&config_paths)?;
+    let mut config = load_training_config(&config_paths)?;
+    if args.config.is_empty() {
+        let backend_name = backend_name(args.backend);
+        if let Some(config_path) = resolve_run_config_path(args.checkpoint.as_ref(), backend_name) {
+            let contents = fs::read_to_string(&config_path).with_context(|| {
+                format!("failed to read run config {}", config_path.display())
+            })?;
+            let run_config: RunConfigJson = serde_json::from_str(&contents)
+                .with_context(|| format!("failed to parse {}", config_path.display()))?;
+            apply_run_config(&mut config, &run_config);
+        }
+    }
+
+    #[cfg(feature = "viz")]
+    let use_viz = args.viz;
+    #[cfg(not(feature = "viz"))]
+    let use_viz = false;
 
     match args.backend {
-        BackendArg::Wgpu => infer_backend::<Wgpu<f32>, _>(&config, &args, "wgpu", init_runtime),
+        BackendArg::Wgpu => {
+            #[cfg(feature = "viz")]
+            if use_viz {
+                return infer_backend_with_viz::<Wgpu<f32>, _>(
+                    &config,
+                    &args,
+                    "wgpu",
+                    init_runtime,
+                );
+            }
+            infer_backend::<Wgpu<f32>, _>(&config, &args, "wgpu", init_runtime)
+        }
         BackendArg::Cuda => {
             #[cfg(feature = "cuda")]
             {
+                if use_viz {
+                    return Err(anyhow!(
+                        "viz overlay requires the wgpu backend; run with --backend wgpu"
+                    ));
+                }
                 infer_backend::<Cuda<f32>, _>(&config, &args, "cuda", |_| {})
             }
             #[cfg(not(feature = "cuda"))]
@@ -73,6 +114,36 @@ where
     Init: Fn(&B::Device),
 {
     let device = B::Device::default();
+    #[cfg(feature = "viz")]
+    {
+        infer_backend_on_device::<B, Init>(
+            config,
+            args,
+            backend_name,
+            device,
+            init_backend,
+            None,
+        )
+    }
+    #[cfg(not(feature = "viz"))]
+    {
+        infer_backend_on_device::<B, Init>(config, args, backend_name, device, init_backend)
+    }
+}
+
+fn infer_backend_on_device<B, Init>(
+    config: &TrainingConfig,
+    args: &Args,
+    backend_name: &str,
+    device: B::Device,
+    init_backend: Init,
+    #[cfg(feature = "viz")] mut viz_runtime: Option<VizRuntime<B>>,
+) -> Result<()>
+where
+    B: Backend + 'static,
+    B::Device: Clone,
+    Init: Fn(&B::Device),
+{
     B::seed(&device, 1337);
     init_backend(&device);
 
@@ -97,11 +168,10 @@ where
     let checkpoint_dir = args
         .checkpoint
         .clone()
-        .unwrap_or_else(|| PathBuf::from("runs").join(backend_name).join("checkpoint"));
-    let (checkpoint_base, epoch) =
-        resolve_checkpoint_base(&checkpoint_dir, args.epoch, backend_name)?;
+        .unwrap_or_else(|| default_checkpoint_dir(backend_name));
+    let (checkpoint_base, epoch) = resolve_checkpoint_base(&checkpoint_dir, args.epoch)?;
 
-    let mut model_config = build_model_config(&config.model);
+    let mut model_config = build_model_config(&config.model, config.training.block_size);
     model_config.vocab_size = tokenizer.len();
     let mut model = BDH::<B>::new(model_config, &device);
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
@@ -123,7 +193,9 @@ where
         format_checkpoint(&checkpoint_base)
     );
 
-    if args.streaming {
+    let use_streaming = args.streaming;
+
+    if use_streaming {
         let strategy =
             resolve_context_strategy(&generation.context_strategy, config.training.block_size);
         eprintln!("{status_msg}");
@@ -137,25 +209,6 @@ where
 
         let prompt_tokens: Vec<i64> = prompt_ids.iter().map(|&id| id as i64).collect();
         let prompt_ids_u32: Vec<u32> = prompt_ids.to_vec();
-
-        #[cfg(feature = "viz")]
-        let viz = {
-            let env_enabled = env::var("BDH_VIZ")
-                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if args.viz || env_enabled {
-                let targets = build_viz_targets(args);
-                if targets.is_empty() {
-                    Viz::new(VizMode::Off)
-                } else {
-                    Viz::new(VizMode::Targets(targets))
-                }
-            } else {
-                Viz::new(VizMode::Off)
-            }
-        };
-        #[cfg(feature = "viz")]
-        let mut viz_step_counter = prompt_tokens.len() as u32;
 
         let mut writer = io::stdout();
         let prompt_text = tokenizer.decode(&prompt_ids_u32);
@@ -177,14 +230,16 @@ where
             state.trim(window);
         }
 
-        #[cfg(feature = "viz")]
-        let collect_knobs = CollectKnobs {
-            k_attn: 32,
-            k_neuron: 16,
-            probes: Vec::new(),
-        };
+        let max_tokens = normalize_max_tokens(generation.max_tokens);
+        let mut generated = 0usize;
+        while max_tokens.is_none_or(|max| generated < max) {
+            #[cfg(feature = "viz")]
+            if let Some(viz) = viz_runtime.as_ref() {
+                if viz.stop.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
 
-        for _ in 0..generation.max_tokens {
             let (next, logits) = sample_next_token(
                 &model,
                 &mut state,
@@ -194,19 +249,15 @@ where
                 &device,
             )?;
             last_logits = logits;
+            generated = generated.saturating_add(1);
 
             if let Ok(token_u32) = u32::try_from(next) {
                 generated_ids.push(token_u32);
                 let decoded = tokenizer.decode(&generated_ids);
-                #[cfg(feature = "viz")]
-                let mut viz_token_text: Option<String> = None;
+
                 if decoded.len() > last_print_len {
                     let new_text = &decoded[last_print_len..];
                     if !new_text.is_empty() {
-                        #[cfg(feature = "viz")]
-                        {
-                            viz_token_text = Some(new_text.to_string());
-                        }
                         if let Err(err) = writer.write_all(new_text.as_bytes()) {
                             stream_err = Some(anyhow!("failed to write streamed token: {err}"));
                             break;
@@ -219,37 +270,27 @@ where
                     }
                     last_print_len = decoded.len();
                 }
+            }
 
-                #[cfg(feature = "viz")]
-                if viz.enabled() {
-                    let token_text = viz_token_text.unwrap_or_else(|| {
-                        let single = [token_u32];
-                        tokenizer.decode(&single)
-                    });
-                    let layer_states = state.take_viz();
-                    let layer_taps = layer_states
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(idx, opt)| {
-                            opt.map(|viz_state| build_layer_tap::<B>(idx as u8, viz_state))
-                        })
-                        .collect::<Vec<_>>();
-                    if !layer_taps.is_empty() {
-                        let step = StepTaps {
-                            t: viz_step_counter,
-                            token_id: token_u32,
-                            token_text,
-                            layers: layer_taps,
-                        };
-                        let frame = to_frame(step, &collect_knobs);
-                        viz.push(frame);
-                        viz_step_counter = viz_step_counter.saturating_add(1);
-                    }
+            #[cfg(feature = "viz")]
+            if let Some(viz) = viz_runtime.as_mut() {
+                let token_index = state.position.saturating_sub(1);
+                if viz.encoder.should_capture(token_index) {
+                    let layers = state.take_viz();
+                    let frame = viz.encoder.step(&layers, token_index);
+                    viz.sender.try_send(frame);
                 }
             }
 
             if stream_err.is_some() {
                 break;
+            }
+
+            #[cfg(feature = "viz")]
+            if let Some(viz) = viz_runtime.as_ref() {
+                if viz.stop.load(Ordering::Relaxed) {
+                    break;
+                }
             }
 
             if let ContextStrategy::Sliding { window } = strategy
@@ -284,127 +325,96 @@ where
     Ok(())
 }
 
-fn build_model_config(overrides: &ModelOverrides) -> BDHConfig {
-    let mut model_config = BDHConfig::default();
-
-    if let Some(n_layer) = overrides.n_layer {
-        model_config.n_layer = n_layer;
-    }
-    if let Some(n_embd) = overrides.n_embd {
-        model_config.n_embd = n_embd;
-    }
-    if let Some(n_head) = overrides.n_head {
-        model_config.n_head = n_head;
-    }
-    if let Some(multiplier) = overrides.mlp_internal_dim_multiplier {
-        model_config.mlp_internal_dim_multiplier = multiplier;
-    }
-    if let Some(dropout) = overrides.dropout {
-        model_config.dropout = dropout;
-    }
-    if let Some(enabled) = overrides.fused_kernels {
-        model_config.fused_kernels.enabled = enabled;
-    }
-    if let Some(block) = overrides.block_size {
-        model_config.fused_kernels.set_block_sizes(block, block);
-    }
-    if let Some(use_alibi) = overrides.use_alibi {
-        model_config.fused_kernels.set_use_alibi(use_alibi);
-        if !use_alibi {
-            model_config
-                .fused_kernels
-                .set_alibi_slopes(vec![0.0; model_config.n_head]);
-        }
-    }
-
-    model_config
-}
-
 #[cfg(feature = "viz")]
-fn build_layer_tap<B: Backend>(layer_index: u8, viz_state: LayerVizState<B>) -> LayerTap<B> {
-    let head_rows = viz_state
-        .attn_rows
-        .into_iter()
-        .enumerate()
-        .map(|(idx, tensor)| HeadRow {
-            w: tensor,
-            head: idx as u8,
-        })
-        .collect::<Vec<_>>();
-
-    let synapses = viz_state.synapses;
-    let dims = synapses.shape().dims::<2>();
-    let syn_rows = dims[0];
-    let syn_cols = dims[1];
-    let syn_data = Arc::new(
-        synapses
-            .to_data()
-            .convert::<f32>()
-            .into_vec::<f32>()
-            .unwrap_or_else(|_| Vec::new()),
-    );
-
-    let rows = syn_rows;
-    let cols = syn_cols;
-    let values = syn_data.clone();
-    let syn_readout = Box::new(move |pairs: &[(u32, u32)]| -> Vec<(u32, u32, f32)> {
-        pairs
-            .iter()
-            .filter_map(|(row, col)| {
-                let r = *row as usize;
-                let c = *col as usize;
-                if r < rows && c < cols {
-                    let idx = r * cols + c;
-                    Some((*row, *col, values[idx]))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }) as Box<dyn Fn(&[(u32, u32)]) -> Vec<(u32, u32, f32)> + Send + Sync>;
-
-    LayerTap {
-        layer: layer_index,
-        attn_rows: head_rows,
-        neurons: viz_state.neurons,
-        syn_readout,
-    }
-}
-
-#[cfg(feature = "viz")]
-fn build_viz_targets(args: &Args) -> Vec<VizTargetConfig> {
-    use std::collections::HashSet;
-
-    let mut targets = Vec::new();
-    let mut seen = HashSet::new();
-    let layouts = if args.viz_layouts.is_empty() {
-        vec![VizLayoutArg::Timeline]
-    } else {
-        args.viz_layouts.clone()
+fn infer_backend_with_viz<B, Init>(
+    config: &TrainingConfig,
+    args: &Args,
+    backend_name: &str,
+    init_backend: Init,
+) -> Result<()>
+where
+    B: Backend<Device = burn_wgpu::WgpuDevice> + 'static,
+    B::Device: Default + Clone + Send + Sync + 'static,
+    Init: Fn(&B::Device) + Copy + Send + 'static,
+    (): bevy_burn::gpu_burn_to_bevy::BurnBevyPrepare<B>,
+{
+    let model_config = build_model_config(&config.model, config.training.block_size);
+    let dims = VizDimensions {
+        layers: model_config.n_layer,
+        heads: model_config.n_head,
+        latent_per_head: model_config.latent_per_head(),
     };
+    let viz_config = VizConfig::default();
 
-    for layout in layouts {
-        if !seen.insert(layout) {
-            continue;
-        }
-        let mut config = match layout {
-            VizLayoutArg::Timeline => VideoConfig::new(args.viz_output.clone()),
-            VizLayoutArg::Plasticity => VideoConfig::new(args.viz_plasticity_output.clone()),
-            VizLayoutArg::Scalefree => VideoConfig::new(args.viz_scalefree_output.clone()),
-        };
-        config.layout = layout.into();
-        targets.push(VizTargetConfig::Video(config));
+    let (exit_tx, exit_rx) = mpsc::channel();
+    let overlay = viz::start_overlay_native::<B>(viz_config.clone(), dims, Some(exit_rx));
+    let stop_flag = overlay.handle().stop_flag();
+    let (viz_handle, mut app) = overlay.split();
+    let device = viz_handle.device().clone();
+    let sender = viz_handle.sender();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let ctrlc_stop = stop_flag.clone();
+        let ctrlc_exit = exit_tx.clone();
+        let _ = ctrlc::set_handler(move || {
+            ctrlc_stop.store(true, Ordering::Relaxed);
+            let _ = ctrlc_exit.send(());
+        });
     }
 
-    targets
+    let backend_name = backend_name.to_string();
+    let config = config.clone();
+    let args = args.clone();
+    let stop_for_thread = stop_flag.clone();
+    let infer_thread = std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let viz_runtime = VizRuntime {
+                encoder: VizEncoder::new(
+                    viz_config,
+                    dims.layers,
+                    dims.heads,
+                    dims.latent_per_head,
+                    &device,
+                ),
+                sender,
+                stop: stop_for_thread,
+            };
+            infer_backend_on_device::<B, Init>(
+                &config,
+                &args,
+                backend_name.as_str(),
+                device,
+                init_backend,
+                Some(viz_runtime),
+            )
+        }));
+
+        let _ = exit_tx.send(());
+        match result {
+            Ok(outcome) => outcome,
+            Err(_) => Err(anyhow!("inference thread panicked")),
+        }
+    });
+
+    app.run();
+    let result = infer_thread
+        .join()
+        .map_err(|_| anyhow!("inference thread crashed"))??;
+    Ok(result)
 }
+
 
 fn apply_generation_overrides(generation: &mut GenerationConfig, args: &Args, block_size: usize) {
     if let Some(prompt) = &args.prompt {
         generation.prompt = prompt.clone();
     }
     if let Some(max_tokens) = args.max_tokens {
-        generation.max_tokens = max_tokens;
+        generation.max_tokens = if max_tokens < 0 {
+            None
+        } else {
+            Some(max_tokens)
+        };
     }
     if let Some(temperature) = args.temperature {
         generation.temperature = temperature;
@@ -422,11 +432,7 @@ fn apply_generation_overrides(generation: &mut GenerationConfig, args: &Args, bl
     }
 }
 
-fn resolve_checkpoint_base(
-    path: &Path,
-    epoch: Option<usize>,
-    backend_name: &str,
-) -> Result<(PathBuf, usize)> {
+fn resolve_checkpoint_base(path: &Path, epoch: Option<usize>) -> Result<(PathBuf, usize)> {
     if path.is_dir() {
         let target_epoch = epoch.unwrap_or(find_latest_epoch(path)?);
         let base = path.join(format!("model-{target_epoch}"));
@@ -454,7 +460,7 @@ fn resolve_checkpoint_base(
                 let parent = base
                     .parent()
                     .map(Path::to_path_buf)
-                    .unwrap_or_else(|| PathBuf::from("runs").join(backend_name).join("checkpoint"));
+                    .unwrap_or_else(|| PathBuf::from("runs").join("checkpoint"));
                 base = parent.join(format!("model-{explicit}"));
             }
             explicit
@@ -517,7 +523,112 @@ fn format_checkpoint(base: &Path) -> String {
     path.display().to_string()
 }
 
-#[derive(Parser, Debug)]
+#[derive(Debug, Deserialize, Default)]
+struct RunConfigJson {
+    #[serde(default)]
+    block_size: Option<usize>,
+    #[serde(default)]
+    overrides: ModelOverrides,
+}
+
+fn apply_run_config(config: &mut TrainingConfig, run_config: &RunConfigJson) {
+    let block_override = run_config
+        .block_size
+        .or(run_config.overrides.block_size)
+        .map(|value| value.max(1));
+    if let Some(block_size) = block_override {
+        config.training.block_size = block_size;
+    }
+    merge_model_overrides(&mut config.model, &run_config.overrides);
+}
+
+fn merge_model_overrides(base: &mut ModelOverrides, incoming: &ModelOverrides) {
+    if let Some(value) = incoming.n_layer {
+        base.n_layer = Some(value);
+    }
+    if let Some(value) = incoming.n_embd {
+        base.n_embd = Some(value);
+    }
+    if let Some(value) = incoming.n_head {
+        base.n_head = Some(value);
+    }
+    if let Some(value) = incoming.mlp_internal_dim_multiplier {
+        base.mlp_internal_dim_multiplier = Some(value);
+    }
+    if let Some(value) = incoming.relu_threshold {
+        base.relu_threshold = Some(value);
+    }
+    if let Some(value) = incoming.dropout {
+        base.dropout = Some(value);
+    }
+    if let Some(value) = incoming.fused_kernels {
+        base.fused_kernels = Some(value);
+    }
+    if let Some(value) = incoming.block_size {
+        base.block_size = Some(value);
+    }
+    if let Some(value) = incoming.rotary_embedding {
+        base.rotary_embedding = Some(value);
+    }
+}
+
+fn resolve_run_config_path(
+    checkpoint: Option<&PathBuf>,
+    backend_name: &str,
+) -> Option<PathBuf> {
+    let checkpoint_path = checkpoint
+        .cloned()
+        .unwrap_or_else(|| default_checkpoint_dir(backend_name));
+    let mut candidates = Vec::new();
+
+    if checkpoint_path.is_dir() {
+        candidates.push(checkpoint_path.join("config.json"));
+        if checkpoint_path
+            .file_name()
+            .is_some_and(|name| name == "checkpoint")
+            && let Some(parent) = checkpoint_path.parent()
+        {
+            candidates.push(parent.join("config.json"));
+        }
+    } else if let Some(parent) = checkpoint_path.parent() {
+        candidates.push(parent.join("config.json"));
+        if parent
+            .file_name()
+            .is_some_and(|name| name == "checkpoint")
+            && let Some(grandparent) = parent.parent()
+        {
+            candidates.push(grandparent.join("config.json"));
+        }
+    }
+
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn default_checkpoint_dir(backend_name: &str) -> PathBuf {
+    resolve_latest_run_dir(backend_name)
+        .map(|dir| dir.join("checkpoint"))
+        .unwrap_or_else(|| PathBuf::from("runs").join("checkpoint"))
+}
+
+fn resolve_latest_run_dir(backend_name: &str) -> Option<PathBuf> {
+    let run_root = PathBuf::from("runs");
+    resolve_latest_run_dir_from(&run_root).or_else(|| {
+        let device_root = run_root.join(backend_name);
+        resolve_latest_run_dir_from(&device_root)
+    })
+}
+
+fn resolve_latest_run_dir_from(run_root: &Path) -> Option<PathBuf> {
+    let latest_path = run_root.join("latest");
+    let contents = fs::read_to_string(&latest_path).ok()?;
+    let name = contents.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(run_root.join(name))
+}
+
+#[derive(Parser, Debug, Clone)]
 #[command(
     author,
     version,
@@ -541,7 +652,7 @@ struct Args {
     prompt: Option<String>,
     /// Override the number of tokens to generate.
     #[arg(long, value_name = "N")]
-    max_tokens: Option<usize>,
+    max_tokens: Option<i64>,
     /// Override the sampling temperature.
     #[arg(long, value_name = "T")]
     temperature: Option<f32>,
@@ -557,39 +668,10 @@ struct Args {
     /// Stream tokens to stdout as they are generated.
     #[arg(long)]
     streaming: bool,
-    #[cfg(feature = "viz")]
-    /// Enable per-token visualization when compiled with `--features viz`.
+    /// whether or not to spawn visualization app, wgpu only
     #[arg(long)]
+    #[cfg(feature = "viz")]
     viz: bool,
-    #[cfg(feature = "viz")]
-    /// Output path for the visualization MP4 when `--viz` or `BDH_VIZ=1` is used.
-    #[arg(long, value_name = "PATH", default_value_os_t = PathBuf::from("runs/viz/output.mp4"))]
-    viz_output: PathBuf,
-    #[cfg(feature = "viz")]
-    /// Output path for the plasticity-focused visualization when enabled via `--viz-layouts`.
-    #[arg(
-        long,
-        value_name = "PATH",
-        default_value_os_t = PathBuf::from("runs/viz/plasticity.mp4")
-    )]
-    viz_plasticity_output: PathBuf,
-    #[cfg(feature = "viz")]
-    /// Output path for the scale-free visualization when enabled via `--viz-layouts`.
-    #[arg(
-        long,
-        value_name = "PATH",
-        default_value_os_t = PathBuf::from("runs/viz/scale_free.mp4")
-    )]
-    viz_scalefree_output: PathBuf,
-    #[cfg(feature = "viz")]
-    /// Comma-separated visualization layouts (`timeline`, `plasticity`, `scalefree`) to render when `--viz` is set.
-    #[arg(
-        long,
-        value_name = "LAYOUTS",
-        value_delimiter = ',',
-        default_value = "timeline,plasticity,scalefree"
-    )]
-    viz_layouts: Vec<VizLayoutArg>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -604,21 +686,17 @@ enum ContextModeArg {
     Sliding,
 }
 
-#[cfg(feature = "viz")]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, ValueEnum)]
-enum VizLayoutArg {
-    Timeline,
-    Plasticity,
-    Scalefree,
+
+fn backend_name(backend: BackendArg) -> &'static str {
+    match backend {
+        BackendArg::Wgpu => "wgpu",
+        BackendArg::Cuda => "cuda",
+    }
 }
 
-#[cfg(feature = "viz")]
-impl From<VizLayoutArg> for VideoLayout {
-    fn from(value: VizLayoutArg) -> Self {
-        match value {
-            VizLayoutArg::Timeline => VideoLayout::Timeline,
-            VizLayoutArg::Plasticity => VideoLayout::Plasticity,
-            VizLayoutArg::Scalefree => VideoLayout::ScaleFree,
-        }
+fn normalize_max_tokens(max_tokens: Option<i64>) -> Option<usize> {
+    match max_tokens {
+        Some(value) if value >= 0 => Some(value as usize),
+        _ => None,
     }
 }

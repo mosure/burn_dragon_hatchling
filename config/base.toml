@@ -2,6 +2,7 @@
 #   "shakespeare"  - tinyshakespeare character corpus
 #   "deep_math"    - zwhe99/DeepMath-103K (Problem/Solution pairs)
 #   "tiny_chat"    - starhopp3r/TinyChat BASIC-English conversations
+#   "poetry_foundation" - suayptalha/Poetry-Foundation-Poems (Title + poem)
 #   "webscale_rl"  - Salesforce/Webscale-RL parquet shards (RL QA data)
 #   "hugging_face" - arbitrary Hugging Face dataset (see example below)
 
@@ -17,7 +18,7 @@ type = "shakespeare"
 # cache_dir = "data"
 # train_split_ratio = 0.85
 # type = "hugging_face"
-# format = "parquet"        # or "jsonl" / "text"
+# format = "parquet"        # or "jsonl" / "text" / "csv"
 # repo_id = "zwhe99/DeepMath-103K"
 # revision = "main"         # optional ref (tag/branch/sha)
 # train_files = ["data/train.parquet"]
@@ -34,9 +35,13 @@ vocab_path = "vocab.json"
 
 [training]
 block_size = 512
-batch_size = 16
+batch_size = 24
 max_iters = 3000
+epochs = 30
+# When set, training uses full epochs and derives max_iters and lr_schedule.num_iters
+# from steps_per_epoch * epochs (training.max_iters is ignored).
 log_frequency = 100
+fast_train = false
 
 [optimizer]
 learning_rate = 0.001
@@ -50,15 +55,19 @@ num_iters = 6000
 
 [generation]
 prompt = "To be or "
-max_tokens = 2048
 temperature = 1.0
 top_k = 3
 
 [model]
-n_layer = 6
+n_layer = 4
 n_embd = 256
 n_head = 4
-mlp_internal_dim_multiplier = 64
+mlp_internal_dim_multiplier = 4
+# Paper default: standard ReLU threshold (0.0).
+relu_threshold = 0.0
 dropout = 0.1
 fused_kernels = true
-use_alibi = true
+# block_size overrides fused-kernel tiling; if omitted, training.block_size is used.
+# block_size = 512
+# rotary embedding: "alibi" (default), "rope", or "pope"
+rotary_embedding = "alibi"

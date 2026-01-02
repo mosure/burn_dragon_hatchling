@@ -87,6 +87,23 @@ pub fn build_dataset(
                 .with_context(|| "failed to prepare Webscale-RL dataset")?,
             )
         }
+        DatasetSourceConfig::PoetryFoundation {
+            revision,
+            max_records,
+        } => {
+            let config = poetry_foundation_config(revision, *max_records);
+            Dataset::from_huggingface(
+                HuggingFaceDataset::new(
+                    &cfg.cache_dir,
+                    training.block_size,
+                    training.batch_size,
+                    cfg.train_split_ratio,
+                    &cfg.tokenizer,
+                    &config,
+                )
+                .with_context(|| "failed to prepare Poetry Foundation Poems dataset")?,
+            )
+        }
     };
 
     let description = match &dataset {
@@ -175,6 +192,23 @@ fn webscale_rl_config(
              {question}\nAnswer: {answer}"
                 .to_string(),
         ),
+        max_records,
+    }
+}
+
+fn poetry_foundation_config(
+    revision: &Option<String>,
+    max_records: Option<usize>,
+) -> HuggingFaceDatasetConfig {
+    HuggingFaceDatasetConfig {
+        repo_id: "suayptalha/Poetry-Foundation-Poems".to_string(),
+        revision: revision.clone(),
+        format: HuggingFaceRecordFormat::Csv,
+        train_files: vec!["PoetryFoundationData.csv".to_string()],
+        validation_files: Vec::new(),
+        text_fields: vec!["Title".to_string(), "Poem".to_string()],
+        field_separator: "\n\n\n".to_string(),
+        template: Some("{Title}\n\n\n{Poem}\n\n\n\n\n\n".to_string()),
         max_records,
     }
 }

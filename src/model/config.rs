@@ -5,6 +5,7 @@ use burn::module::{
 use burn::tensor::backend::{AutodiffBackend, Backend};
 
 use crate::kernel::{BlockPattern1d, BlockPattern2d, BlockSparseConfig};
+use crate::positional::RotaryEmbedding;
 
 #[derive(Clone, Debug)]
 pub struct FusedKernelConfig {
@@ -13,7 +14,7 @@ pub struct FusedKernelConfig {
     pub rope_theta: f32,
     pub relu_threshold: f32,
     pub alibi_slopes: Option<Vec<f32>>,
-    pub use_alibi: bool,
+    pub rotary_embedding: RotaryEmbedding,
 }
 
 impl Default for FusedKernelConfig {
@@ -24,7 +25,7 @@ impl Default for FusedKernelConfig {
             rope_theta: 65_536.0,
             relu_threshold: 0.0,
             alibi_slopes: None,
-            use_alibi: false,
+            rotary_embedding: RotaryEmbedding::default(),
         }
     }
 }
@@ -46,8 +47,8 @@ impl FusedKernelConfig {
         self.alibi_slopes = Some(slopes);
     }
 
-    pub fn set_use_alibi(&mut self, enabled: bool) {
-        self.use_alibi = enabled;
+    pub fn set_rotary_embedding(&mut self, rotary_embedding: RotaryEmbedding) {
+        self.rotary_embedding = rotary_embedding;
     }
 }
 
@@ -90,9 +91,9 @@ impl<B: AutodiffBackend> AutodiffModule<B> for FusedKernelConfig {
 impl ModuleDisplayDefault for FusedKernelConfig {
     fn content(&self, content: Content) -> Option<Content> {
         let summary = format!(
-            "enabled={}, use_alibi={}, relu_threshold={}, rope_theta={}, latent_block={}, time_block={}, custom_alibi={}",
+            "enabled={}, rotary_embedding={}, relu_threshold={}, rope_theta={}, latent_block={}, time_block={}, custom_alibi={}",
             self.enabled,
-            self.use_alibi,
+            self.rotary_embedding,
             self.relu_threshold,
             self.rope_theta,
             self.block_sparse.latent.block_size(),
@@ -128,7 +129,7 @@ impl Default for BDHConfig {
             n_embd: 256,
             dropout: 0.1,
             n_head: 4,
-            mlp_internal_dim_multiplier: 128,
+            mlp_internal_dim_multiplier: 4,
             n_expert: 1,
             vocab_size: 256,
             fused_kernels: FusedKernelConfig::default(),

@@ -1,9 +1,12 @@
 use std::f32::consts::PI;
 
 use burn::tensor::backend::Backend;
-use burn::tensor::{Int, Tensor};
+use burn::tensor::{Int, Tensor, activation};
 
 use super::block_sparse::BlockPattern2d;
+use crate::positional::RotaryEmbedding;
+
+const ROW_NORM_EPS: f32 = 1e-6;
 
 pub fn fused_state_aligned<B: Backend>(
     query: Tensor<B, 4>,
@@ -11,6 +14,7 @@ pub fn fused_state_aligned<B: Backend>(
     freqs: Tensor<B, 4>,
     alibi_slopes: Option<Tensor<B, 1>>,
     layout: &BlockPattern2d,
+    rotary_embedding: RotaryEmbedding,
 ) -> Tensor<B, 4> {
     let device = query.device();
     let [batch, heads, time, _dim_q] = query.shape().dims::<4>();
@@ -20,9 +24,19 @@ pub fn fused_state_aligned<B: Backend>(
         .float()
         .reshape([1, 1, time, 1]);
 
-    let raw = positions.clone() * freqs;
-    let phases = (raw.clone() - raw.floor()) * (2.0 * PI);
-    let (q_rot, k_rot) = apply_rope::<B>(phases, query.clone());
+    let (q_rot, k_rot) = match rotary_embedding {
+        RotaryEmbedding::Rope => {
+            let raw = positions.clone() * freqs;
+            let phases = (raw.clone() - raw.floor()) * (2.0 * PI);
+            apply_rope::<B>(phases, query.clone())
+        }
+        RotaryEmbedding::Pope => {
+            let raw = positions.clone() * freqs;
+            let phases = (raw.clone() - raw.floor()) * (2.0 * PI);
+            apply_pope::<B>(phases, query.clone())
+        }
+        RotaryEmbedding::Alibi => (query.clone(), query.clone()),
+    };
 
     let value = value.repeat_dim(1, heads);
     let mut outputs: Vec<Tensor<B, 4>> = Vec::new();
@@ -45,6 +59,7 @@ pub fn fused_state_aligned<B: Backend>(
         let q_block = q_rot.clone().slice_dim(2, row_range.clone());
 
         let mut block_acc = Tensor::<B, 4>::zeros([batch, heads, row_len, dim_v], &device);
+        let mut row_norm = Tensor::<B, 4>::zeros([batch, heads, row_len, 1], &device);
 
         let cols = layout.iter_cols(row, total_blocks);
         if cols.is_empty() {
@@ -86,10 +101,13 @@ pub fn fused_state_aligned<B: Backend>(
 
             let v_block = value.clone().slice_dim(2, col_range);
 
+            row_norm = row_norm + scores.clone().abs().sum_dim(3);
             let contribution = scores.matmul(v_block);
             block_acc = block_acc + contribution;
         }
 
+        let denom = row_norm.add_scalar(ROW_NORM_EPS);
+        block_acc = block_acc / denom;
         outputs.push(block_acc);
     }
 
@@ -115,6 +133,19 @@ fn apply_rope<B: Backend>(
     let rotated = Tensor::stack::<5>(vec![odd.clone().neg(), even], 4).reshape([b, h, t, n]);
 
     let rot = values * cos.clone() + rotated * sin;
+    (rot.clone(), rot)
+}
+
+fn apply_pope<B: Backend>(
+    phases: Tensor<B, 4>,
+    values: Tensor<B, 4>,
+) -> (Tensor<B, 4>, Tensor<B, 4>) {
+    let magnitude = activation::softplus(values, 1.0);
+    let cos = phases.clone().cos();
+    let sin = phases.sin();
+    let real = magnitude.clone() * cos;
+    let imag = magnitude * sin;
+    let rot = Tensor::cat(vec![real, imag], 3);
     (rot.clone(), rot)
 }
 
