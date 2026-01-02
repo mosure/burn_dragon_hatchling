@@ -1,0 +1,14 @@
+{
+  "run_name": "quirky-friends",
+  "block_size": 512,
+  "overrides": {
+    "n_layer": 4,
+    "n_embd": 128,
+    "n_head": 4,
+    "mlp_internal_dim_multiplier": 4,
+    "dropout": 0.1,
+    "fused_kernels": true,
+    "block_size": null,
+    "rotary_embedding": "alibi"
+  }
+}
