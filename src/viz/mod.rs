@@ -8,6 +8,10 @@ use bevy::prelude::App;
 use burn::tensor::backend::Backend;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, atomic::AtomicBool};
+#[cfg(target_arch = "wasm32")]
+use std::cell::RefCell;
+#[cfg(target_arch = "wasm32")]
+use std::rc::Rc;
 
 pub use bevy_app::VizDimensions;
 pub use encoder::VizEncoder;
@@ -26,7 +30,7 @@ pub struct VizHandle<B: Backend> {
 #[derive(Clone)]
 pub struct VizHandle<B: Backend> {
     sender: VizSender<B>,
-    device: B::Device,
+    device: Rc<RefCell<Option<B::Device>>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -58,8 +62,8 @@ impl<B: Backend> VizHandle<B> {
         self.sender.clone()
     }
 
-    pub fn device(&self) -> &B::Device {
-        &self.device
+    pub fn device_ready(&self) -> Option<B::Device> {
+        self.device.borrow().clone()
     }
 }
 
@@ -118,7 +122,9 @@ where
     (): bevy_burn::gpu_burn_to_bevy::BurnBevyPrepare<B>,
 {
     let (sender, receiver) = transport::channel();
-    let (app, device) = bevy_app::build_app::<B>(config, dims, receiver, None);
+    let device_slot = Rc::new(RefCell::new(None));
+    let (app, device) =
+        bevy_app::build_app::<B>(config, dims, receiver, None, device_slot.clone());
     VizOverlay {
         app,
         handle: VizHandle {

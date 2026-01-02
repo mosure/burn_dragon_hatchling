@@ -6,6 +6,10 @@ use std::sync::{
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "cli"))]
 use std::sync::atomic::Ordering;
+#[cfg(target_arch = "wasm32")]
+use std::cell::RefCell;
+#[cfg(target_arch = "wasm32")]
+use std::rc::Rc;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::ecs::hierarchy::ChildSpawnerCommands;
@@ -14,6 +18,9 @@ use bevy::input::ButtonInput;
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
+use bevy::render::settings::{RenderCreation, WgpuFeatures, WgpuSettings};
+use bevy::render::RenderPlugin;
+use bevy::ui::IsDefaultUiCamera;
 use bevy::ui::{ComputedNode, UiGlobalTransform};
 use bevy::window::{PrimaryWindow, Window};
 #[cfg(all(not(target_arch = "wasm32"), feature = "cli"))]
@@ -24,6 +31,8 @@ use bevy_burn::{
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 use burn_wgpu::WgpuDevice;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_futures::spawn_local;
 
 use super::frame::{LAYER_GAP, VizConfig, VizFrame};
 use super::transport::VizReceiver;
@@ -41,6 +50,12 @@ struct VizLayout {
     units_height: usize,
 }
 
+#[derive(Resource, Default)]
+struct VizUiState {
+    camera_spawned: bool,
+    panels_spawned: bool,
+}
+
 #[cfg(all(not(target_arch = "wasm32"), feature = "cli"))]
 #[derive(Resource, Clone)]
 struct StopSignal {
@@ -50,6 +65,11 @@ struct StopSignal {
 #[derive(Resource)]
 struct ExitReceiver {
     inner: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct VizDeviceSlot<B: Backend> {
+    device: Rc<RefCell<Option<B::Device>>>,
 }
 
 #[derive(Resource, Debug)]
@@ -103,10 +123,10 @@ enum PanelKind {
 impl PanelKind {
     fn label(&self) -> &'static str {
         match self {
-            PanelKind::UnitsWrites => "writes",
-            PanelKind::UnitsY => "y",
-            PanelKind::UnitsXY => "xy",
-            PanelKind::UnitsRho => "rho",
+            PanelKind::UnitsWrites => "x (gate)",
+            PanelKind::UnitsY => "y (read)",
+            PanelKind::UnitsXY => "x·y",
+            PanelKind::UnitsRho => "ρ ← ρ + E y ⊗ x",
         }
     }
 
@@ -135,17 +155,28 @@ where
 {
     let mut app = App::new();
 
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "burn_dragon_hatchling".to_string(),
-            canvas: Some("#bevy".to_string()),
-            prevent_default_event_handling: true,
+    let default_plugins = DefaultPlugins
+        .set(ImagePlugin::default_nearest())
+        .set(RenderPlugin {
+            render_creation: RenderCreation::Automatic(WgpuSettings {
+                features: WgpuFeatures::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "burn_dragon_hatchling".to_string(),
+                canvas: Some("#bevy".to_string()),
+                prevent_default_event_handling: true,
+                ..default()
+            }),
             ..default()
-        }),
-        ..default()
-    }));
+        });
+    app.add_plugins(default_plugins);
     app.insert_resource(ClearColor(Color::BLACK));
-    app.add_plugins(BevyBurnBridgePlugin::<B>::default());
+    let bridge = BevyBurnBridgePlugin::<B>::default();
+    app.add_plugins(bridge);
 
     let history = config.history.max(1);
     let latent_total = dims
@@ -165,6 +196,7 @@ where
     #[cfg(not(feature = "cli"))]
     let _ = stop_flag;
     app.insert_resource(PanZoomState::default());
+    app.insert_resource(VizUiState::default());
     app.insert_resource(PanZoomTexture {
         size: Vec2::new(history as f32, units_height as f32),
     });
@@ -178,7 +210,7 @@ where
         app.add_systems(Update, poll_exit);
     }
 
-    app.add_systems(Startup, setup::<B>);
+    app.add_systems(Update, setup_once::<B>);
     #[cfg(feature = "cli")]
     app.add_systems(Update, handle_window_close);
     app.add_systems(
@@ -201,28 +233,47 @@ where
 }
 
 #[cfg(target_arch = "wasm32")]
+pub fn run_app_wasm(mut app: App) {
+    spawn_local(async move {
+        app.run();
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
 pub fn build_app<B: Backend<Device = WgpuDevice>>(
     config: VizConfig,
     dims: VizDimensions,
     receiver: VizReceiver<B>,
     exit_rx: Option<std::sync::mpsc::Receiver<()>>,
-) -> (App, B::Device)
+    device_slot: Rc<RefCell<Option<B::Device>>>,
+) -> (App, Rc<RefCell<Option<B::Device>>>)
 where
     B: Backend + 'static,
     B::Device: Default + Clone,
     (): bevy_burn::gpu_burn_to_bevy::BurnBevyPrepare<B>,
 {
+    ensure_canvas();
     let mut app = App::new();
 
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "burn_dragon_hatchling".to_string(),
-            canvas: Some("#bevy".to_string()),
-            prevent_default_event_handling: true,
+    let default_plugins = DefaultPlugins
+        .set(ImagePlugin::default_nearest())
+        .set(RenderPlugin {
+            render_creation: RenderCreation::Automatic(WgpuSettings {
+                features: WgpuFeatures::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "burn_dragon_hatchling".to_string(),
+                canvas: Some("#bevy".to_string()),
+                prevent_default_event_handling: true,
+                ..default()
+            }),
             ..default()
-        }),
-        ..default()
-    }));
+        });
+    app.add_plugins(default_plugins);
     app.insert_resource(ClearColor(Color::BLACK));
     app.add_plugins(BevyBurnBridgePlugin::<B>::default());
 
@@ -240,11 +291,13 @@ where
         units_height,
     });
     app.insert_resource(PanZoomState::default());
+    app.insert_resource(VizUiState::default());
     app.insert_resource(PanZoomTexture {
         size: Vec2::new(history as f32, units_height as f32),
     });
 
     insert_receiver::<B>(&mut app, receiver);
+    insert_device_slot::<B>(&mut app, device_slot.clone());
 
     if let Some(exit_rx) = exit_rx {
         app.insert_resource(ExitReceiver {
@@ -253,24 +306,57 @@ where
         app.add_systems(Update, poll_exit);
     }
 
-    app.add_systems(Startup, setup::<B>);
+    app.add_systems(Update, setup_once::<B>);
+    app.add_systems(Startup, style_canvas);
+    app.add_systems(Update, capture_burn_device::<B>);
     app.add_systems(
         Update,
         (update_pan_zoom_bounds, pan_zoom_input, apply_pan_zoom).chain(),
     );
     app.add_systems(Update, apply_latest_frame::<B>);
+    (app, device_slot)
+}
 
-    app.finish();
-    app.cleanup();
+#[cfg(target_arch = "wasm32")]
+fn style_canvas() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = window.document() else {
+        return;
+    };
+    let canvas = document
+        .query_selector("#bevy")
+        .ok()
+        .flatten()
+        .or_else(|| document.query_selector("canvas").ok().flatten());
+    let Some(canvas) = canvas else {
+        return;
+    };
+    let _ = canvas.set_attribute(
+        "style",
+        "position: absolute; right: 16px; bottom: 16px; width: 40vw; height: 40vh; max-width: 720px; max-height: 480px; z-index: 20; opacity: 1; pointer-events: auto;",
+    );
+}
 
-    let device = app
-        .world()
-        .resource::<BurnDevice>()
-        .device()
-        .cloned()
-        .expect("viz: burn device not ready; bevy_burn must initialize the shared GPU device");
-
-    (app, device)
+#[cfg(target_arch = "wasm32")]
+fn ensure_canvas() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = window.document() else {
+        return;
+    };
+    if document.get_element_by_id("bevy").is_some() {
+        return;
+    }
+    let Ok(canvas) = document.create_element("canvas") else {
+        return;
+    };
+    let _ = canvas.set_attribute("id", "bevy");
+    if let Some(body) = document.body() {
+        let _ = body.append_child(&canvas);
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -281,6 +367,11 @@ fn insert_receiver<B: Backend>(app: &mut App, receiver: VizReceiver<B>) {
 #[cfg(target_arch = "wasm32")]
 fn insert_receiver<B: Backend>(app: &mut App, receiver: VizReceiver<B>) {
     app.insert_non_send_resource(receiver);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn insert_device_slot<B: Backend>(app: &mut App, device: Rc<RefCell<Option<B::Device>>>) {
+    app.insert_non_send_resource(VizDeviceSlot::<B> { device });
 }
 
 fn poll_exit(receiver: Res<ExitReceiver>, mut exit: MessageWriter<AppExit>) {
@@ -303,18 +394,30 @@ fn handle_window_close(
     }
 }
 
-fn setup<B: Backend<Device = WgpuDevice>>(
+fn setup_once<B: Backend<Device = WgpuDevice>>(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
+    asset_server: Res<AssetServer>,
     layout: Res<VizLayout>,
-    burn: Res<BurnDevice>,
+    burn: Option<Res<BurnDevice>>,
+    mut ui_state: ResMut<VizUiState>,
 ) {
-    let Some(device) = burn.device() else {
-        eprintln!("viz: burn device not ready during setup");
+    if !ui_state.camera_spawned {
+        commands.spawn((Camera2d, IsDefaultUiCamera));
+        ui_state.camera_spawned = true;
+    }
+    if ui_state.panels_spawned {
+        return;
+    }
+    let Some(burn) = burn else {
         return;
     };
+    let Some(device) = burn.device() else {
+        return;
+    };
+    ui_state.panels_spawned = true;
 
-    commands.spawn(Camera2d);
+    let label_font = asset_server.load("font/NanumGothicCoding-Bold.ttf");
 
     commands
         .spawn((
@@ -338,6 +441,7 @@ fn setup<B: Backend<Device = WgpuDevice>>(
                 layout.history,
                 layout.units_height,
                 device,
+                &label_font,
                 &mut images,
             );
             spawn_panel::<B>(
@@ -346,6 +450,7 @@ fn setup<B: Backend<Device = WgpuDevice>>(
                 layout.history,
                 layout.units_height,
                 device,
+                &label_font,
                 &mut images,
             );
             spawn_panel::<B>(
@@ -354,6 +459,7 @@ fn setup<B: Backend<Device = WgpuDevice>>(
                 layout.history,
                 layout.units_height,
                 device,
+                &label_font,
                 &mut images,
             );
             spawn_panel::<B>(
@@ -362,9 +468,27 @@ fn setup<B: Backend<Device = WgpuDevice>>(
                 layout.history,
                 layout.units_height,
                 device,
+                &label_font,
                 &mut images,
             );
         });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn capture_burn_device<B: Backend<Device = WgpuDevice>>(
+    burn: Option<Res<BurnDevice>>,
+    slot: NonSendMut<VizDeviceSlot<B>>,
+) {
+    if slot.device.borrow().is_some() {
+        return;
+    }
+    let Some(burn) = burn else {
+        return;
+    };
+    let Some(device) = burn.device() else {
+        return;
+    };
+    *slot.device.borrow_mut() = Some(device.clone());
 }
 
 fn spawn_panel<B: Backend<Device = WgpuDevice>>(
@@ -373,6 +497,7 @@ fn spawn_panel<B: Backend<Device = WgpuDevice>>(
     width: usize,
     height: usize,
     device: &B::Device,
+    label_font: &Handle<Font>,
     images: &mut Assets<Image>,
 ) {
     let (handle, tensor) = build_image::<B>(width, height, device, images);
@@ -394,8 +519,8 @@ fn spawn_panel<B: Backend<Device = WgpuDevice>>(
             panel.spawn((
                 Text::new(kind.label()),
                 TextFont {
-                    font: Handle::default(),
-                    font_size: 12.0,
+                    font: label_font.clone(),
+                    font_size: 16.0,
                     ..default()
                 },
                 TextColor(Color::srgb(0.8, 0.8, 0.8)),
@@ -421,7 +546,7 @@ fn spawn_panel<B: Backend<Device = WgpuDevice>>(
                             height: px(height as f32),
                             ..default()
                         },
-                        ImageNode::new(handle.clone()),
+                        ImageNode::new(handle.clone()).with_mode(NodeImageMode::Stretch),
                         BevyBurnHandle::<B> {
                             bevy_image: handle,
                             tensor,
@@ -452,17 +577,16 @@ fn build_image<B: Backend>(
     let mut img = Image::new_fill(
         size,
         TextureDimension::D2,
-        &[0; 16],
+        &[0u8; 16],
         TextureFormat::Rgba32Float,
         RenderAssetUsages::RENDER_WORLD,
     );
-    img.texture_descriptor.usage |= TextureUsages::COPY_SRC
-        | TextureUsages::COPY_DST
+    img.texture_descriptor.usage |= TextureUsages::COPY_DST
         | TextureUsages::TEXTURE_BINDING
         | TextureUsages::STORAGE_BINDING;
     img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
         mag_filter: ImageFilterMode::Nearest,
-        min_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Nearest,
         mipmap_filter: ImageFilterMode::Nearest,
         ..Default::default()
     });
@@ -530,7 +654,7 @@ fn update_pan_zoom_bounds(
     if !state.initialized {
         let init_scale = scale_x.clamp(min_scale, max_scale);
         state.scale = init_scale;
-        state.offset = default_offset_top(viewport, texture.size * state.scale);
+        state.offset = default_offset_bottom(viewport, texture.size * state.scale);
         state.initialized = true;
         return;
     }
@@ -681,8 +805,8 @@ fn clamp_offset(offset: Vec2, viewport: Vec2, texture: Vec2, scale: f32) -> Vec2
     out
 }
 
-fn default_offset_top(viewport: Vec2, scaled: Vec2) -> Vec2 {
-    Vec2::new((viewport.x - scaled.x) * 0.5, 0.0)
+fn default_offset_bottom(viewport: Vec2, scaled: Vec2) -> Vec2 {
+    Vec2::new((viewport.x - scaled.x) * 0.5, viewport.y - scaled.y)
 }
 
 #[cfg(all(test, feature = "viz", feature = "cli"))]

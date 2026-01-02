@@ -89,7 +89,7 @@ fn run_inference_backend<B, Init, Skip>(
 
         // Warm-up ensures shader compilation / graph construction is amortized.
         let settings = GenerationSettings {
-            max_new_tokens: cfg.batch,
+            max_new_tokens: cfg.batch.into(),
             temperature: 1.0,
             top_k: None,
             strategy: BENCH_CONTEXT,

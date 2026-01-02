@@ -8,7 +8,13 @@
     />
     <title>burn_dragon_hatchling</title>
     <style>
-      @import url("https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap");
+      @font-face {
+        font-family: "Nanum Gothic Coding Bold";
+        src: url("./assets/font/NanumGothicCoding-Bold.tff") format("truetype");
+        font-weight: 700;
+        font-style: normal;
+        font-display: swap;
+      }
 
       :root {
         color-scheme: dark;
@@ -30,7 +36,7 @@
         height: 100%;
         margin: 0;
         color: var(--text);
-        font-family: "Space Mono", "JetBrains Mono", monospace;
+        font-family: "Nanum Gothic Coding Bold", "JetBrains Mono", monospace;
         overflow: hidden;
         overscroll-behavior: none;
       }
@@ -55,6 +61,22 @@
         position: fixed;
         inset: 0;
         overflow: hidden;
+      }
+
+      #bevy {
+        position: absolute;
+        right: 16px;
+        bottom: 16px;
+        width: 40vw;
+        height: 40vh;
+        max-width: 720px;
+        max-height: 480px;
+        z-index: 20;
+        opacity: 1;
+        pointer-events: auto;
+        background: #050507;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
       }
 
       #output {
@@ -148,6 +170,7 @@
       <div id="output"></div>
       <div id="fade-top"></div>
     </div>
+    <canvas id="bevy"></canvas>
 
     <script type="module">
       import init, { loadModel } from "./out/burn_dragon_hatchling.js";
@@ -158,9 +181,11 @@
       const fadeTop = document.getElementById("fade-top");
 
       const params = new URLSearchParams(window.location.search);
-      const modelUrl = params.get("model") || "./assets/model.bin";
-      const vocabUrl = params.get("vocab") || "./assets/vocab.json";
-      const configUrl = params.get("config") || "./assets/config.json";
+      const modelName = params.get("model_name") || "tiny_shakespeare";
+      const modelBase = `./assets/model/${modelName}`;
+      const modelUrl = params.get("model") || `${modelBase}/model.bin`;
+      const vocabUrl = params.get("vocab") || `${modelBase}/vocab.json`;
+      const configUrl = params.get("config") || `${modelBase}/config.json`;
       // Config JSON: { "block_size": 256, "max_tokens": -1, "overrides": { "n_layer": 6, ... } }
       const prompt =
         params.get("prompt") ||
@@ -171,10 +196,15 @@
       const topK = topKParam ? Number(topKParam) : undefined;
       const windowParam = params.get("window");
       const contextWindow = windowParam ? Number(windowParam) : undefined;
-      const vizParam = params.get("viz");
+      const vizParam = params.get("viz") || "1";
       const startViz = vizParam === "1" || vizParam === "true";
+      const bevyCanvas = document.getElementById("bevy");
+      if (bevyCanvas && !startViz) {
+        bevyCanvas.style.opacity = "0";
+        bevyCanvas.style.pointerEvents = "none";
+      }
 
-      const cacheName = "bdh-cache-v4";
+      const cacheName = "bdh-cache-v5";
       const maxBufferChars = 200000;
       const trimBufferChars = 150000;
       const scrollLiftRatio = 0.6;

@@ -8,6 +8,14 @@ use burn::tensor::Tensor;
 use burn_wgpu::{RuntimeOptions, graphics};
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
+#[cfg(feature = "viz")]
+use wasm_bindgen::JsCast;
+#[cfg(feature = "viz")]
+use wasm_bindgen_futures::JsFuture;
+#[cfg(feature = "viz")]
+use js_sys::Promise;
+#[cfg(feature = "viz")]
+use wasm_bindgen::closure::Closure;
 
 use crate::generation::{
     ContextStrategy, prefill_state, resolve_context_strategy, sample_next_token_async,
@@ -45,6 +53,22 @@ struct StreamState {
 struct WebVizRuntime {
     encoder: VizEncoder<WebBackend>,
     sender: viz::VizSender<WebBackend>,
+}
+
+#[cfg(feature = "viz")]
+async fn yield_now() {
+    let promise = Promise::new(&mut |resolve, _reject| {
+        let Some(window) = web_sys::window() else {
+            let _ = resolve.call0(&JsValue::NULL);
+            return;
+        };
+        let resolve = resolve.clone();
+        let closure = Closure::once_into_js(move |_ts: f64| {
+            let _ = resolve.call0(&JsValue::NULL);
+        });
+        let _ = window.request_animation_frame(closure.unchecked_ref());
+    });
+    let _ = JsFuture::from(promise).await;
 }
 
 #[wasm_bindgen]
@@ -100,9 +124,51 @@ pub async fn load_model(
             latent_per_head: model_config.latent_per_head(),
         };
 
-        let device = WebDevice::default();
-        burn_wgpu::init_setup_async::<graphics::WebGpu>(&device, RuntimeOptions::default()).await;
-        WebBackend::seed(&device, 1337);
+        #[cfg(feature = "viz")]
+        let (device, viz_runtime) = if start_viz.unwrap_or(false) {
+            let viz_config = VizConfig::default();
+            let overlay = viz::start_overlay_wasm::<WebBackend>(viz_config.clone(), dims);
+            let (handle, app) = overlay.split();
+            let sender = handle.sender();
+            viz::bevy_app::run_app_wasm(app);
+
+            let device = loop {
+                if let Some(device) = handle.device_ready() {
+                    break device;
+                }
+                yield_now().await;
+            };
+
+            WebBackend::seed(&device, 1337);
+            (
+                device.clone(),
+                Some(WebVizRuntime {
+                    encoder: VizEncoder::new(
+                        viz_config,
+                        dims.layers,
+                        dims.heads,
+                        dims.latent_per_head,
+                        &device,
+                    ),
+                    sender,
+                }),
+            )
+        } else {
+            let device = WebDevice::default();
+            burn_wgpu::init_setup_async::<graphics::WebGpu>(&device, RuntimeOptions::default())
+                .await;
+            WebBackend::seed(&device, 1337);
+            (device, None)
+        };
+
+        #[cfg(not(feature = "viz"))]
+        let device = {
+            let device = WebDevice::default();
+            burn_wgpu::init_setup_async::<graphics::WebGpu>(&device, RuntimeOptions::default())
+                .await;
+            WebBackend::seed(&device, 1337);
+            device
+        };
 
         let bytes = model_bytes.as_slice();
         let record: <BDH<WebBackend> as Module<WebBackend>>::Record =
@@ -119,27 +185,6 @@ pub async fn load_model(
                     })?,
             };
         let model = BDH::<WebBackend>::new(model_config, &device).load_record(record);
-
-        #[cfg(feature = "viz")]
-        let viz_runtime = if start_viz.unwrap_or(false) {
-            let viz_config = VizConfig::default();
-            let overlay = viz::start_overlay_wasm::<WebBackend>(viz_config.clone(), dims);
-            let (handle, mut app) = overlay.split();
-            let sender = handle.sender();
-            let _ = app.run();
-            Some(WebVizRuntime {
-                encoder: VizEncoder::new(
-                    viz_config,
-                    dims.layers,
-                    dims.heads,
-                    dims.latent_per_head,
-                    &device,
-                ),
-                sender,
-            })
-        } else {
-            None
-        };
 
         #[cfg(not(feature = "viz"))]
         let _ = start_viz;

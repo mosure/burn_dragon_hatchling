@@ -52,7 +52,7 @@ train = [
   "dep:tracing",
 ]
 cuda = ["burn/cuda", "burn-cuda"]
-web = ["burn/webgpu", "burn-wgpu/webgpu"]
+web = ["burn/webgpu", "burn-wgpu/webgpu", "viz"]
 viz = [
   "dep:bevy",
   "dep:bevy_burn",

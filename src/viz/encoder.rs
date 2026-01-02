@@ -190,10 +190,14 @@ impl<B: Backend> VizEncoder<B> {
         if self.latent_total == 0 {
             return self.zero_units.clone();
         }
-        let values = values.reshape([self.latent_total, 1]);
-        let mag = values.clone().mul_scalar(gain).clamp(0.0, 1.0);
-        let mask = values.greater_elem(ACTIVE_EPS).float();
-        let intensity = mask * (mag.mul_scalar(0.75).add_scalar(0.25));
+        let values = values.clamp_min(0.0).reshape([self.latent_total, 1]);
+        let mag = values
+            .clone()
+            .mul_scalar(gain)
+            .div(values.clone().mul_scalar(gain).add_scalar(1.0))
+            .powf_scalar(0.5);
+        let mask = values.clone().div(values.clone().add_scalar(ACTIVE_EPS * 4.0));
+        let intensity = mag * mask;
         let intensity = intensity.reshape([self.latent_total, 1, 1]);
         let mut column = intensity * color.clone();
         if let Some(sep) = &self.separator_rgba {
