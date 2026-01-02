@@ -16,6 +16,7 @@ use bevy::ecs::hierarchy::ChildSpawnerCommands;
 use bevy::image::{ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::input::ButtonInput;
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
+use bevy::input::touch::Touches;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevy::render::settings::{RenderCreation, WgpuFeatures, WgpuSettings};
@@ -23,6 +24,8 @@ use bevy::render::RenderPlugin;
 use bevy::ui::IsDefaultUiCamera;
 use bevy::ui::{ComputedNode, UiGlobalTransform};
 use bevy::window::{PrimaryWindow, Window};
+#[cfg(target_arch = "wasm32")]
+use bevy::ui::UiScale;
 #[cfg(all(not(target_arch = "wasm32"), feature = "cli"))]
 use bevy::window::WindowCloseRequested;
 use bevy_burn::{
@@ -85,6 +88,9 @@ struct PanZoomState {
     initialized: bool,
     dragging: bool,
     last_cursor: Option<Vec2>,
+    touch_active_viewport: Option<Entity>,
+    touch_last_center: Option<Vec2>,
+    touch_last_distance: Option<f32>,
 }
 
 impl Default for PanZoomState {
@@ -99,6 +105,9 @@ impl Default for PanZoomState {
             initialized: false,
             dragging: false,
             last_cursor: None,
+            touch_active_viewport: None,
+            touch_last_center: None,
+            touch_last_distance: None,
         }
     }
 }
@@ -306,6 +315,7 @@ where
 
     app.add_systems(Update, setup_once::<B>);
     app.add_systems(Startup, style_canvas);
+    app.add_systems(Update, update_ui_scale);
     app.add_systems(Update, capture_burn_device::<B>);
     app.add_systems(
         Update,
@@ -331,10 +341,46 @@ fn style_canvas() {
     let Some(canvas) = canvas else {
         return;
     };
+    if matches!(
+        canvas.get_attribute("data-bdh-layout").as_deref(),
+        Some("css")
+    ) {
+        return;
+    }
     let _ = canvas.set_attribute(
         "style",
-        "position: absolute; right: 16px; bottom: 16px; width: 40vw; height: 40vh; max-width: 720px; max-height: 480px; z-index: 20; opacity: 1; pointer-events: auto;",
+        "position: absolute; right: 16px; bottom: 16px; width: 40vw; height: 40vh; max-width: 720px; max-height: 480px; z-index: 20; opacity: 1; pointer-events: auto; touch-action: none;",
     );
+}
+
+#[cfg(target_arch = "wasm32")]
+fn update_ui_scale(
+    mut ui_scale: ResMut<UiScale>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+) {
+    let window: &Window = match windows.single() {
+        Ok(window) => window,
+        Err(_) => return,
+    };
+    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+        return;
+    };
+    let is_mobile = document
+        .query_selector("body.is-mobile")
+        .ok()
+        .flatten()
+        .is_some();
+
+    let target = if is_mobile {
+        let scale_factor = window.scale_factor().max(1.0);
+        (1.0 / scale_factor).clamp(0.3, 1.0)
+    } else {
+        1.0
+    };
+
+    if (ui_scale.0 - target).abs() > 0.01 {
+        ui_scale.0 = target;
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -667,9 +713,10 @@ fn pan_zoom_input(
     mut state: ResMut<PanZoomState>,
     texture: Res<PanZoomTexture>,
     windows: Query<&Window, With<PrimaryWindow>>,
-    viewports: Query<(&ComputedNode, &UiGlobalTransform), With<PanZoomViewport>>,
+    viewports: Query<(Entity, &ComputedNode, &UiGlobalTransform), With<PanZoomViewport>>,
     buttons: Res<ButtonInput<MouseButton>>,
     mut scroll_events: MessageReader<MouseWheel>,
+    touches: Res<Touches>,
 ) {
     if !state.initialized {
         return;
@@ -679,6 +726,138 @@ fn pan_zoom_input(
         Ok(window) => window,
         Err(_) => return,
     };
+    let window_scale_factor = window.scale_factor() as f32;
+
+    let mut touch_points: Vec<(u64, Vec2)> = touches
+        .iter()
+        .map(|touch| (touch.id(), touch.position()))
+        .collect();
+
+    if !touch_points.is_empty() {
+        touch_points.sort_by_key(|(id, _)| *id);
+        let mut active_entity = state
+            .touch_active_viewport
+            .filter(|entity| viewports.get(*entity).is_ok());
+        if active_entity.is_none() {
+            state.touch_active_viewport = None;
+        }
+        if active_entity.is_none() {
+            for (_, position) in &touch_points {
+                let physical = *position * window_scale_factor;
+                if let Some(active) = active_viewport(physical, &viewports) {
+                    state.touch_active_viewport = Some(active.entity);
+                    active_entity = Some(active.entity);
+                    break;
+                }
+            }
+        }
+
+        let Some(active_entity) = active_entity else {
+            state.touch_active_viewport = None;
+            state.touch_last_center = None;
+            state.touch_last_distance = None;
+            state.dragging = false;
+            state.last_cursor = None;
+            return;
+        };
+
+        let (_, node, transform) = match viewports.get(active_entity) {
+            Ok(parts) => parts,
+            Err(_) => {
+                state.touch_active_viewport = None;
+                state.touch_last_center = None;
+                state.touch_last_distance = None;
+                state.dragging = false;
+                state.last_cursor = None;
+                return;
+            }
+        };
+
+        let viewport_size = node.size();
+        if viewport_size.x <= 0.0 || viewport_size.y <= 0.0 {
+            state.touch_last_center = None;
+            state.touch_last_distance = None;
+            state.dragging = false;
+            state.last_cursor = None;
+            return;
+        }
+
+        state.viewport_size = viewport_size;
+        state.inverse_scale_factor = node.inverse_scale_factor();
+
+        let scale_factor = if node.inverse_scale_factor() > 0.0 {
+            1.0 / node.inverse_scale_factor()
+        } else {
+            window_scale_factor.max(0.0001)
+        };
+
+        let touch_points: Vec<(u64, Vec2)> = touch_points
+            .into_iter()
+            .map(|(id, position)| (id, position * scale_factor))
+            .collect();
+
+        if touch_points.len() == 1 {
+            let position = touch_points[0].1;
+            if state.touch_last_distance.is_some() {
+                state.touch_last_center = Some(position);
+                state.touch_last_distance = None;
+                state.dragging = false;
+                state.last_cursor = None;
+                return;
+            }
+            if let Some(last) = state.touch_last_center {
+                let delta = position - last;
+                state.offset += delta;
+                state.offset =
+                    clamp_offset(state.offset, viewport_size, texture.size, state.scale);
+            }
+            state.touch_last_center = Some(position);
+            state.touch_last_distance = None;
+            state.dragging = false;
+            state.last_cursor = None;
+            return;
+        }
+
+        let pos_a = touch_points[0].1;
+        let pos_b = touch_points[1].1;
+        let center = (pos_a + pos_b) * 0.5;
+        let distance = pos_a.distance(pos_b).max(0.0001);
+        if state.touch_last_distance.is_none() {
+            state.touch_last_center = Some(center);
+            state.touch_last_distance = Some(distance);
+            state.dragging = false;
+            state.last_cursor = None;
+            return;
+        }
+        if let (Some(last_center), Some(last_distance)) =
+            (state.touch_last_center, state.touch_last_distance)
+        {
+            let delta = center - last_center;
+            state.offset += delta;
+            let zoom_factor = distance / last_distance;
+            let next_scale = (state.scale * zoom_factor).clamp(state.min_scale, state.max_scale);
+            if (next_scale - state.scale).abs() > f32::EPSILON {
+                if let Some(pivot) = cursor_local_from_viewport(center, node, transform) {
+                    let image_pos = (pivot - state.offset) / state.scale;
+                    state.scale = next_scale;
+                    state.offset = pivot - image_pos * state.scale;
+                } else {
+                    state.scale = next_scale;
+                }
+            }
+            state.offset = clamp_offset(state.offset, viewport_size, texture.size, state.scale);
+        }
+        state.touch_last_center = Some(center);
+        state.touch_last_distance = Some(distance);
+        state.dragging = false;
+        state.last_cursor = None;
+        return;
+    }
+
+    state.touch_active_viewport = None;
+    state.touch_last_center = None;
+    state.touch_last_distance = None;
+
     let Some(cursor) = window.physical_cursor_position() else {
         state.last_cursor = None;
         state.dragging = false;
@@ -758,26 +937,40 @@ fn apply_pan_zoom(
 
 #[derive(Clone, Copy, Debug)]
 struct ActiveViewport {
+    entity: Entity,
     cursor_local: Vec2,
     size: Vec2,
     inverse_scale_factor: f32,
 }
 
+fn cursor_local_from_viewport(
+    cursor: Vec2,
+    node: &ComputedNode,
+    transform: &UiGlobalTransform,
+) -> Option<Vec2> {
+    let Some(local) = transform
+        .try_inverse()
+        .map(|affine| affine.transform_point2(cursor))
+    else {
+        return None;
+    };
+    let size = node.size();
+    Some(local + size * 0.5)
+}
+
 fn active_viewport(
     cursor: Vec2,
-    viewports: &Query<(&ComputedNode, &UiGlobalTransform), With<PanZoomViewport>>,
+    viewports: &Query<(Entity, &ComputedNode, &UiGlobalTransform), With<PanZoomViewport>>,
 ) -> Option<ActiveViewport> {
-    for (node, transform) in viewports.iter() {
+    for (entity, node, transform) in viewports.iter() {
         if node.contains_point(*transform, cursor) {
-            let Some(local) = transform.try_inverse().map(|affine| affine.transform_point2(cursor))
-            else {
+            let Some(local_top_left) = cursor_local_from_viewport(cursor, node, transform) else {
                 continue;
             };
-            let size = node.size();
-            let local_top_left = local + size * 0.5;
             return Some(ActiveViewport {
+                entity,
                 cursor_local: local_top_left,
-                size,
+                size: node.size(),
                 inverse_scale_factor: node.inverse_scale_factor(),
             });
         }

@@ -25,6 +25,7 @@
         --muted: #9aa3ad;
         --accent: #6ef5d2;
         --accent-2: #5fd0ff;
+        --mobile-canvas-height: clamp(200px, 32dvh, 50dvh);
       }
 
       * {
@@ -74,6 +75,8 @@
         z-index: 20;
         opacity: 1;
         pointer-events: auto;
+        touch-action: none;
+        display: block;
         background: #050507;
         border: 1px solid rgba(255, 255, 255, 0.18);
         box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
@@ -157,6 +160,40 @@
           transform: rotate(360deg);
         }
       }
+
+      body.is-mobile {
+        display: flex;
+        flex-direction: column;
+        height: 100dvh;
+        align-items: stretch;
+      }
+
+      body.is-mobile #viewport {
+        position: relative;
+        inset: auto;
+        flex: 1 1 auto;
+        min-height: 0;
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+      }
+
+      body.is-mobile #bevy {
+        position: relative;
+        right: auto;
+        bottom: auto;
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+        height: var(--mobile-canvas-height);
+        max-height: 50dvh;
+        align-self: stretch;
+        border-left: none;
+        border-right: none;
+        border-bottom: none;
+        border-radius: 0;
+        box-shadow: none;
+      }
     </style>
   </head>
   <body>
@@ -170,7 +207,7 @@
       <div id="output"></div>
       <div id="fade-top"></div>
     </div>
-    <canvas id="bevy"></canvas>
+    <canvas id="bevy" data-bdh-layout="css"></canvas>
 
     <script type="module">
       import init, { loadModel } from "./out/burn_dragon_hatchling.js";
@@ -179,6 +216,7 @@
       const status = document.getElementById("status");
       const output = document.getElementById("output");
       const fadeTop = document.getElementById("fade-top");
+      const viewport = document.getElementById("viewport");
 
       const params = new URLSearchParams(window.location.search);
       const modelName = params.get("model_name") || "tiny_shakespeare";
@@ -278,6 +316,11 @@
         }
       };
 
+      const getViewportHeight = () => {
+        const height = viewport?.getBoundingClientRect().height;
+        return height && height > 0 ? height : window.innerHeight;
+      };
+
       const stepScroll = (now) => {
         if (!animating) {
           return;
@@ -309,7 +352,7 @@
 
       const adjustScroll = (force) => {
         const contentHeight = output.scrollHeight;
-        const viewportHeight = window.innerHeight;
+        const viewportHeight = getViewportHeight();
         const liftPx = viewportHeight * scrollLiftRatio;
         const maxOffset = Math.max(0, contentHeight - (viewportHeight - liftPx));
 
@@ -331,6 +374,20 @@
       window.addEventListener("resize", () => adjustScroll(true), {
         passive: true,
       });
+
+      const mobileQuery = window.matchMedia(
+        "(max-width: 900px), (pointer: coarse)"
+      );
+      const updateMobileLayout = () => {
+        document.body.classList.toggle("is-mobile", mobileQuery.matches);
+        requestAnimationFrame(() => adjustScroll(true));
+      };
+      updateMobileLayout();
+      if (mobileQuery.addEventListener) {
+        mobileQuery.addEventListener("change", updateMobileLayout);
+      } else if (mobileQuery.addListener) {
+        mobileQuery.addListener(updateMobileLayout);
+      }
 
       const run = async () => {
         setStatus("loading wasm runtime");
