@@ -3,16 +3,21 @@ use burn::tensor::{Tensor, TensorData};
 
 use crate::model::LayerVizState;
 
-use super::frame::{LAYER_GAP, VizConfig, VizFrame};
+use super::frame::{LAYER_GAP, VizConfig, VizFrame, clamp_history, clamp_layers, units_height};
 use super::palette::{
-    COLOR_ACTIVITY, COLOR_INTERACTION, COLOR_MEMORY, COLOR_SEPARATOR, COLOR_WRITES,
+    COLOR_ACTIVITY_HIGH, COLOR_ACTIVITY_LOW, COLOR_INTERACTION_HIGH, COLOR_INTERACTION_LOW,
+    COLOR_MEMORY_HIGH, COLOR_MEMORY_LOW, COLOR_SEPARATOR, COLOR_WRITES_HIGH, COLOR_WRITES_LOW,
 };
 
 const ACTIVE_EPS: f32 = 1e-3;
+const SOFT_CLIP: f32 = 0.35;
+const INTENSITY_GAMMA: f32 = 1.15;
+const RGB_MASK: [f32; 4] = [1.0, 1.0, 1.0, 0.0];
+const ALPHA_MASK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
 pub struct VizEncoder<B: Backend> {
     config: VizConfig,
-    layers: usize,
+    layers_visible: usize,
     heads: usize,
     latent_per_head: usize,
     latent_total: usize,
@@ -21,10 +26,16 @@ pub struct VizEncoder<B: Backend> {
     units_y: Tensor<B, 3>,
     units_xy: Tensor<B, 3>,
     units_rho: Tensor<B, 3>,
-    color_x: Tensor<B, 3>,
-    color_y: Tensor<B, 3>,
-    color_xy: Tensor<B, 3>,
-    color_rho: Tensor<B, 3>,
+    color_x_low: Tensor<B, 3>,
+    color_x_high: Tensor<B, 3>,
+    color_y_low: Tensor<B, 3>,
+    color_y_high: Tensor<B, 3>,
+    color_xy_low: Tensor<B, 3>,
+    color_xy_high: Tensor<B, 3>,
+    color_rho_low: Tensor<B, 3>,
+    color_rho_high: Tensor<B, 3>,
+    rgb_mask: Tensor<B, 3>,
+    alpha_mask: Tensor<B, 3>,
     separator_rgba: Option<Tensor<B, 3>>,
     zero_units: Tensor<B, 3>,
     zero_gap: Option<Tensor<B, 3>>,
@@ -32,30 +43,35 @@ pub struct VizEncoder<B: Backend> {
 
 impl<B: Backend> VizEncoder<B> {
     pub fn new(
-        config: VizConfig,
+        mut config: VizConfig,
         layers: usize,
         heads: usize,
         latent_per_head: usize,
         device: &B::Device,
     ) -> Self {
-        let history = config.history.max(1);
+        config.history = clamp_history(config.history);
+        let history = config.history;
         let latent_total = heads.saturating_mul(latent_per_head).max(1);
         let layers = layers.max(1);
+        let layers_visible = clamp_layers(layers, latent_total);
         let layer_gap = LAYER_GAP;
-        let units_height = latent_total
-            .saturating_mul(layers)
-            .saturating_add(layer_gap.saturating_mul(layers.saturating_sub(1)))
-            .max(1);
+        let units_height = units_height(layers_visible, latent_total);
 
         let units_x = Tensor::<B, 3>::zeros([units_height, history, 4], device);
         let units_y = Tensor::<B, 3>::zeros([units_height, history, 4], device);
         let units_xy = Tensor::<B, 3>::zeros([units_height, history, 4], device);
         let units_rho = Tensor::<B, 3>::zeros([units_height, history, 4], device);
 
-        let color_x = color_tensor::<B>(COLOR_WRITES, device);
-        let color_y = color_tensor::<B>(COLOR_ACTIVITY, device);
-        let color_xy = color_tensor::<B>(COLOR_INTERACTION, device);
-        let color_rho = color_tensor::<B>(COLOR_MEMORY, device);
+        let color_x_low = color_tensor::<B>(COLOR_WRITES_LOW, device);
+        let color_x_high = color_tensor::<B>(COLOR_WRITES_HIGH, device);
+        let color_y_low = color_tensor::<B>(COLOR_ACTIVITY_LOW, device);
+        let color_y_high = color_tensor::<B>(COLOR_ACTIVITY_HIGH, device);
+        let color_xy_low = color_tensor::<B>(COLOR_INTERACTION_LOW, device);
+        let color_xy_high = color_tensor::<B>(COLOR_INTERACTION_HIGH, device);
+        let color_rho_low = color_tensor::<B>(COLOR_MEMORY_LOW, device);
+        let color_rho_high = color_tensor::<B>(COLOR_MEMORY_HIGH, device);
+        let rgb_mask = color_tensor::<B>(RGB_MASK, device);
+        let alpha_mask = color_tensor::<B>(ALPHA_MASK, device);
 
         let separator_rgba = build_separator::<B>(latent_total, latent_per_head, device);
         let zero_units = Tensor::<B, 3>::zeros([latent_total, 1, 4], device);
@@ -67,7 +83,7 @@ impl<B: Backend> VizEncoder<B> {
 
         Self {
             config,
-            layers,
+            layers_visible,
             heads,
             latent_per_head,
             latent_total,
@@ -76,10 +92,16 @@ impl<B: Backend> VizEncoder<B> {
             units_y,
             units_xy,
             units_rho,
-            color_x,
-            color_y,
-            color_xy,
-            color_rho,
+            color_x_low,
+            color_x_high,
+            color_y_low,
+            color_y_high,
+            color_xy_low,
+            color_xy_high,
+            color_rho_low,
+            color_rho_high,
+            rgb_mask,
+            alpha_mask,
             separator_rgba,
             zero_units,
             zero_gap,
@@ -99,9 +121,12 @@ impl<B: Backend> VizEncoder<B> {
         let device = self.zero_units.device();
         let history = self.config.history.max(1);
         let cursor = token_index % history;
-        let layer_count = self.layers.min(layers.len()).max(1);
+        let available_layers = layers.len().max(1);
+        let layer_count = self.layers_visible.min(available_layers).max(1);
+        let layer_start = available_layers.saturating_sub(layer_count);
 
         for layer_idx in 0..layer_count {
+            let source_idx = layer_start + layer_idx;
             let offset = layer_idx
                 .saturating_mul(self.latent_total.saturating_add(self.layer_gap));
             if let Some(gap) = &self.zero_gap {
@@ -128,7 +153,7 @@ impl<B: Backend> VizEncoder<B> {
             }
 
             let (x_last, y_last, xy_last, rho_last) = layers
-                .get(layer_idx)
+                .get(source_idx)
                 .and_then(|layer| layer.as_ref())
                 .map(|layer| {
                     (
@@ -152,10 +177,30 @@ impl<B: Backend> VizEncoder<B> {
             let xy_flat = xy_last.reshape([self.latent_total]);
             let rho_flat = rho_last.reshape([self.latent_total]);
 
-            let units_x_col = self.encode_units(x_flat, self.config.gain_x, &self.color_x);
-            let units_y_col = self.encode_units(y_flat, self.config.gain_xy, &self.color_y);
-            let units_xy_col = self.encode_units(xy_flat, self.config.gain_xy, &self.color_xy);
-            let units_rho_col = self.encode_units(rho_flat, self.config.gain_xy, &self.color_rho);
+            let units_x_col = self.encode_units(
+                x_flat,
+                self.config.gain_x,
+                &self.color_x_low,
+                &self.color_x_high,
+            );
+            let units_y_col = self.encode_units(
+                y_flat,
+                self.config.gain_xy,
+                &self.color_y_low,
+                &self.color_y_high,
+            );
+            let units_xy_col = self.encode_units(
+                xy_flat,
+                self.config.gain_xy,
+                &self.color_xy_low,
+                &self.color_xy_high,
+            );
+            let units_rho_col = self.encode_units(
+                rho_flat,
+                self.config.gain_xy,
+                &self.color_rho_low,
+                &self.color_rho_high,
+            );
 
             let range = offset..offset + self.latent_total;
             self.units_x = self.units_x.clone().slice_assign(
@@ -186,20 +231,26 @@ impl<B: Backend> VizEncoder<B> {
         }
     }
 
-    fn encode_units(&self, values: Tensor<B, 1>, gain: f32, color: &Tensor<B, 3>) -> Tensor<B, 3> {
+    fn encode_units(
+        &self,
+        values: Tensor<B, 1>,
+        gain: f32,
+        color_low: &Tensor<B, 3>,
+        color_high: &Tensor<B, 3>,
+    ) -> Tensor<B, 3> {
         if self.latent_total == 0 {
             return self.zero_units.clone();
         }
         let values = values.clamp_min(0.0).reshape([self.latent_total, 1]);
-        let mag = values
-            .clone()
-            .mul_scalar(gain)
-            .div(values.clone().mul_scalar(gain).add_scalar(1.0))
-            .powf_scalar(0.5);
+        let scaled = values.clone().mul_scalar(gain);
+        let mag = scaled.clone().div(scaled.add_scalar(SOFT_CLIP));
         let mask = values.clone().div(values.clone().add_scalar(ACTIVE_EPS * 4.0));
-        let intensity = mag * mask;
+        let intensity = (mag * mask).powf_scalar(INTENSITY_GAMMA);
         let intensity = intensity.reshape([self.latent_total, 1, 1]);
-        let mut column = intensity * color.clone();
+        let ramp = color_low.clone() + (color_high.clone() - color_low.clone()) * intensity.clone();
+        let rgb = ramp * intensity.clone() * self.rgb_mask.clone();
+        let alpha = self.alpha_mask.clone();
+        let mut column = rgb + alpha;
         if let Some(sep) = &self.separator_rgba {
             column = column.max_pair(sep.clone());
         }
@@ -208,7 +259,22 @@ impl<B: Backend> VizEncoder<B> {
 }
 
 fn color_tensor<B: Backend>(rgba: [f32; 4], device: &B::Device) -> Tensor<B, 3> {
+    let [r, g, b, a] = rgba;
+    let rgba = [
+        srgb_to_linear(r),
+        srgb_to_linear(g),
+        srgb_to_linear(b),
+        a,
+    ];
     Tensor::<B, 3>::from_data(TensorData::new(rgba.to_vec(), [1, 1, 4]), device)
+}
+
+fn srgb_to_linear(value: f32) -> f32 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 fn build_separator<B: Backend>(

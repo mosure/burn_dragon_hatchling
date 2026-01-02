@@ -34,7 +34,9 @@ use burn_wgpu::WgpuDevice;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_futures::spawn_local;
 
-use super::frame::{LAYER_GAP, VizConfig, VizFrame};
+use super::frame::{
+    LAYER_GAP, VizConfig, VizFrame, clamp_history, clamp_layers, units_height,
+};
 use super::transport::VizReceiver;
 
 #[derive(Clone, Copy, Debug)]
@@ -178,15 +180,13 @@ where
     let bridge = BevyBurnBridgePlugin::<B>::default();
     app.add_plugins(bridge);
 
-    let history = config.history.max(1);
+    let history = clamp_history(config.history);
     let latent_total = dims
         .heads
         .saturating_mul(dims.latent_per_head)
         .max(1);
-    let units_height = latent_total
-        .saturating_mul(dims.layers.max(1))
-        .saturating_add(LAYER_GAP.saturating_mul(dims.layers.saturating_sub(1)))
-        .max(1);
+    let layers_visible = clamp_layers(dims.layers, latent_total);
+    let units_height = units_height(layers_visible, latent_total);
     app.insert_resource(VizLayout {
         history,
         units_height,
@@ -277,15 +277,13 @@ where
     app.insert_resource(ClearColor(Color::BLACK));
     app.add_plugins(BevyBurnBridgePlugin::<B>::default());
 
-    let history = config.history.max(1);
+    let history = clamp_history(config.history);
     let latent_total = dims
         .heads
         .saturating_mul(dims.latent_per_head)
         .max(1);
-    let units_height = latent_total
-        .saturating_mul(dims.layers.max(1))
-        .saturating_add(LAYER_GAP.saturating_mul(dims.layers.saturating_sub(1)))
-        .max(1);
+    let layers_visible = clamp_layers(dims.layers, latent_total);
+    let units_height = units_height(layers_visible, latent_total);
     app.insert_resource(VizLayout {
         history,
         units_height,

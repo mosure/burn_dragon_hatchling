@@ -2,6 +2,28 @@ use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 
 pub const LAYER_GAP: usize = 20;
+pub const VIZ_MAX_RES: usize = 8192;
+
+pub fn clamp_history(history: usize) -> usize {
+    history.max(1).min(VIZ_MAX_RES)
+}
+
+pub fn clamp_layers(layers: usize, latent_total: usize) -> usize {
+    let layers = layers.max(1);
+    let latent_total = latent_total.max(1);
+    let step = latent_total.saturating_add(LAYER_GAP).max(1);
+    let max_layers = VIZ_MAX_RES.saturating_add(LAYER_GAP) / step;
+    layers.min(max_layers.max(1))
+}
+
+pub fn units_height(layers: usize, latent_total: usize) -> usize {
+    let layers = layers.max(1);
+    let latent_total = latent_total.max(1);
+    latent_total
+        .saturating_mul(layers)
+        .saturating_add(LAYER_GAP.saturating_mul(layers.saturating_sub(1)))
+        .max(1)
+}
 
 #[derive(Clone, Debug)]
 pub struct VizConfig {
