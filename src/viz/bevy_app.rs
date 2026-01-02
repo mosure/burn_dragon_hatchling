@@ -35,7 +35,7 @@ use burn_wgpu::WgpuDevice;
 use wasm_bindgen_futures::spawn_local;
 
 use super::frame::{
-    LAYER_GAP, VizConfig, VizFrame, clamp_history, clamp_layers, units_height,
+    VizConfig, VizFrame, clamp_history, clamp_layers, units_height,
 };
 use super::transport::VizReceiver;
 
@@ -639,7 +639,7 @@ fn update_pan_zoom_bounds(
     let scale_x = viewport.x / texture.size.x.max(1.0);
     let scale_y = viewport.y / texture.size.y.max(1.0);
     let min_scale = scale_x.min(scale_y).max(0.0001);
-    let max_scale = (min_scale * 64.0).max(min_scale);
+    let max_scale = (min_scale * 512.0).max(min_scale);
 
     let viewport_changed = state.viewport_size != viewport
         || (state.inverse_scale_factor - inverse_scale_factor).abs() > f32::EPSILON;
